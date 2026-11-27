@@ -262,15 +262,8 @@ function getProcessOwnerProof(
   canCheckUidMap: boolean,
 ): "other_user" | "maybe_ours" | "absent" {
   const pidDir = path.join(procRoot, String(pid));
-  let dirStat: fs.Stats;
-  try {
-    dirStat = fs.statSync(pidDir);
-  } catch (err: unknown) {
-    const code = getErrorCode(err);
-    if (code === "ENOENT" || code === "ESRCH") {
-      return "absent";
-    }
-    return "maybe_ours";
+  if (!fs.existsSync(pidDir)) {
+    return "absent";
   }
 
   // Inside an unshared user namespace (e.g. `unshare -c -n`), processes in an
@@ -314,7 +307,7 @@ function getProcessOwnerProof(
     }
   }
 
-  return dirStat.uid !== myUid ? "other_user" : "maybe_ours";
+  return "maybe_ours";
 }
 
 function formatUncertainProcesses(uncertain: UncertainProcessEntry[], procRoot: string): string {

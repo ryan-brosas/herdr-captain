@@ -60,6 +60,8 @@ interface FixtureProcEntry {
   environ?: string;
   environMode?: number;
   uids?: [number, number, number, number];
+  statusRaw?: string;
+  statusMode?: number;
   uidMap?: string;
 }
 
@@ -84,12 +86,15 @@ function createFixtureProcRoot(
   for (const entry of entries) {
     const pidDir = path.join(procRoot, String(entry.pid));
     fs.mkdirSync(pidDir, { recursive: true });
-    if (entry.uids !== undefined) {
-      fs.writeFileSync(
-        path.join(pidDir, "status"),
-        `Name:\tfixture\nUid:\t${entry.uids.join("\t")}\n`,
-        "utf8",
-      );
+    if (entry.statusRaw !== undefined || entry.uids !== undefined) {
+      const statusPath = path.join(pidDir, "status");
+      const statusContent =
+        entry.statusRaw ?? `Name:\tfixture\nUid:\t${entry.uids?.join("\t")}\n`;
+      fs.writeFileSync(statusPath, statusContent, "utf8");
+      if (entry.statusMode !== undefined) {
+        fs.chmodSync(statusPath, entry.statusMode);
+        chmodPaths.push(statusPath);
+      }
     }
     if (entry.uidMap !== undefined) {
       fs.writeFileSync(path.join(pidDir, "uid_map"), entry.uidMap, "utf8");
@@ -2651,7 +2656,7 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
           environMode: 0o000,
         },
         {
-          // Unreadable stat for same-user process without status file (falls back to dir owner).
+          // Unreadable stat without status file (unknown owner stays maybe_ours).
           pid: 9000004,
           stat: makeStatLine(9000004, "worker", "S", "50030"),
           statMode: 0o000,
@@ -2887,5 +2892,78 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
     expect(
       await stopProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-absent", 200, fixture.procRoot),
     ).toEqual([]);
+  });
+
+  test("fixture proc root: root-owned pid directory without readable status UIDs is reported uncertain and fails cleanup", async () => {
+    if (typeof process.getuid !== "function" || process.getuid() === 0) {
+      return;
+    }
+    const myUid = process.getuid();
+    const rootUid = 0;
+    const sameNsUidMap = `${myUid} ${myUid} 1\n`;
+    const fixture = createFixtureProcRoot(
+      path.join(scratchRoot, "proc-root-owned-dir"),
+      "50000",
+      [
+        {
+          // Non-dumpable same-namespace process: root owns /proc/<pid>, status and environ are denied.
+          pid: 9000041,
+          uids: [myUid, myUid, myUid, myUid],
+          statusMode: 0o000,
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000041, "nondump", "S", "50020"),
+          environ: "HERDR_TEST_TOKEN=tok-nondump\0",
+          environMode: 0o000,
+        },
+        {
+          // Same-namespace process: root owns /proc/<pid>, status omits the four Uid fields.
+          pid: 9000042,
+          statusRaw: "Name:\tnondump\nState:\tS (sleeping)\n",
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000042, "nondump", "S", "50025"),
+          environ: "HERDR_TEST_TOKEN=tok-nondump\0",
+          environMode: 0o000,
+        },
+      ],
+      sameNsUidMap,
+    );
+
+    const rootOwnedDirs = new Set([
+      path.join(fixture.procRoot, "9000041"),
+      path.join(fixture.procRoot, "9000042"),
+    ]);
+    const origStatSync = fs.statSync.bind(fs);
+    const statSpy = spyOn(fs, "statSync").mockImplementation(((...args: unknown[]) => {
+      const real = origStatSync(...(args as Parameters<typeof fs.statSync>));
+      if (
+        rootOwnedDirs.has(String(args[0])) &&
+        real !== undefined &&
+        real !== null &&
+        typeof real === "object" &&
+        "uid" in real
+      ) {
+        return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { uid: rootUid });
+      }
+      return real;
+    }) as typeof fs.statSync);
+
+    try {
+      const scan = scanProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-nondump", fixture.procRoot);
+      expect(scan.matches).toEqual([]);
+      const uncertainSorted = [...scan.uncertain].sort((a, b) => a.pid - b.pid);
+      expect(uncertainSorted).toEqual([
+        { pid: 9000041, startTime: "50020", reason: "unreadable_environ" },
+        { pid: 9000042, startTime: "50025", reason: "unreadable_environ" },
+      ]);
+      expect(() =>
+        findProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-nondump", fixture.procRoot),
+      ).toThrow(/Uncertain process cleanup.*pid=9000041/);
+      await expect(
+        stopProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-nondump", 200, fixture.procRoot),
+      ).rejects.toThrow(/Uncertain process cleanup.*unreadable_environ/);
+    } finally {
+      statSpy.mockRestore();
+      fixture.restoreModes();
+    }
   });
 });
