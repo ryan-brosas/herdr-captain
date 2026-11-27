@@ -6,7 +6,9 @@ Terms used here follow [CONTEXT.md](../CONTEXT.md). Decisions live in [adr/](adr
 
 ## 1. Scope, governance, and non-goals
 
-Existing workflow documents, GitHub issues, and skills own product exploration, grounding, grilling, glossary ownership, ADRs, issue readiness, dependency ordering, and multi-ticket pacing. `herdr-captain` adds deterministic ticket execution reliability on top of `pi-fabric` and `herdr-core` (`hc`). It consumes one workflow-authorized brief per tracked ticket and enforces proved state transitions, attempt correlation, readback reconciliation, and exact-head gates.
+Existing workflow documents, GitHub issues, and skills own product exploration, grounding, grilling, glossary ownership, ADRs, issue readiness, dependency ordering, and multi-ticket pacing.
+
+`herdr-captain` adds deterministic ticket execution reliability on top of `pi-fabric` and `herdr-core` (`hc`). It consumes one workflow-authorized brief per tracked ticket and enforces proved state transitions, attempt correlation, readback reconciliation, and exact-head gates.
 
 ### Roles and harnesses
 
