@@ -4,7 +4,13 @@
 
 ## Status
 
-This repository holds a **design draft** only. Nothing is built, no code is installed, and no test has run. Runtime claims are either cited from observed package documentation or labelled `PROPOSED` or `TO BE PROBED`.
+Probes P1 through P4 have run. Probe P5 has not run yet, and no implementation slice is built. This repository holds design documents, probe records in `docs/probes/`, and probe code under `probes/`. It also holds the P1 package stub (`package.json` and `src/index.ts`) ([docs/proof-plan.md](docs/proof-plan.md#1-pre-build-probes-walking-skeleton), [#28](https://github.com/ryan-brosas/herdr-captain/issues/28)).
+
+- **P1:** Checks 1 to 5 passed in both normal and poisoned-environment runs ([P1, summary](docs/probes/p1.md#summary)).
+- **P2:** Complete. The holder-process owner lease works on Linux under Bun. Rules `(a)` through `(f)` each need a design change before Slice S1 ([P2, verdicts](docs/probes/p2.md#verdicts-for-section-5-rules-a-to-f)).
+- **P3:** Completed with gaps and design changes. Observed in live use on `hc` `0.1.22`, with no scratch `hc` session ([P3, method](docs/probes/p3.md#method-and-why-no-scratch-core-was-used)).
+- **P4:** Checks 1 to 6 passed, and the core mechanism holds. The two requested ADR-0003 updates have merged ([P4, verdict](docs/probes/p4.md#verdict-on-adr-0003), [#18](https://github.com/ryan-brosas/herdr-captain/issues/18)).
+- **P5:** Not run yet. Part 1 tests a recovery tracer against a fake `hc`. Part 2 waits for the owner's go-ahead before one live run under P3's rules ([#7](https://github.com/ryan-brosas/herdr-captain/issues/7)).
 
 Observed tool versions at design time: `pi-fabric` `0.140.1` (compiled-kernel precedent inspected at `0.139.0`, commit `0aaad42685a4dbe49194ee14a9a2f82caf6ef3b0`), `hc` `0.1.22`, `util-linux` `flock` `2.42.4`, and `gh pr merge --help` listing `--match-head-commit`. `jev-fabric` `0.8.0` was observed and is unused in version 1.
 
@@ -21,7 +27,8 @@ Observed tool versions at design time: `pi-fabric` `0.140.1` (compiled-kernel pr
 | [docs/adr/0003-deterministic-policy.md](docs/adr/0003-deterministic-policy.md) | Compiled `gdp-wired` transition kernel and advisory-only future Jev | Proposed |
 | [docs/adr/0004-package-home.md](docs/adr/0004-package-home.md) | Public standalone Pi package and pinned private consumption | Proposed |
 | [docs/adoption.md](docs/adoption.md) | Prior failures F1 to F6, method credits, donor pins, explicit rejections | Draft |
-| [docs/proof-plan.md](docs/proof-plan.md) | Ordered probes P1 to P5, slices S1 to S4, one-issue trial, pass and abort rules | Planned |
+| [docs/proof-plan.md](docs/proof-plan.md) | Probes P1 to P5, build order, slices S1 to S4, one-issue trial, pass and abort rules | Active |
+| [docs/probes/](docs/probes/) | Result documents for probes P1 to P4 | Recorded |
 
 ## How it will be consumed
 
@@ -37,17 +44,16 @@ This public repository will hold only source code, proofs, the compiled policy a
 
 ## Review state
 
-Two model review seats (Claude, Gemini) and an advisor attack on the planning brief and on the draft are complete, and their findings are folded into this revision. The third seat (Codex) declined under the vendor-independence rule because a GPT model co-wrote the planning brief; it is recorded as **unassessed**, never as approval. Planning text came from OpenAI and Anthropic models and the design text from Gemini, so no vendor-independent reviewer exists for this pack. This pack is documentation only: nothing is built and no test has run.
+Two model review seats (Claude, Gemini) and an advisor attack on the planning brief and on the draft are complete, and their findings are folded into this revision. The third seat (Codex) declined under the vendor-independence rule because a GPT model co-wrote the planning brief; it is recorded as **unassessed**, never as approval. Planning text came from OpenAI and Anthropic models and the design text from Gemini, so no vendor-independent reviewer exists for this pack. That note covers the initial design pack only. Probes P1 through P4 have since run, and no implementation slice is built yet ([docs/proof-plan.md](docs/proof-plan.md#1-pre-build-probes-walking-skeleton)).
 
 ## Next steps
 
-Run the five pre-build walking-skeleton probes in [docs/proof-plan.md](docs/proof-plan.md) before writing Slice 1:
+Follow the build order in [docs/proof-plan.md](docs/proof-plan.md#build-order):
 
-1. **P1:** Install by pinned git SHA into a fixture Pi home and prove `fleet` provider register, withdraw, and `/reload`.
-2. **P2:** Fault-test the `flock` holder lease under second start, parent `kill -9`, `/reload`, and withdrawal with queued work.
-3. **P3:** Probe `hc` `0.1.22` in a scratch `HC_SESSION` (`--outlive-parent`, `first_message.sent`, deterministic name lookup, finished terminal read, absent `HC_TERMINAL_ID`).
-4. **P4:** Audit `gdp-wired` compiled-kernel packaging, `{from: 'any'}` proof (`proven && checked && !assumes`), helper licence, and offline execution against installed `pi-fabric` `0.140.1`.
-5. **P5:** Run a scratch end-to-end recovery tracer (launch, kill Captain, return, reconcile) before expanding policy coverage.
+1. Merge the P2 lease updates and the proof-plan update, then start **Slice S1**. S1 does not wait for probe P5 ([#8](https://github.com/ryan-brosas/herdr-captain/issues/8), [#20](https://github.com/ryan-brosas/herdr-captain/issues/20), [#28](https://github.com/ryan-brosas/herdr-captain/issues/28)).
+2. Run **Probe P5**. Test the recovery tracer against a fake `hc`. Wait for the owner's go-ahead before its one live run under P3's rules ([#7](https://github.com/ryan-brosas/herdr-captain/issues/7)).
+3. Decide how a worker sees an `attemptId` and returns it ([#27](https://github.com/ryan-brosas/herdr-captain/issues/27)).
+4. Build **Slices S2, S3, and S4** after their gates merge, then run the one-issue trial ([docs/proof-plan.md](docs/proof-plan.md#2-ordered-implementation-slices)).
 
 ## Licence
 
