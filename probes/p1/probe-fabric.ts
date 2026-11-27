@@ -114,7 +114,7 @@ function findPiCodingAgentPackageDir(explicitDir?: string): string {
   };
 
   try {
-    const bunBinDir = execFileSync("bun", ["pm", "bin", "-g"], { encoding: "utf8" }).trim();
+    const bunBinDir = execFileSync("bun", ["--no-env-file", "pm", "bin", "-g"], { encoding: "utf8" }).trim();
     const bunPi = join(bunBinDir, "pi");
     if (existsSync(bunPi)) {
       const found = walkToPackage(dirname(realpathSync(bunPi)));
@@ -381,6 +381,7 @@ async function main(): Promise<void> {
     typeof process.env.HOME === "string" && realpathSync(process.env.HOME) === resolvedHome,
     `process.env.HOME (${String(process.env.HOME)}) !== os.homedir() (${resolvedHome})`,
   );
+  assertWithinScratch(process.cwd(), args.scratchDir, "process.cwd()");
 
   const piPackageDir = findPiCodingAgentPackageDir(args.piPackageDir);
   const piModuleUrl = pathToFileURL(join(piPackageDir, "dist", "index.js")).href;
@@ -746,6 +747,7 @@ async function main(): Promise<void> {
       piFabricVersion: piFabricPkg.version,
       isolation: {
         homeInScratch: true,
+        cwdInScratch: true,
         agentDirInScratch: true,
         envKeys: initialEnvKeys,
         checkedProviderCount: runtimeProviders.length,
