@@ -2673,6 +2673,55 @@ describe("project identity (S1b)", () => {
     assert.deepStrictEqual(snapshotTree(stateNew), beforeNewTree);
   });
 
+  test("fix-3 R12: destination folder present with commitless live repo refuses with decision_mismatch and leaves state unchanged", () => {
+    const scratch = createScratchDir("fix3-r12");
+    const stateBase = path.join(scratch, "state");
+    const repo1A = path.join(scratch, "repo1-a");
+    const sharedPathB = path.join(scratch, "shared-b");
+    const repo1Away = path.join(scratch, "repo1-away");
+
+    initRepoWithCommit(repo1A, { content: "repo one for r12\n" });
+    const open1A = openProject(repo1A, stateBase);
+    seedStateFiles(open1A.stateRoot);
+
+    fs.renameSync(repo1A, sharedPathB);
+    const decAB = recordIdentityDecision({
+      cwd: sharedPathB,
+      stateBase,
+      choice: "rebind",
+      oldProjectKey: open1A.projectKey,
+      decidedBy: "user-r12",
+    });
+    const open1B = openProject(sharedPathB, stateBase);
+    assert.strictEqual(open1B.rebound, true);
+    assert.strictEqual(fs.existsSync(open1B.stateRoot), true);
+    assert.strictEqual(open1B.record.rootCommitShas.length, 1);
+
+    // Move repo 1 away and place a commitless repository at path B with folder B still present.
+    fs.renameSync(sharedPathB, repo1Away);
+    fs.mkdirSync(sharedPathB, { recursive: true });
+    runGit(["init", "-b", "main"], sharedPathB);
+
+    const emptyLive = resolveProjectIdentity(sharedPathB);
+    assert.strictEqual(emptyLive.projectKey, open1B.projectKey);
+    assert.deepStrictEqual(emptyLive.rootCommitShas, []);
+
+    const beforeTree = snapshotTree(stateBase);
+    const err = expectIdentityError(
+      () => openProject(sharedPathB, stateBase),
+      "decision_mismatch",
+      "openProject must refuse when destination folder exists and commitless live repo differs from decision root commits",
+    );
+    assert.ok(err.message.includes(decAB.decisionPath));
+    assert.match(err.message, /root/i);
+    assert.strictEqual(err.details?.decisionPath, decAB.decisionPath);
+    assert.deepStrictEqual(
+      snapshotTree(stateBase),
+      beforeTree,
+      "refusal for commitless repo with existing destination folder must leave state tree unchanged",
+    );
+  });
+
   test("fix-2 R8: mismatched decision whose source folder waits for an earlier rebind finishes that folder per Build note 17 and refuses with decision_mismatch", async () => {
     const scratch = createScratchDir("fix2-r8");
     const stateBase = path.join(scratch, "state");
@@ -3066,6 +3115,155 @@ describe("project identity (S1b)", () => {
     assert.strictEqual(racedE, true);
     assert.deepStrictEqual(snapshotTree(fbOpenOrig.stateRoot), beforeFbOld);
     assert.strictEqual(fs.readFileSync(fbDestRoot, "utf8"), "not-a-dir\n");
+  });
+
+  test("fix-3 R11: recordIdentityDecision reads each input field once and publishes a decision accepted by openProject", () => {
+    const scratch = createScratchDir("fix3-r11");
+
+    // Subcase A: fresh repository, absent state base, new_project with counting getters and a changing decidedBy accessor.
+    const freshRepo = path.join(scratch, "fresh-repo");
+    const absentStateNew = path.join(scratch, "absent-state-new");
+    initRepoWithCommit(freshRepo, { content: "r11 fresh repo\n" });
+
+    let newCwdReads = 0;
+    let newStateBaseReads = 0;
+    let newChoiceReads = 0;
+    let newDecidedByReads = 0;
+    let newOldKeyReads = 0;
+
+    const newInput: RecordIdentityDecisionInput = {
+      get cwd() {
+        newCwdReads += 1;
+        return freshRepo;
+      },
+      get stateBase() {
+        newStateBaseReads += 1;
+        return absentStateNew;
+      },
+      get choice() {
+        newChoiceReads += 1;
+        return "new_project" as const;
+      },
+      get decidedBy() {
+        newDecidedByReads += 1;
+        return newDecidedByReads === 1 ? "  user  " : "";
+      },
+      get oldProjectKey() {
+        newOldKeyReads += 1;
+        return null;
+      },
+    };
+
+    const recordedNew = recordIdentityDecision(newInput);
+    const openedNew = openProject(freshRepo, absentStateNew);
+    assert.strictEqual(openedNew.created, true);
+    assert.strictEqual(openedNew.appliedDecisionId, recordedNew.decision.decisionId);
+
+    assert.strictEqual(
+      recordedNew.decision.decidedBy,
+      "user",
+      "returned decision must hold the trimmed first decidedBy value",
+    );
+
+    const onDiskNew = JSON.parse(fs.readFileSync(recordedNew.decisionPath, "utf8")) as IdentityDecision;
+    assert.strictEqual(
+      onDiskNew.decidedBy,
+      "user",
+      "published decision file must hold the trimmed first decidedBy value",
+    );
+
+    assert.strictEqual(newCwdReads, 1, "recordIdentityDecision(new_project) must read input.cwd once");
+    assert.strictEqual(
+      newStateBaseReads,
+      1,
+      "recordIdentityDecision(new_project) must read input.stateBase once",
+    );
+    assert.strictEqual(
+      newChoiceReads,
+      1,
+      "recordIdentityDecision(new_project) must read input.choice once",
+    );
+    assert.strictEqual(
+      newDecidedByReads,
+      1,
+      "recordIdentityDecision(new_project) must read input.decidedBy once",
+    );
+    assert.strictEqual(
+      newOldKeyReads,
+      1,
+      "recordIdentityDecision(new_project) must read input.oldProjectKey once",
+    );
+
+    // Subcase B: rebind path also reads every input field once (including oldProjectKey).
+    const stateRebind = path.join(scratch, "state-rebind");
+    const locA = path.join(scratch, "rebind-a");
+    const locB = path.join(scratch, "rebind-b");
+    initRepoWithCommit(locA, { content: "r11 rebind repo\n" });
+    const openA = openProject(locA, stateRebind);
+    fs.renameSync(locA, locB);
+
+    let rebCwdReads = 0;
+    let rebStateBaseReads = 0;
+    let rebChoiceReads = 0;
+    let rebDecidedByReads = 0;
+    let rebOldKeyReads = 0;
+
+    const rebindInput: RecordIdentityDecisionInput = {
+      get cwd() {
+        rebCwdReads += 1;
+        return locB;
+      },
+      get stateBase() {
+        rebStateBaseReads += 1;
+        return stateRebind;
+      },
+      get choice() {
+        rebChoiceReads += 1;
+        return "rebind" as const;
+      },
+      get decidedBy() {
+        rebDecidedByReads += 1;
+        return rebDecidedByReads === 1 ? "  rebind-user  " : "";
+      },
+      get oldProjectKey() {
+        rebOldKeyReads += 1;
+        return openA.projectKey;
+      },
+    };
+
+    const recordedRebind = recordIdentityDecision(rebindInput);
+    const openedRebind = openProject(locB, stateRebind);
+    assert.strictEqual(openedRebind.rebound, true);
+    assert.strictEqual(openedRebind.appliedDecisionId, recordedRebind.decision.decisionId);
+
+    assert.strictEqual(recordedRebind.decision.decidedBy, "rebind-user");
+
+    const onDiskRebind = JSON.parse(
+      fs.readFileSync(recordedRebind.decisionPath, "utf8"),
+    ) as IdentityDecision;
+    assert.strictEqual(onDiskRebind.decidedBy, "rebind-user");
+
+    assert.strictEqual(rebCwdReads, 1, "recordIdentityDecision(rebind) must read input.cwd once");
+    assert.strictEqual(
+      rebStateBaseReads,
+      1,
+      "recordIdentityDecision(rebind) must read input.stateBase once",
+    );
+    assert.strictEqual(
+      rebChoiceReads,
+      1,
+      "recordIdentityDecision(rebind) must read input.choice once",
+    );
+    assert.strictEqual(
+      rebDecidedByReads,
+      1,
+      "recordIdentityDecision(rebind) must read input.decidedBy once",
+    );
+    assert.strictEqual(
+      rebOldKeyReads,
+      1,
+      "recordIdentityDecision(rebind) must read input.oldProjectKey once",
+    );
   });
 });
 

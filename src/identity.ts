@@ -1340,25 +1340,31 @@ export function resolveProjectIdentity(cwd: string): LiveProjectIdentity {
 export function recordIdentityDecision(
   input: RecordIdentityDecisionInput,
 ): RecordIdentityDecisionResult {
-  requireNonEmptyString(input.cwd, "cwd");
-  requireNonEmptyString(input.stateBase, "stateBase");
-  requireNonEmptyString(input.decidedBy, "decidedBy");
+  const cwd = input.cwd;
+  const stateBase = input.stateBase;
+  const choice = input.choice;
+  const decidedBy = input.decidedBy;
+  const requestedOldProjectKey = input.oldProjectKey;
 
-  if (input.choice !== "rebind" && input.choice !== "new_project") {
+  requireNonEmptyString(cwd, "cwd");
+  requireNonEmptyString(stateBase, "stateBase");
+  requireNonEmptyString(decidedBy, "decidedBy");
+
+  if (choice !== "rebind" && choice !== "new_project") {
     throw new IdentityError(
       "invalid_argument",
-      `choice must be "rebind" or "new_project", received ${String(input.choice)}`,
+      `choice must be "rebind" or "new_project", received ${String(choice)}`,
     );
   }
-  if (input.choice === "rebind") {
-    if (typeof input.oldProjectKey !== "string" || !PROJECT_KEY_PATTERN.test(input.oldProjectKey)) {
+  if (choice === "rebind") {
+    if (typeof requestedOldProjectKey !== "string" || !PROJECT_KEY_PATTERN.test(requestedOldProjectKey)) {
       throw new IdentityError(
         "invalid_argument",
         "rebind decision requires a valid 16-hex oldProjectKey",
       );
     }
-  } else if (input.oldProjectKey !== undefined && input.oldProjectKey !== null) {
-    if (typeof input.oldProjectKey !== "string" || !PROJECT_KEY_PATTERN.test(input.oldProjectKey)) {
+  } else if (requestedOldProjectKey !== undefined && requestedOldProjectKey !== null) {
+    if (typeof requestedOldProjectKey !== "string" || !PROJECT_KEY_PATTERN.test(requestedOldProjectKey)) {
       throw new IdentityError(
         "invalid_argument",
         "oldProjectKey must be a valid 16-hex key or null",
@@ -1366,8 +1372,8 @@ export function recordIdentityDecision(
     }
   }
 
-  const resolvedStateBase = path.resolve(input.stateBase);
-  const live = resolveProjectIdentity(input.cwd);
+  const resolvedStateBase = path.resolve(stateBase);
+  const live = resolveProjectIdentity(cwd);
   const newStateRoot = path.join(resolvedStateBase, live.projectKey);
 
   if (lstatOrNull(newStateRoot) !== null) {
@@ -1401,19 +1407,19 @@ export function recordIdentityDecision(
     }
     if (existingDecision.oldProjectKey !== null && existingDecision.oldCanonicalCommonDir !== null) {
       if (
-        input.oldProjectKey !== undefined &&
-        input.oldProjectKey !== null &&
-        input.oldProjectKey !== existingDecision.oldProjectKey
+        requestedOldProjectKey !== undefined &&
+        requestedOldProjectKey !== null &&
+        requestedOldProjectKey !== existingDecision.oldProjectKey
       ) {
         throw new IdentityError(
           "decision_mismatch",
-          `Existing identity decision at ${decisionPath} names ${existingDecision.oldProjectKey} -> ${existingDecision.newProjectKey}, not ${input.oldProjectKey} -> ${live.projectKey}`,
+          `Existing identity decision at ${decisionPath} names ${existingDecision.oldProjectKey} -> ${existingDecision.newProjectKey}, not ${requestedOldProjectKey} -> ${live.projectKey}`,
           {
             details: {
               decisionPath,
               decisionId: existingDecision.decisionId,
               existingOldProjectKey: existingDecision.oldProjectKey,
-              requestedOldProjectKey: input.oldProjectKey,
+              requestedOldProjectKey,
               newProjectKey: live.projectKey,
             },
           },
@@ -1449,8 +1455,8 @@ export function recordIdentityDecision(
   let oldProjectKey: string | null = null;
   let oldCanonicalCommonDir: string | null = null;
 
-  if (input.choice === "rebind" || (input.oldProjectKey !== undefined && input.oldProjectKey !== null)) {
-    const requestedKey = input.oldProjectKey as string;
+  if (choice === "rebind" || (requestedOldProjectKey !== undefined && requestedOldProjectKey !== null)) {
+    const requestedKey = requestedOldProjectKey as string;
     const matched = candidates.find((candidate) => candidate.projectKey === requestedKey);
     if (matched !== undefined) {
       oldProjectKey = matched.projectKey;
@@ -1474,14 +1480,14 @@ export function recordIdentityDecision(
   const decision: IdentityDecision = {
     schemaVersion: IDENTITY_DECISION_SCHEMA_VERSION,
     decisionId: crypto.randomUUID(),
-    choice: input.choice,
+    choice,
     oldProjectKey,
     newProjectKey: live.projectKey,
     oldCanonicalCommonDir,
     newCanonicalCommonDir: live.canonicalCommonDir,
     rootCommitShas: [...live.rootCommitShas],
     originUrl: live.originUrl,
-    decidedBy: input.decidedBy.trim(),
+    decidedBy: decidedBy.trim(),
     time: new Date().toISOString(),
   };
 
