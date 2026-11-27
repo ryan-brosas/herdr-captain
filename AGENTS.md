@@ -15,13 +15,17 @@
 - [docs/adr/](docs/adr/): architectural decision records (`0001` to `0004`).
 - [docs/adoption.md](docs/adoption.md): prior failures F1 to F6, method credits, donor pins, and rejections.
 - [docs/proof-plan.md](docs/proof-plan.md): pre-build probes P1 to P5, slices S1 to S4, and trial protocol.
-- Future implementation paths: `src/`, `proofs/`, `generated/`, and `test/` (none exist yet).
+- [docs/probes/](docs/probes/): result documents for probes P1 to P4 ([docs/proof-plan.md](docs/proof-plan.md#1-pre-build-probes-walking-skeleton)).
+- [probes/](probes/): probe scripts and fixtures under `probes/p1/`, `probes/p2/`, and `probes/p4/` ([P1](docs/probes/p1.md), [P2](docs/probes/p2.md), [P4](docs/probes/p4.md)).
+- [package.json](package.json) and [src/index.ts](src/index.ts): minimal package stub from probe P1 ([P1, environment](docs/probes/p1.md#environment-and-fixture-isolation)).
+- Future implementation paths: `proofs/`, `generated/`, and `test/` do not exist yet ([docs/proof-plan.md](docs/proof-plan.md#2-ordered-implementation-slices)).
 
 ## Issues and public hygiene
 
 - Track work in this repository's GitHub issues.
 - This repository is public. Never commit runtime state, session files, logs, operational briefs, receipts, private fleet configuration, or secrets.
+- A probe result document may quote commands, exit codes, and outputs of its own fixtures and stand-in terminals. For real work sessions, it gives counts and field values only, never a verbatim output or receipt ([P3, method](docs/probes/p3.md#method-and-why-no-scratch-core-was-used), [#28](https://github.com/ryan-brosas/herdr-captain/issues/28)).
 
 ## Build and tests
 
-No build or test command exists yet because this repository contains only design documents. Add the real commands here when Slice 1 lands.
+No package build or test command exists yet. This repository holds design documents, probe records in `docs/probes/`, and probe code under `probes/` (`p1`, `p2`, and `p4`). It also holds the package stub (`package.json` and `src/index.ts`) from probe P1. Add the real commands here when Slice S1 lands ([P1](docs/probes/p1.md), [#8](https://github.com/ryan-brosas/herdr-captain/issues/8), [#28](https://github.com/ryan-brosas/herdr-captain/issues/28)).
