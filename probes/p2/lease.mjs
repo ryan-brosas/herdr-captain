@@ -19,6 +19,22 @@ export class LeaseError extends Error {
   }
 }
 
+export function formatError(err) {
+  if (!(err instanceof Error)) {
+    return String(err);
+  }
+  const header = `${err.name}: ${err.message}`;
+  if (typeof err.stack !== "string" || err.stack.length === 0) {
+    return header;
+  }
+  const firstNewline = err.stack.indexOf("\n");
+  const firstLine = firstNewline === -1 ? err.stack : err.stack.slice(0, firstNewline);
+  if (err.message.length === 0 || firstLine.includes(err.message)) {
+    return err.stack;
+  }
+  return firstNewline === -1 ? header : `${header}\n${err.stack.slice(firstNewline + 1)}`;
+}
+
 export function getGlobalLeaseRegistry() {
   let registry = globalThis[REGISTRY_SYMBOL];
   if (!(registry instanceof Map)) {
@@ -200,6 +216,119 @@ export async function terminateExternalProcess(pid, expectedStartTime, timeoutMs
   return true;
 }
 
+export function findProcessesByEnvToken(envName, token) {
+  if (typeof envName !== "string" || envName.length === 0 || typeof token !== "string" || token.length === 0) {
+    return [];
+  }
+  const needle = `${envName}=${token}`;
+  const matches = [];
+  let entries;
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return [];
+  }
+
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) {
+      continue;
+    }
+    const pid = Number(name);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
+      continue;
+    }
+    let statBefore;
+    try {
+      statBefore = readProcessStat(pid);
+    } catch {
+      continue;
+    }
+    if (
+      statBefore === null ||
+      statBefore.state === "Z" ||
+      statBefore.state === "X" ||
+      statBefore.state === "x"
+    ) {
+      continue;
+    }
+    let envRaw;
+    try {
+      envRaw = fs.readFileSync(`/proc/${pid}/environ`, "utf8");
+    } catch {
+      continue;
+    }
+    if (!envRaw.split("\0").includes(needle)) {
+      continue;
+    }
+    let statAfter;
+    try {
+      statAfter = readProcessStat(pid);
+    } catch {
+      continue;
+    }
+    if (
+      statAfter === null ||
+      statAfter.startTime !== statBefore.startTime ||
+      statAfter.state === "Z" ||
+      statAfter.state === "X" ||
+      statAfter.state === "x"
+    ) {
+      continue;
+    }
+    matches.push({ pid, startTime: statAfter.startTime });
+  }
+
+  return matches;
+}
+
+export async function stopProcessesByEnvToken(envName, token, timeoutMs = 3000) {
+  const stopped = [];
+  const seen = new Set();
+  const deadline = performance.now() + timeoutMs;
+
+  while (true) {
+    const matches = findProcessesByEnvToken(envName, token);
+    if (matches.length === 0) {
+      return stopped;
+    }
+    for (const proc of matches) {
+      const remaining = Math.max(200, Math.ceil(deadline - performance.now()));
+      const ok = await terminateExternalProcess(proc.pid, proc.startTime, remaining);
+      if (!ok) {
+        throw new Error(`Failed to confirm termination of token-owned process pid=${proc.pid}`);
+      }
+      const key = `${proc.pid}:${proc.startTime}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        stopped.push(proc);
+      }
+    }
+    if (performance.now() >= deadline) {
+      const remainingMatches = findProcessesByEnvToken(envName, token);
+      if (remainingMatches.length > 0) {
+        throw new Error(
+          `Timed out waiting for token-owned processes to terminate: ${remainingMatches.map((m) => m.pid).join(",")}`,
+        );
+      }
+      return stopped;
+    }
+  }
+}
+
+export function stopProcessesByEnvTokenSync(envName, token) {
+  const matches = findProcessesByEnvToken(envName, token);
+  for (const proc of matches) {
+    if (!isSameProcessAlive(proc.pid, proc.startTime)) {
+      continue;
+    }
+    try {
+      process.kill(proc.pid, "SIGKILL");
+    } catch {
+      // Ignore ESRCH if already exited.
+    }
+  }
+}
+
 function safeEndStdin(child) {
   if (!child.stdin || child.stdin.destroyed || child.stdin.writableEnded) {
     return;
@@ -315,8 +444,11 @@ function spawnFlockHolder(lockPath, acquireTimeoutMs) {
       }
       const line = stdoutBuf.slice(0, newlineIndex).replace(/\r$/, "");
       if (line !== "ready") {
-        safeEndStdin(child);
-        finishReject(new LeaseError("lease_acquire_error", `Unexpected holder ready line: ${JSON.stringify(line)}`));
+        settled = true;
+        clearTimeout(timer);
+        closeHolderAndWait(child, exitedPromise, DEFAULT_RELEASE_TIMEOUT_MS).finally(() => {
+          reject(new LeaseError("lease_acquire_error", `Unexpected holder ready line: ${JSON.stringify(line)}`));
+        });
         return;
       }
       settled = true;
@@ -382,10 +514,10 @@ export async function acquireLease({
   fs.mkdirSync(stateRoot, { recursive: true });
   const lockPath = path.join(stateRoot, "owner.lock");
   const holder = await spawnFlockHolder(lockPath, acquireTimeoutMs);
-  const holderStartTime = readProcessStat(holder.child.pid)?.startTime ?? null;
 
-  let ownerRecord;
+  let registryEntry = null;
   try {
+    const holderStartTime = readProcessStat(holder.child.pid)?.startTime ?? null;
     const prev = readOwnerRecord(stateRoot);
     if (prev !== null && prev.projectKey !== projectKey) {
       throw new LeaseError(
@@ -395,7 +527,7 @@ export async function acquireLease({
     }
 
     const epoch = (prev ? prev.epoch : 0) + 1;
-    ownerRecord = {
+    const ownerRecord = {
       schemaVersion: 1,
       projectKey,
       epoch,
@@ -404,116 +536,117 @@ export async function acquireLease({
       acquiredAt: new Date().toISOString(),
     };
     writeOwnerRecordAtomic(stateRoot, ownerRecord);
-  } catch (err) {
-    await closeHolderAndWait(holder.child, holder.exitedPromise, releaseTimeoutMs);
-    throw err;
-  }
 
-  let revoked = false;
-  let queueTail = Promise.resolve();
-  let revokePromise = null;
+    let revoked = false;
+    let queueTail = Promise.resolve();
+    let revokePromise = null;
 
-  const isHolderAlive = () =>
-    !holder.isExited() &&
-    (holderStartTime !== null
-      ? isSameProcessAlive(holder.child.pid, holderStartTime)
-      : isProcessAliveNonZombie(holder.child.pid));
+    const isHolderAlive = () =>
+      !holder.isExited() &&
+      (holderStartTime !== null
+        ? isSameProcessAlive(holder.child.pid, holderStartTime)
+        : isProcessAliveNonZombie(holder.child.pid));
 
-  const assertValid = () => {
-    if (revoked) {
-      throw new LeaseError("lease_revoked", "Owner lease has been revoked");
-    }
-    if (!isHolderAlive()) {
-      revoked = true;
-      throw new LeaseError("lease_revoked", "Owner lease holder is no longer alive");
-    }
-    const diskRecord = readOwnerRecord(stateRoot);
-    if (
-      diskRecord === null ||
-      diskRecord.projectKey !== projectKey ||
-      diskRecord.epoch !== ownerRecord.epoch
-    ) {
-      revoked = true;
-      throw new LeaseError(
-        "lease_revoked",
-        `Owner lease epoch mismatch: local=${ownerRecord.epoch}, disk=${diskRecord ? diskRecord.epoch : "missing"}`,
+    const assertValid = () => {
+      if (revoked) {
+        throw new LeaseError("lease_revoked", "Owner lease has been revoked");
+      }
+      if (!isHolderAlive()) {
+        revoked = true;
+        throw new LeaseError("lease_revoked", "Owner lease holder is no longer alive");
+      }
+      const diskRecord = readOwnerRecord(stateRoot);
+      if (
+        diskRecord === null ||
+        diskRecord.projectKey !== projectKey ||
+        diskRecord.epoch !== ownerRecord.epoch
+      ) {
+        revoked = true;
+        throw new LeaseError(
+          "lease_revoked",
+          `Owner lease epoch mismatch: local=${ownerRecord.epoch}, disk=${diskRecord ? diskRecord.epoch : "missing"}`,
+        );
+      }
+    };
+
+    const enqueue = ({ write, effect } = {}) => {
+      const step = queueTail.then(async () => {
+        assertValid();
+        const writeResult = write ? await write() : undefined;
+        assertValid();
+        const effectResult = effect ? await effect(writeResult) : undefined;
+        return { writeResult, effectResult };
+      });
+
+      queueTail = step.then(
+        () => {},
+        () => {},
       );
-    }
-  };
+      return step;
+    };
 
-  const enqueue = ({ write, effect } = {}) => {
-    const step = queueTail.then(async () => {
-      assertValid();
-      const writeResult = write ? await write() : undefined;
-      assertValid();
-      const effectResult = effect ? await effect(writeResult) : undefined;
-      return { writeResult, effectResult };
-    });
+    const revokeAndClose = () => {
+      // Rule (d): set revoked synchronously first, drain serialized queue, then close holder stdin and await exit.
+      revoked = true;
+      if (revokePromise !== null) {
+        return revokePromise;
+      }
 
-    queueTail = step.then(
-      () => {},
-      () => {},
-    );
-    return step;
-  };
+      revokePromise = (async () => {
+        let drainedTail;
+        do {
+          drainedTail = queueTail;
+          await drainedTail;
+        } while (queueTail !== drainedTail);
 
-  let registryEntry;
+        await closeHolderAndWait(holder.child, holder.exitedPromise, releaseTimeoutMs);
 
-  const revokeAndClose = () => {
-    // Rule (d): set revoked synchronously first, drain serialized queue, then close holder stdin and await exit.
-    revoked = true;
-    if (revokePromise !== null) {
+        if (registry.get(projectKey) === registryEntry) {
+          registry.delete(projectKey);
+        }
+      })();
+
       return revokePromise;
-    }
+    };
 
-    revokePromise = (async () => {
-      let drainedTail;
-      do {
-        drainedTail = queueTail;
-        await drainedTail;
-      } while (queueTail !== drainedTail);
+    registryEntry = {
+      projectKey,
+      stateRoot,
+      epoch: ownerRecord.epoch,
+      holderPid: holder.child.pid,
+      moduleInstanceId: MODULE_INSTANCE_ID,
+      revokeAndClose,
+    };
+    registry.set(projectKey, registryEntry);
 
-      await closeHolderAndWait(holder.child, holder.exitedPromise, releaseTimeoutMs);
-
+    holder.exitedPromise.then(() => {
+      revoked = true;
       if (registry.get(projectKey) === registryEntry) {
         registry.delete(projectKey);
       }
-    })();
+    });
 
-    return revokePromise;
-  };
-
-  registryEntry = {
-    projectKey,
-    stateRoot,
-    epoch: ownerRecord.epoch,
-    holderPid: holder.child.pid,
-    moduleInstanceId: MODULE_INSTANCE_ID,
-    revokeAndClose,
-  };
-  registry.set(projectKey, registryEntry);
-
-  holder.exitedPromise.then(() => {
-    revoked = true;
-    if (registry.get(projectKey) === registryEntry) {
+    return {
+      projectKey,
+      stateRoot,
+      epoch: ownerRecord.epoch,
+      pid: process.pid,
+      holderPid: holder.child.pid,
+      holderStartTime,
+      moduleInstanceId: MODULE_INSTANCE_ID,
+      ownerRecord,
+      isRevoked: () => revoked,
+      isHolderAlive,
+      assertValid,
+      enqueue,
+      revoke: revokeAndClose,
+      release: revokeAndClose,
+    };
+  } catch (err) {
+    if (registryEntry !== null && registry.get(projectKey) === registryEntry) {
       registry.delete(projectKey);
     }
-  });
-
-  return {
-    projectKey,
-    stateRoot,
-    epoch: ownerRecord.epoch,
-    pid: process.pid,
-    holderPid: holder.child.pid,
-    holderStartTime,
-    moduleInstanceId: MODULE_INSTANCE_ID,
-    ownerRecord,
-    isRevoked: () => revoked,
-    isHolderAlive,
-    assertValid,
-    enqueue,
-    revoke: revokeAndClose,
-    release: revokeAndClose,
-  };
+    await closeHolderAndWait(holder.child, holder.exitedPromise, releaseTimeoutMs);
+    throw err;
+  }
 }

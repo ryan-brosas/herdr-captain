@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   CONFLICT_EXIT_CODE,
+  formatError,
   isSameProcessAlive,
   readProcessStat,
   terminateExternalProcess,
@@ -13,15 +14,34 @@ import {
 
 const ownedChildren = new Set();
 const trackedExternals = new Map();
+let activeScratchRoot = null;
+let fatalShutdownPromise = null;
+
+function removeActiveScratchRoot() {
+  if (activeScratchRoot !== null) {
+    const target = activeScratchRoot;
+    fs.rmSync(target, { recursive: true, force: true });
+    activeScratchRoot = null;
+  }
+}
 
 function trackChild(child) {
   let exitedFlag = false;
   let handle;
   const exited = new Promise((resolve) => {
-    child.once("exit", (code, signal) => {
+    const settle = (info) => {
+      if (exitedFlag) {
+        return;
+      }
       exitedFlag = true;
       ownedChildren.delete(handle);
-      resolve({ code, signal });
+      resolve(info);
+    };
+    child.once("error", (err) => {
+      settle({ code: null, signal: null, error: err });
+    });
+    child.once("exit", (code, signal) => {
+      settle({ code, signal });
     });
   });
 
@@ -89,6 +109,61 @@ async function cleanupAll() {
     throw new AggregateError(errors, `Cleanup failed for ${errors.length} tracked process(es)`);
   }
 }
+
+function handleFatalError(label, err) {
+  console.error(`${label}: ${formatError(err)}`);
+  if (fatalShutdownPromise !== null) {
+    return fatalShutdownPromise;
+  }
+  fatalShutdownPromise = (async () => {
+    try {
+      await cleanupAll();
+    } catch (cleanupErr) {
+      console.error(formatError(cleanupErr));
+    }
+    try {
+      removeActiveScratchRoot();
+    } catch (rmErr) {
+      console.error(formatError(rmErr));
+    }
+    process.exit(1);
+  })();
+  return fatalShutdownPromise;
+}
+
+process.on("uncaughtException", (err) => {
+  void handleFatalError("Uncaught exception", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  void handleFatalError("Unhandled rejection", reason);
+});
+
+process.on("exit", () => {
+  for (const entry of [...ownedChildren]) {
+    if (!entry.hasExited()) {
+      try {
+        entry.child.kill("SIGKILL");
+      } catch {
+        // Ignore ESRCH on exit fallback.
+      }
+    }
+  }
+  for (const entry of [...trackedExternals.values()]) {
+    if (isSameProcessAlive(entry.pid, entry.startTime)) {
+      try {
+        process.kill(entry.pid, "SIGKILL");
+      } catch {
+        // Ignore ESRCH on exit fallback.
+      }
+    }
+  }
+  try {
+    removeActiveScratchRoot();
+  } catch {
+    // Ignore exit fallback removal error.
+  }
+});
 
 function readFirstLine(stream) {
   return new Promise((resolve, reject) => {
@@ -346,6 +421,7 @@ async function diagnoseCloseWithoutAwaitExitRace(scratchRoot) {
 
 async function main() {
   const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-captain-p2-gaps-"));
+  activeScratchRoot = scratchRoot;
   try {
     console.log("Probe P2: design-gap reproduction diagnostics");
     console.log("scratchRoot: <scratch>");
@@ -356,7 +432,10 @@ async function main() {
     console.log(`DIAG [gap-3: await holder exit on close] ${await diagnoseCloseWithoutAwaitExitRace(scratchRoot)}`);
   } finally {
     await cleanupAll();
-    fs.rmSync(scratchRoot, { recursive: true, force: true });
+    removeActiveScratchRoot();
+  }
+  if (fatalShutdownPromise !== null) {
+    await fatalShutdownPromise;
   }
 }
 
@@ -364,8 +443,13 @@ main().catch(async (err) => {
   try {
     await cleanupAll();
   } catch (cleanupErr) {
-    console.error(cleanupErr instanceof Error ? cleanupErr.stack : String(cleanupErr));
+    console.error(formatError(cleanupErr));
   }
-  console.error(err instanceof Error ? err.stack : String(err));
+  try {
+    removeActiveScratchRoot();
+  } catch (rmErr) {
+    console.error(formatError(rmErr));
+  }
+  console.error(formatError(err));
   process.exit(1);
 });

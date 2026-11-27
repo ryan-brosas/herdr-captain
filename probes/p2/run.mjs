@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   acquireLease,
+  formatError,
   getGlobalLeaseRegistry,
   isProcessAliveNonZombie,
   isSameProcessAlive,
@@ -15,6 +16,8 @@ import {
   readOwnerRecord,
   readProcessStat,
   resolveProjectIdentity,
+  stopProcessesByEnvToken,
+  stopProcessesByEnvTokenSync,
   terminateExternalProcess,
 } from "./lease.mjs";
 
@@ -24,6 +27,27 @@ const LEASE_SOURCE_PATH = path.join(HERE, "lease.mjs");
 
 const ownedChildren = new Set();
 const trackedExternals = new Map();
+const activeEnvTokens = new Map();
+let activeScratchRoot = null;
+let fatalErrorOccurred = false;
+let fatalShutdownPromise = null;
+
+function registerEnvToken(envName, token) {
+  activeEnvTokens.set(`${envName}=${token}`, { envName, token });
+}
+
+async function stopAndRetireEnvToken(envName, token) {
+  await stopProcessesByEnvToken(envName, token, 3000);
+  activeEnvTokens.delete(`${envName}=${token}`);
+}
+
+function removeActiveScratchRoot() {
+  if (activeScratchRoot !== null) {
+    const target = activeScratchRoot;
+    fs.rmSync(target, { recursive: true, force: true });
+    activeScratchRoot = null;
+  }
+}
 
 function externalKey(pid, startTime) {
   return `${pid}:${startTime}`;
@@ -78,10 +102,68 @@ async function cleanupAllTracked() {
     }
   }
 
+  for (const entry of [...activeEnvTokens.values()]) {
+    try {
+      await stopAndRetireEnvToken(entry.envName, entry.token);
+    } catch (err) {
+      errors.push(err);
+    }
+  }
+
   if (errors.length > 0) {
     throw new AggregateError(errors, `Cleanup failed for ${errors.length} tracked process(es)`);
   }
 }
+
+function handleFatalError(label, err) {
+  fatalErrorOccurred = true;
+  console.error(`${label}: ${formatError(err)}`);
+  if (fatalShutdownPromise !== null) {
+    return fatalShutdownPromise;
+  }
+  fatalShutdownPromise = (async () => {
+    try {
+      await cleanupAllTracked();
+    } catch (cleanupErr) {
+      console.error(formatError(cleanupErr));
+    }
+    try {
+      removeActiveScratchRoot();
+    } catch (rmErr) {
+      console.error(formatError(rmErr));
+    }
+    process.exit(1);
+  })();
+  return fatalShutdownPromise;
+}
+
+process.on("uncaughtException", (err) => {
+  void handleFatalError("Uncaught exception", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  void handleFatalError("Unhandled rejection", reason);
+});
+
+process.on("exit", () => {
+  for (const entry of [...ownedChildren]) {
+    if (!entry.hasExited()) {
+      try {
+        entry.child.kill("SIGKILL");
+      } catch {
+        // Ignore ESRCH on last-resort exit hook.
+      }
+    }
+  }
+  for (const entry of [...activeEnvTokens.values()]) {
+    stopProcessesByEnvTokenSync(entry.envName, entry.token);
+  }
+  try {
+    removeActiveScratchRoot();
+  } catch {
+    // Ignore last-resort cleanup error on exit.
+  }
+});
 
 function createDeferred() {
   let resolve;
@@ -93,9 +175,14 @@ function createDeferred() {
   return { promise, resolve, reject };
 }
 
-function spawnWorker(args) {
+function spawnWorker(args, extraEnv = undefined) {
   const child = spawn(process.execPath, [WORKER_PATH, ...args], {
     stdio: ["pipe", "pipe", "pipe"],
+    env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+  });
+
+  child.stdin.on("error", () => {
+    // Suppress EPIPE/ECONNRESET if worker exits while stdin is closing.
   });
 
   let exitedFlag = false;
@@ -139,16 +226,31 @@ function spawnWorker(args) {
   let ownerHandle;
 
   const exited = new Promise((resolve) => {
-    child.once("exit", (code, signal) => {
+    const settleExit = (info, message) => {
+      if (exitedFlag) {
+        return;
+      }
       exitedFlag = true;
       ownedChildren.delete(ownerHandle);
       while (lineWaiters.length > 0) {
         const waiter = lineWaiters.shift();
-        waiter.reject(
-          new Error(`Worker exited before emitting expected line (code=${code}, signal=${signal}, stderr=${stderrBuf.trim()})`),
-        );
+        waiter.reject(new Error(message));
       }
-      resolve({ code, signal, stderr: stderrBuf.trim() });
+      resolve(info);
+    };
+
+    child.once("error", (err) => {
+      settleExit(
+        { code: null, signal: null, error: err, stderr: stderrBuf.trim() },
+        `Worker spawn error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+
+    child.once("exit", (code, signal) => {
+      settleExit(
+        { code, signal, stderr: stderrBuf.trim() },
+        `Worker exited before emitting expected line (code=${code}, signal=${signal}, stderr=${stderrBuf.trim()})`,
+      );
     });
   });
 
@@ -661,6 +763,7 @@ async function check4WithdrawalQueuedWork(scratchRoot) {
           err instanceof LeaseError &&
           err.code === "lease_revoked" &&
           err.message.includes("no longer alive"),
+        "expected pre-effect check to reject dead unreaped holder with no longer alive",
       );
       assert.equal(sawRevokedFalseBeforePreEffect, true, "exit callback ran before pre-effect liveness guard");
       assert.equal(sawZombieState, true, "expected unreaped zombie state Z before event loop poll");
@@ -761,17 +864,24 @@ async function check5NonInheritance(scratchRoot) {
   const childPidFile = path.join(scratchRoot, "check5-child.json");
   const projectKey = "0505050505050505";
   const lockPath = path.join(stateRoot, "owner.lock");
+  // Pre-assign a unique process-ownership token inherited from fork across detached setsid(),
+  // so runner cleanup stops the child even if owner1 dies before publishing anything.
+  const childOwnershipToken = `herdr-p2-check5-${crypto.randomUUID()}`;
+  registerEnvToken("HERDR_P2_CHILD_TOKEN", childOwnershipToken);
 
-  const owner1 = spawnWorker([
-    "--mode",
-    "hold-with-child",
-    "--state-root",
-    stateRoot,
-    "--project-key",
-    projectKey,
-    "--child-pid-file",
-    childPidFile,
-  ]);
+  const owner1 = spawnWorker(
+    [
+      "--mode",
+      "hold-with-child",
+      "--state-root",
+      stateRoot,
+      "--project-key",
+      projectKey,
+      "--child-pid-file",
+      childPidFile,
+    ],
+    { HERDR_P2_CHILD_TOKEN: childOwnershipToken },
+  );
   let owner2 = null;
   let survivingChildPid = null;
   let survivingChildStartTime = null;
@@ -880,6 +990,7 @@ async function check5NonInheritance(scratchRoot) {
     if (survivingChildPid !== null && survivingChildStartTime !== null) {
       await stopExternalAndRetire(survivingChildPid, survivingChildStartTime, "detached-child");
     }
+    await stopAndRetireEnvToken("HERDR_P2_CHILD_TOKEN", childOwnershipToken);
     fs.rmSync(childPidFile, { force: true });
   }
 }
@@ -919,10 +1030,10 @@ async function check6LinkedWorktrees(scratchRoot) {
   const expectedKey = crypto.createHash("sha256").update(expectedCommonDir, "utf8").digest("hex").slice(0, 16);
 
   assert.match(idAlpha.projectKey, /^[0-9a-f]{16}$/);
-  assert.equal(idMain.projectKey, expectedKey);
-  assert.equal(idAlpha.projectKey, expectedKey);
-  assert.equal(idBeta.projectKey, expectedKey);
-  assert.equal(idBetaLink.projectKey, expectedKey);
+  assert.equal(idMain.projectKey, expectedKey, "main-clone projectKey did not match sha256(realpath(git common dir))");
+  assert.equal(idAlpha.projectKey, expectedKey, "wt-alpha projectKey did not match sha256(realpath(git common dir))");
+  assert.equal(idBeta.projectKey, expectedKey, "wt-beta projectKey did not match sha256(realpath(git common dir))");
+  assert.equal(idBetaLink.projectKey, expectedKey, "wt-beta-symlink projectKey did not match sha256(realpath(git common dir))");
   assert.equal(idAlpha.canonicalCommonDir, idBeta.canonicalCommonDir);
   assert.notEqual(idSeparate.projectKey, expectedKey, "separate clone collided with main clone projectKey");
 
@@ -987,6 +1098,7 @@ async function check6LinkedWorktrees(scratchRoot) {
 
 async function main() {
   const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-captain-p2-"));
+  activeScratchRoot = scratchRoot;
   let passed = 0;
   let failed = 0;
 
@@ -1011,6 +1123,9 @@ async function main() {
     console.log("");
 
     for (const check of checks) {
+      if (fatalErrorOccurred) {
+        break;
+      }
       const start = performance.now();
       try {
         const detail = await check.fn(scratchRoot);
@@ -1021,26 +1136,36 @@ async function main() {
       } catch (err) {
         const ms = (performance.now() - start).toFixed(1);
         console.error(`FAIL [${check.id}] (${ms}ms) ${check.name}`);
-        console.error(`  ${sanitize(err instanceof Error ? err.stack || err.message : String(err), scratchRoot)}`);
+        console.error(`  ${sanitize(formatError(err), scratchRoot)}`);
         failed += 1;
       }
     }
   } finally {
     await cleanupAllTracked();
-    fs.rmSync(scratchRoot, { recursive: true, force: true });
+    removeActiveScratchRoot();
+  }
+
+  if (fatalShutdownPromise !== null) {
+    await fatalShutdownPromise;
+    return;
   }
 
   console.log("");
   console.log(`Summary: ${passed} passed, ${failed} failed (total ${checks.length})`);
-  process.exit(failed === 0 ? 0 : 1);
+  process.exit(failed === 0 && !fatalErrorOccurred ? 0 : 1);
 }
 
 main().catch(async (err) => {
   try {
     await cleanupAllTracked();
   } catch (cleanupErr) {
-    console.error(cleanupErr instanceof Error ? cleanupErr.stack : String(cleanupErr));
+    console.error(formatError(cleanupErr));
   }
-  console.error(err instanceof Error ? err.stack : String(err));
+  try {
+    removeActiveScratchRoot();
+  } catch (rmErr) {
+    console.error(formatError(rmErr));
+  }
+  console.error(formatError(err));
   process.exit(1);
 });

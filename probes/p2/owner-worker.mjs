@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { acquireLease, LeaseError, readProcessStat, resolveProjectIdentity } from "./lease.mjs";
+import { acquireLease, formatError, LeaseError, readProcessStat, resolveProjectIdentity } from "./lease.mjs";
 
 function parseArgs(argv) {
   const args = {};
@@ -55,7 +55,7 @@ function writePidFileAtomic(filePath, data) {
   fs.renameSync(tmpPath, filePath);
 }
 
-function spawnDetachedSurvivingChild(onSpawned) {
+function spawnDetachedSurvivingChild(onHandleCreated, onChildTracked) {
   return new Promise((resolve, reject) => {
     const child = spawn("sh", ["-c", 'printf "child_ready\\n"; exec sleep 60 >/dev/null 2>&1'], {
       detached: true,
@@ -63,18 +63,24 @@ function spawnDetachedSurvivingChild(onSpawned) {
     });
 
     let childExited = false;
+    let resolveExited;
     const exitedPromise = new Promise((res) => {
-      child.once("exit", (code, signal) => {
+      resolveExited = res;
+    });
+    const markExited = (info) => {
+      if (!childExited) {
         childExited = true;
-        res({ code, signal });
-      });
+        resolveExited(info);
+      }
+    };
+    child.once("exit", (code, signal) => {
+      markExited({ code, signal });
     });
 
-    const startTime = readProcessStat(child.pid)?.startTime ?? null;
     const handle = {
       child,
       pid: child.pid,
-      startTime,
+      startTime: null,
       hasExited: () => childExited,
       exitedPromise,
       async stopAndWait() {
@@ -89,12 +95,8 @@ function spawnDetachedSurvivingChild(onSpawned) {
       },
     };
 
-    try {
-      onSpawned(handle);
-    } catch (err) {
-      reject(err);
-      return;
-    }
+    // Establish raw-handle cleanup ownership immediately after spawn, before any fallible call.
+    onHandleCreated(handle);
 
     let stdoutBuf = "";
     let sawReady = false;
@@ -107,6 +109,19 @@ function spawnDetachedSurvivingChild(onSpawned) {
       settled = true;
       reject(err);
     };
+
+    child.once("error", (err) => {
+      markExited({ code: null, signal: null, error: err });
+      finishReject(err);
+    });
+
+    try {
+      handle.startTime = readProcessStat(child.pid)?.startTime ?? null;
+      onChildTracked(handle);
+    } catch (err) {
+      finishReject(err);
+      return;
+    }
 
     child.stdout.on("data", (chunk) => {
       stdoutBuf += chunk.toString("utf8");
@@ -129,7 +144,6 @@ function spawnDetachedSurvivingChild(onSpawned) {
       resolve(handle);
     });
 
-    child.once("error", finishReject);
     child.once("exit", (code, signal) => {
       if (!sawReady) {
         finishReject(new Error(`Detached child exited early (code=${code}, signal=${signal})`));
@@ -225,23 +239,27 @@ async function main() {
       const afterFds = inspectFds("self");
       const newParentFds = afterFds.filter((x) => beforeFds.get(x.fd) !== x.target);
 
-      const childHandle = await spawnDetachedSurvivingChild((handle) => {
-        ownedChild = handle;
-        if (childPidFile) {
-          writePidFileAtomic(childPidFile, {
-            pid: handle.pid,
-            startTime: handle.startTime,
+      const childHandle = await spawnDetachedSurvivingChild(
+        (handle) => {
+          ownedChild = handle;
+        },
+        (handle) => {
+          if (childPidFile) {
+            writePidFileAtomic(childPidFile, {
+              pid: handle.pid,
+              startTime: handle.startTime,
+            });
+          }
+          emit({
+            event: "child_spawned",
+            pid: lease.pid,
+            holderPid: lease.holderPid,
+            holderStartTime: lease.holderStartTime,
+            childPid: handle.pid,
+            childStartTime: handle.startTime,
           });
-        }
-        emit({
-          event: "child_spawned",
-          pid: lease.pid,
-          holderPid: lease.holderPid,
-          holderStartTime: lease.holderStartTime,
-          childPid: handle.pid,
-          childStartTime: handle.startTime,
-        });
-      });
+        },
+      );
 
       const childFds = inspectFds(childHandle.pid);
 
@@ -327,6 +345,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  process.stderr.write(`${err instanceof Error ? err.stack : String(err)}\n`);
+  process.stderr.write(`${formatError(err)}\n`);
   process.exit(1);
 });
