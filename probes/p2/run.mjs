@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -10,39 +10,77 @@ import {
   acquireLease,
   getGlobalLeaseRegistry,
   isProcessAliveNonZombie,
+  isSameProcessAlive,
   LeaseError,
   readOwnerRecord,
+  readProcessStat,
   resolveProjectIdentity,
+  terminateExternalProcess,
 } from "./lease.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = path.join(HERE, "owner-worker.mjs");
 const LEASE_SOURCE_PATH = path.join(HERE, "lease.mjs");
 
-const trackedPids = new Set();
+const ownedChildren = new Set();
+const trackedExternals = new Map();
 
-function trackPid(pid) {
-  if (Number.isInteger(pid) && pid > 0) {
-    trackedPids.add(pid);
-  }
+function externalKey(pid, startTime) {
+  return `${pid}:${startTime}`;
 }
 
-function forceKillPid(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) {
+function trackExternal(pid, startTime, label) {
+  if (!Number.isInteger(pid) || pid <= 0 || typeof startTime !== "string" || startTime.length === 0) {
     return;
   }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // Ignore ESRCH if already dead.
-  }
+  trackedExternals.set(externalKey(pid, startTime), { pid, startTime, label });
 }
 
-function cleanupTrackedPids() {
-  for (const pid of trackedPids) {
-    forceKillPid(pid);
+function retireExternalIfDead(pid, startTime) {
+  if (!Number.isInteger(pid) || pid <= 0 || typeof startTime !== "string" || startTime.length === 0) {
+    return false;
   }
-  trackedPids.clear();
+  if (!isSameProcessAlive(pid, startTime)) {
+    trackedExternals.delete(externalKey(pid, startTime));
+    return true;
+  }
+  return false;
+}
+
+async function stopExternalAndRetire(pid, startTime, label = "external") {
+  if (!Number.isInteger(pid) || pid <= 0 || typeof startTime !== "string" || startTime.length === 0) {
+    return;
+  }
+  const key = externalKey(pid, startTime);
+  const stopped = await terminateExternalProcess(pid, startTime, 2000);
+  if (!stopped) {
+    throw new Error(`Failed to confirm termination of ${label} process pid=${pid}`);
+  }
+  trackedExternals.delete(key);
+}
+
+async function cleanupAllTracked() {
+  const errors = [];
+
+  for (const entry of [...ownedChildren]) {
+    try {
+      await entry.ensureStopped();
+    } catch (err) {
+      errors.push(err);
+    }
+  }
+
+  for (const entry of [...trackedExternals.values()]) {
+    try {
+      await stopExternalAndRetire(entry.pid, entry.startTime, entry.label);
+    } catch (err) {
+      errors.push(err);
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new AggregateError(errors, `Cleanup failed for ${errors.length} tracked process(es)`);
+  }
 }
 
 function createDeferred() {
@@ -59,8 +97,8 @@ function spawnWorker(args) {
   const child = spawn(process.execPath, [WORKER_PATH, ...args], {
     stdio: ["pipe", "pipe", "pipe"],
   });
-  trackPid(child.pid);
 
+  let exitedFlag = false;
   const lines = [];
   const lineWaiters = [];
   let stdoutBuf = "";
@@ -79,11 +117,11 @@ function spawnWorker(args) {
         continue;
       }
       const parsed = JSON.parse(rawLine);
-      if (parsed.holderPid) {
-        trackPid(parsed.holderPid);
+      if (parsed.holderPid && parsed.holderStartTime) {
+        trackExternal(parsed.holderPid, parsed.holderStartTime, "holder");
       }
-      if (parsed.childPid) {
-        trackPid(parsed.childPid);
+      if (parsed.childPid && parsed.childStartTime) {
+        trackExternal(parsed.childPid, parsed.childStartTime, "detached-child");
       }
       if (lineWaiters.length > 0) {
         const waiter = lineWaiters.shift();
@@ -98,9 +136,12 @@ function spawnWorker(args) {
     stderrBuf += chunk.toString("utf8");
   });
 
+  let ownerHandle;
+
   const exited = new Promise((resolve) => {
     child.once("exit", (code, signal) => {
-      trackedPids.delete(child.pid);
+      exitedFlag = true;
+      ownedChildren.delete(ownerHandle);
       while (lineWaiters.length > 0) {
         const waiter = lineWaiters.shift();
         waiter.reject(
@@ -153,21 +194,44 @@ function spawnWorker(args) {
     return exited;
   };
 
-  return {
+  const ensureStopped = async () => {
+    if (!exitedFlag) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Ignore ESRCH if exited concurrently.
+      }
+      await exited;
+    }
+  };
+
+  ownerHandle = {
     child,
     pid: child.pid,
+    hasExited: () => exitedFlag,
     nextEvent,
     sendLine,
     releaseAndWait,
+    ensureStopped,
     exited,
   };
+  ownedChildren.add(ownerHandle);
+
+  return ownerHandle;
 }
 
 async function runTryOnce(args) {
   const worker = spawnWorker(["--mode", "try-once", ...args]);
-  const event = await worker.nextEvent();
-  const exit = await worker.exited;
-  return { event, exit };
+  try {
+    const event = await worker.nextEvent();
+    const exit = await worker.exited;
+    if (event.holderPid && event.holderStartTime) {
+      retireExternalIfDead(event.holderPid, event.holderStartTime);
+    }
+    return { event, exit };
+  } finally {
+    await worker.ensureStopped();
+  }
 }
 
 function waitForKernelLockRelease(lockPath, timeoutSec = 5) {
@@ -222,7 +286,7 @@ async function check1OwnerConflict(scratchRoot) {
     const acquired1 = await owner1.nextEvent();
     assert.equal(acquired1.event, "acquired");
     assert.equal(acquired1.epoch, 1);
-    assert.equal(isProcessAliveNonZombie(acquired1.holderPid), true);
+    assert.equal(isSameProcessAlive(acquired1.holderPid, acquired1.holderStartTime), true);
 
     const ownerJsonPath = path.join(stateRoot, "owner.json");
     const before = snapshotFile(ownerJsonPath);
@@ -236,7 +300,7 @@ async function check1OwnerConflict(scratchRoot) {
     assert.equal(after.sha256, before.sha256, "owner.json content changed on owner_conflict");
     assert.equal(after.ino, before.ino, "owner.json inode changed on owner_conflict");
     assert.equal(after.mtimeMs, before.mtimeMs, "owner.json mtime changed on owner_conflict");
-    assert.equal(isProcessAliveNonZombie(acquired1.holderPid), true, "owner1 holder died after conflict");
+    assert.equal(isSameProcessAlive(acquired1.holderPid, acquired1.holderStartTime), true, "owner1 holder died after conflict");
 
     // Prove owner1 still actively holds its lease and can commit queued writes.
     owner1.sendLine("write:owner1-proof.txt");
@@ -247,12 +311,11 @@ async function check1OwnerConflict(scratchRoot) {
 
     const exit1 = await owner1.releaseAndWait();
     assert.equal(exit1.code, 0);
-    assert.equal(isProcessAliveNonZombie(acquired1.holderPid), false);
+    assert.equal(retireExternalIfDead(acquired1.holderPid, acquired1.holderStartTime), true);
 
     return `owner1(pid=${owner1.pid}, holderPid=${acquired1.holderPid}, epoch=1) held lease; owner2 exited code=${attempt2.exit.code} with code=${attempt2.event.code}; owner.json sha256 unchanged (${before.sha256.slice(0, 12)}); owner1 queued write succeeded after conflict`;
   } finally {
-    forceKillPid(owner1.pid);
-    await owner1.exited;
+    await owner1.ensureStopped();
   }
 }
 
@@ -268,7 +331,7 @@ async function check2Kill9Release(scratchRoot) {
     assert.equal(acquired1.event, "acquired");
     assert.equal(acquired1.epoch, 1);
     assert.equal(isProcessAliveNonZombie(owner1.pid), true);
-    assert.equal(isProcessAliveNonZombie(acquired1.holderPid), true);
+    assert.equal(isSameProcessAlive(acquired1.holderPid, acquired1.holderStartTime), true);
 
     const killStart = performance.now();
     process.kill(owner1.pid, "SIGKILL");
@@ -280,8 +343,8 @@ async function check2Kill9Release(scratchRoot) {
     const releaseMs = Number((performance.now() - killStart).toFixed(2));
 
     assert.equal(
-      isProcessAliveNonZombie(acquired1.holderPid),
-      false,
+      retireExternalIfDead(acquired1.holderPid, acquired1.holderStartTime),
+      true,
       `holder1 (pid=${acquired1.holderPid}) still alive after lock release`,
     );
 
@@ -306,14 +369,13 @@ async function check2Kill9Release(scratchRoot) {
 
     const exit2 = await owner2.releaseAndWait();
     assert.equal(exit2.code, 0);
+    assert.equal(retireExternalIfDead(acquired2.holderPid, acquired2.holderStartTime), true);
 
     return `SIGKILL owner1(pid=${owner1.pid}) -> holder1(pid=${acquired1.holderPid}) exited & kernel lock released in ${releaseMs}ms; owner2(pid=${owner2.pid}, holderPid=${acquired2.holderPid}) acquired epoch=2 (total ${reacquireMs}ms); owner3 blocked with owner_conflict`;
   } finally {
-    forceKillPid(owner1.pid);
-    await owner1.exited;
+    await owner1.ensureStopped();
     if (owner2) {
-      forceKillPid(owner2.pid);
-      await owner2.exited;
+      await owner2.ensureStopped();
     }
   }
 }
@@ -348,7 +410,7 @@ async function check3SimulatedReload(scratchRoot) {
   try {
     const lease1 = await mod1.acquireLease({ projectKey, stateRoot });
     activeLease = lease1;
-    trackPid(lease1.holderPid);
+    trackExternal(lease1.holderPid, lease1.holderStartTime, "reload-holder");
     assert.equal(lease1.epoch, 1);
 
     const registry = getGlobalLeaseRegistry();
@@ -361,11 +423,11 @@ async function check3SimulatedReload(scratchRoot) {
     // Reload: acquire from second module instance WITHOUT calling lease1.release().
     const lease2 = await mod2.acquireLease({ projectKey, stateRoot });
     activeLease = lease2;
-    trackPid(lease2.holderPid);
+    trackExternal(lease2.holderPid, lease2.holderStartTime, "reload-holder");
 
     assert.equal(lease1.isRevoked(), true, "lease1 not marked revoked on reload handoff");
-    assert.equal(isProcessAliveNonZombie(lease1.holderPid), false, "lease1 holder still alive after reload handoff");
-    assert.equal(isProcessAliveNonZombie(lease2.holderPid), true, "lease2 holder not alive");
+    assert.equal(retireExternalIfDead(lease1.holderPid, lease1.holderStartTime), true, "lease1 holder still alive after reload handoff");
+    assert.equal(isSameProcessAlive(lease2.holderPid, lease2.holderStartTime), true, "lease2 holder not alive");
     assert.notEqual(lease2.holderPid, lease1.holderPid);
     assert.equal(lease2.epoch, 2);
     assert.equal(registry.get(projectKey)?.holderPid, lease2.holderPid);
@@ -389,15 +451,17 @@ async function check3SimulatedReload(scratchRoot) {
 
     // Stress 10 consecutive simulated reloads with zero sleeps to prove no close-vs-acquire race.
     let prevHolderPid = lease2.holderPid;
+    let prevHolderStartTime = lease2.holderStartTime;
     for (let round = 3; round <= 12; round += 1) {
       const nextMod = await loadFreshLeaseModuleInstance(moduleDir, round);
       assert.notEqual(nextMod.MODULE_INSTANCE_ID, activeLease.moduleInstanceId);
       const nextLease = await nextMod.acquireLease({ projectKey, stateRoot });
-      trackPid(nextLease.holderPid);
-      assert.equal(isProcessAliveNonZombie(prevHolderPid), false);
+      trackExternal(nextLease.holderPid, nextLease.holderStartTime, "reload-holder");
+      assert.equal(retireExternalIfDead(prevHolderPid, prevHolderStartTime), true);
       assert.equal(nextLease.epoch, round);
       assert.equal(registry.get(projectKey)?.holderPid, nextLease.holderPid);
       prevHolderPid = nextLease.holderPid;
+      prevHolderStartTime = nextLease.holderStartTime;
       activeLease = nextLease;
     }
 
@@ -405,7 +469,10 @@ async function check3SimulatedReload(scratchRoot) {
     assert.equal(diskOwner.epoch, 12);
     assert.equal(diskOwner.holderPid, activeLease.holderPid);
 
+    const finalPid = activeLease.holderPid;
+    const finalStartTime = activeLease.holderStartTime;
     await activeLease.release();
+    assert.equal(retireExternalIfDead(finalPid, finalStartTime), true);
     assert.equal(registry.has(projectKey), false);
     activeLease = null;
 
@@ -418,7 +485,10 @@ async function check3SimulatedReload(scratchRoot) {
     return `[simulated reload; real Pi /reload is another ticket] distinct module instances (${mod1.MODULE_INSTANCE_ID.slice(0, 8)} -> ${mod2.MODULE_INSTANCE_ID.slice(0, 8)}, separate LeaseError constructors) handed off via process-global registry; 12/12 back-to-back reloads succeeded with zero sleeps (epoch 1 -> 12, stale lease1 rejected with lease_revoked)`;
   } finally {
     if (activeLease) {
+      const pid = activeLease.holderPid;
+      const startTime = activeLease.holderStartTime;
       await activeLease.release();
+      retireExternalIfDead(pid, startTime);
     }
   }
 }
@@ -432,7 +502,7 @@ async function check4WithdrawalQueuedWork(scratchRoot) {
   const forbiddenEffectMarker = path.join(stateRoot, "forbidden-effect.marker");
 
   const lease = await acquireLease({ projectKey, stateRoot });
-  trackPid(lease.holderPid);
+  trackExternal(lease.holderPid, lease.holderStartTime, "check4-holder");
 
   const seqGate = createDeferred();
   const releaseItem0Gate = createDeferred();
@@ -503,7 +573,7 @@ async function check4WithdrawalQueuedWork(scratchRoot) {
     trace.push("revoke:flag_set");
 
     // Verify holder pipe is NOT closed before queue drains: external owner still gets owner_conflict.
-    assert.equal(isProcessAliveNonZombie(lease.holderPid), true, "holder exited before queue drained");
+    assert.equal(isSameProcessAlive(lease.holderPid, lease.holderStartTime), true, "holder exited before queue drained");
     const duringDrain = await runTryOnce(["--state-root", stateRoot, "--project-key", projectKey]);
     assert.equal(duringDrain.event.code, "owner_conflict", "lock released prematurely before queue drained");
     assert.equal(duringDrain.exit.code, 2);
@@ -538,7 +608,7 @@ async function check4WithdrawalQueuedWork(scratchRoot) {
     assert.equal(fs.existsSync(item0WriteFile), true, "item0 pre-withdrawal write missing");
     assert.equal(fs.existsSync(forbiddenWriteMarker), false, "forbidden-write.marker appeared!");
     assert.equal(fs.existsSync(forbiddenEffectMarker), false, "forbidden-effect.marker appeared!");
-    assert.equal(isProcessAliveNonZombie(lease.holderPid), false, "holder still alive after revoke resolved");
+    assert.equal(retireExternalIfDead(lease.holderPid, lease.holderStartTime), true, "holder still alive after revoke resolved");
 
     // Confirm another owner process can now acquire cleanly.
     const afterRevoke = await runTryOnce(["--state-root", stateRoot, "--project-key", projectKey]);
@@ -546,73 +616,177 @@ async function check4WithdrawalQueuedWork(scratchRoot) {
     assert.equal(afterRevoke.event.event, "acquired");
     assert.equal(afterRevoke.event.epoch, 2);
 
-    // Sub-proof B: external SIGKILL of holder revokes lease and fails queued work closed.
+    // Sub-proof B (S1): deterministic dead, unreaped zombie holder caught BEFORE exit callback runs.
     const stateRootKill = path.join(scratchRoot, "check4-holder-kill");
+    const killWriteOk = path.join(stateRootKill, "pre-kill-write.ok");
     const killMarker = path.join(stateRootKill, "forbidden-after-holder-kill.marker");
     const killLease = await acquireLease({ projectKey: "0404040404040405", stateRoot: stateRootKill });
-    trackPid(killLease.holderPid);
+    trackExternal(killLease.holderPid, killLease.holderStartTime, "check4-kill-holder");
+    let sawRevokedFalseBeforePreEffect = false;
+    let sawZombieState = false;
+    let sawKillZeroOnZombie = false;
     try {
-      process.kill(killLease.holderPid, "SIGKILL");
-      await waitForKernelLockRelease(path.join(stateRootKill, "owner.lock"), 5);
+      const lockPathKill = path.join(stateRootKill, "owner.lock");
       await assert.rejects(
         () =>
           killLease.enqueue({
-            write: () => fs.writeFileSync(killMarker, "should-not-write"),
-            effect: () => fs.writeFileSync(killMarker, "should-not-effect"),
+            write: () => {
+              fs.writeFileSync(killWriteOk, `epoch=${killLease.epoch}\n`, "utf8");
+              // Kill holder and synchronously block in Linux flock(2) waitqueue WITHOUT yielding
+              // to the JS event loop so holder exit callbacks have not run yet.
+              process.kill(killLease.holderPid, "SIGKILL");
+              const waitRes = spawnSync("flock", ["--exclusive", "--timeout", "5", lockPathKill, "true"]);
+              assert.equal(waitRes.status, 0, `synchronous flock release wait failed: ${waitRes.status}`);
+              // Finish the microsecond kernel exit_files -> exit_notify transition synchronously
+              // without yielding to the JS event loop so holder is deterministically in state Z.
+              let stat = readProcessStat(killLease.holderPid);
+              const zDeadline = performance.now() + 500;
+              while (stat !== null && stat.state !== "Z" && performance.now() < zDeadline) {
+                stat = readProcessStat(killLease.holderPid);
+              }
+              sawRevokedFalseBeforePreEffect = killLease.isRevoked() === false;
+              sawZombieState = stat !== null && stat.state === "Z";
+              try {
+                process.kill(killLease.holderPid, 0);
+                sawKillZeroOnZombie = true;
+              } catch {
+                sawKillZeroOnZombie = false;
+              }
+            },
+            effect: () => {
+              fs.writeFileSync(killMarker, "should-not-effect\n", "utf8");
+            },
           }),
-        (err) => err instanceof LeaseError && err.code === "lease_revoked",
+        (err) =>
+          err instanceof LeaseError &&
+          err.code === "lease_revoked" &&
+          err.message.includes("no longer alive"),
       );
-      assert.equal(fs.existsSync(killMarker), false);
+      assert.equal(sawRevokedFalseBeforePreEffect, true, "exit callback ran before pre-effect liveness guard");
+      assert.equal(sawZombieState, true, "expected unreaped zombie state Z before event loop poll");
+      assert.equal(sawKillZeroOnZombie, true, "expected kill(pid, 0) to succeed on Linux zombie");
+      assert.equal(fs.existsSync(killWriteOk), true);
+      assert.equal(fs.existsSync(killMarker), false, "effect ran after dead unreaped holder");
       assert.equal(killLease.isRevoked(), true);
     } finally {
+      const pid = killLease.holderPid;
+      const startTime = killLease.holderStartTime;
       await killLease.release();
+      retireExternalIfDead(pid, startTime);
     }
 
-    // Sub-proof C: epoch drift in owner.json fails queued work closed with lease_revoked.
-    const stateRootEpoch = path.join(scratchRoot, "check4-epoch-drift");
-    const epochMarker = path.join(stateRootEpoch, "forbidden-after-epoch-drift.marker");
-    const epochLease = await acquireLease({ projectKey: "0404040404040406", stateRoot: stateRootEpoch });
-    trackPid(epochLease.holderPid);
+    // Sub-proof C1 (S1): epoch drift between an authorized write and its effect blocks the effect.
+    const stateRootEpochEffect = path.join(scratchRoot, "check4-epoch-effect");
+    const epochWriteOk = path.join(stateRootEpochEffect, "authorized-write.ok");
+    const epochEffectMarker = path.join(stateRootEpochEffect, "forbidden-effect-after-epoch-drift.marker");
+    const epochEffectLease = await acquireLease({ projectKey: "0404040404040406", stateRoot: stateRootEpochEffect });
+    trackExternal(epochEffectLease.holderPid, epochEffectLease.holderStartTime, "check4-epoch-effect-holder");
     try {
-      const drifted = { ...readOwnerRecord(stateRootEpoch), epoch: epochLease.epoch + 1 };
-      fs.writeFileSync(path.join(stateRootEpoch, "owner.json"), `${JSON.stringify(drifted, null, 2)}\n`, "utf8");
       await assert.rejects(
         () =>
-          epochLease.enqueue({
-            write: () => fs.writeFileSync(epochMarker, "should-not-write"),
-            effect: () => fs.writeFileSync(epochMarker, "should-not-effect"),
+          epochEffectLease.enqueue({
+            write: () => {
+              fs.writeFileSync(epochWriteOk, `epoch=${epochEffectLease.epoch}\n`, "utf8");
+              const drifted = { ...readOwnerRecord(stateRootEpochEffect), epoch: epochEffectLease.epoch + 1 };
+              fs.writeFileSync(
+                path.join(stateRootEpochEffect, "owner.json"),
+                `${JSON.stringify(drifted, null, 2)}\n`,
+                "utf8",
+              );
+            },
+            effect: () => {
+              fs.writeFileSync(epochEffectMarker, "should-not-effect\n", "utf8");
+            },
           }),
-        (err) => err instanceof LeaseError && err.code === "lease_revoked",
+        (err) =>
+          err instanceof LeaseError &&
+          err.code === "lease_revoked" &&
+          err.message.includes("epoch mismatch"),
       );
-      assert.equal(fs.existsSync(epochMarker), false);
-      assert.equal(epochLease.isRevoked(), true);
+      assert.equal(fs.existsSync(epochWriteOk), true);
+      assert.equal(fs.existsSync(epochEffectMarker), false, "effect ran despite epoch drift after write");
+      assert.equal(epochEffectLease.isRevoked(), true);
     } finally {
-      await epochLease.release();
+      const pid = epochEffectLease.holderPid;
+      const startTime = epochEffectLease.holderStartTime;
+      await epochEffectLease.release();
+      retireExternalIfDead(pid, startTime);
     }
 
-    return `FIFO order verified; revoked set synchronously before drain; lock stayed held during drain (owner_conflict); 5/5 post-revocation steps rejected with lease_revoked; forbidden-write.marker and forbidden-effect.marker absent; external holder SIGKILL and owner.json epoch drift both failed closed with lease_revoked; trace=[${trace.join(" -> ")}]`;
+    // Sub-proof C2: epoch drift before write blocks both write and effect.
+    const stateRootEpochWrite = path.join(scratchRoot, "check4-epoch-write");
+    const epochWriteMarker = path.join(stateRootEpochWrite, "forbidden-write-after-epoch-drift.marker");
+    const epochWriteLease = await acquireLease({ projectKey: "0404040404040407", stateRoot: stateRootEpochWrite });
+    trackExternal(epochWriteLease.holderPid, epochWriteLease.holderStartTime, "check4-epoch-write-holder");
+    try {
+      const drifted = { ...readOwnerRecord(stateRootEpochWrite), epoch: epochWriteLease.epoch + 1 };
+      fs.writeFileSync(
+        path.join(stateRootEpochWrite, "owner.json"),
+        `${JSON.stringify(drifted, null, 2)}\n`,
+        "utf8",
+      );
+      await assert.rejects(
+        () =>
+          epochWriteLease.enqueue({
+            write: () => fs.writeFileSync(epochWriteMarker, "should-not-write\n", "utf8"),
+            effect: () => fs.writeFileSync(epochWriteMarker, "should-not-effect\n", "utf8"),
+          }),
+        (err) =>
+          err instanceof LeaseError &&
+          err.code === "lease_revoked" &&
+          err.message.includes("epoch mismatch"),
+      );
+      assert.equal(fs.existsSync(epochWriteMarker), false);
+      assert.equal(epochWriteLease.isRevoked(), true);
+    } finally {
+      const pid = epochWriteLease.holderPid;
+      const startTime = epochWriteLease.holderStartTime;
+      await epochWriteLease.release();
+      retireExternalIfDead(pid, startTime);
+    }
+
+    return `FIFO order verified; revoked set synchronously before drain; lock stayed held during drain (owner_conflict); 5/5 post-revocation steps rejected with lease_revoked; forbidden-write.marker and forbidden-effect.marker absent; unreaped zombie holder (stat=Z, kill(0)=true, revoked=false) caught synchronously before exit callback; epoch drift blocked both pre-effect (after authorized write) and pre-write; trace=[${trace.join(" -> ")}]`;
   } finally {
     seqGate.resolve();
     releaseItem0Gate.resolve();
+    const pid = lease.holderPid;
+    const startTime = lease.holderStartTime;
     await lease.release();
+    retireExternalIfDead(pid, startTime);
   }
 }
 
 async function check5NonInheritance(scratchRoot) {
   const stateRoot = path.join(scratchRoot, "check5");
+  const childPidFile = path.join(scratchRoot, "check5-child.json");
   const projectKey = "0505050505050505";
   const lockPath = path.join(stateRoot, "owner.lock");
 
-  const owner1 = spawnWorker(["--mode", "hold-with-child", "--state-root", stateRoot, "--project-key", projectKey]);
+  const owner1 = spawnWorker([
+    "--mode",
+    "hold-with-child",
+    "--state-root",
+    stateRoot,
+    "--project-key",
+    projectKey,
+    "--child-pid-file",
+    childPidFile,
+  ]);
   let owner2 = null;
   let survivingChildPid = null;
+  let survivingChildStartTime = null;
 
   try {
+    const spawnedEvt = await owner1.nextEvent();
+    assert.equal(spawnedEvt.event, "child_spawned");
+    survivingChildPid = spawnedEvt.childPid;
+    survivingChildStartTime = spawnedEvt.childStartTime;
+
     const acquired1 = await owner1.nextEvent();
     assert.equal(acquired1.event, "acquired_with_child");
     assert.equal(acquired1.epoch, 1);
-    survivingChildPid = acquired1.childPid;
-    trackPid(survivingChildPid);
+    assert.equal(acquired1.childPid, survivingChildPid);
+    assert.equal(acquired1.childStartTime, survivingChildStartTime);
 
     // Kernel-level proof: every new fd created by acquireLease in parent has O_CLOEXEC.
     const ioFds = acquired1.newParentFds.filter((f) => f.target.startsWith("socket:") || f.target.startsWith("pipe:"));
@@ -625,8 +799,12 @@ async function check5NonInheritance(scratchRoot) {
       );
     }
 
-    // Kernel-level proof: surviving child inherited none of the parent's holder fds.
+    // Kernel-level proof: surviving child inherited none of the parent's holder fds or any pipe/socket.
     const parentTargets = new Set(acquired1.newParentFds.map((f) => f.target));
+    const childStdioByFd = new Map(acquired1.childFds.map((f) => [f.fd, f.target]));
+    assert.equal(childStdioByFd.get("0"), "/dev/null", "expected child fd 0 -> /dev/null");
+    assert.equal(childStdioByFd.get("1"), "/dev/null", "expected child fd 1 -> /dev/null");
+    assert.equal(childStdioByFd.get("2"), "/dev/null", "expected child fd 2 -> /dev/null");
     for (const childFd of acquired1.childFds) {
       assert.equal(
         parentTargets.has(childFd.target),
@@ -634,15 +812,15 @@ async function check5NonInheritance(scratchRoot) {
         `child inherited parent holder fd target ${childFd.target}`,
       );
       assert.equal(
-        childFd.target,
-        "/dev/null",
-        `unexpected child fd ${childFd.fd} -> ${childFd.target}`,
+        childFd.target.startsWith("socket:") || childFd.target.startsWith("pipe:"),
+        false,
+        `child inherited unexpected socket/pipe fd ${childFd.fd} -> ${childFd.target}`,
       );
     }
 
     assert.equal(isProcessAliveNonZombie(owner1.pid), true);
-    assert.equal(isProcessAliveNonZombie(acquired1.holderPid), true);
-    assert.equal(isProcessAliveNonZombie(survivingChildPid), true);
+    assert.equal(isSameProcessAlive(acquired1.holderPid, acquired1.holderStartTime), true);
+    assert.equal(isSameProcessAlive(survivingChildPid, survivingChildStartTime), true);
 
     // Kill owner1 with real SIGKILL while child stays alive.
     const killStart = performance.now();
@@ -650,35 +828,59 @@ async function check5NonInheritance(scratchRoot) {
     const exit1 = await owner1.exited;
     assert.equal(exit1.signal, "SIGKILL");
 
-    assert.equal(isProcessAliveNonZombie(survivingChildPid), true, "child died with owner1; cannot prove non-inheritance");
+    assert.equal(
+      isSameProcessAlive(survivingChildPid, survivingChildStartTime),
+      true,
+      "child died with owner1; cannot prove non-inheritance",
+    );
 
     await waitForKernelLockRelease(lockPath, 5);
     const releaseMs = Number((performance.now() - killStart).toFixed(2));
 
-    assert.equal(isProcessAliveNonZombie(acquired1.holderPid), false, "holder1 did not exit while child remained alive");
-    assert.equal(isProcessAliveNonZombie(survivingChildPid), true, "child exited before owner2 check");
+    assert.equal(
+      retireExternalIfDead(acquired1.holderPid, acquired1.holderStartTime),
+      true,
+      "holder1 did not exit while child remained alive",
+    );
+    assert.equal(
+      isSameProcessAlive(survivingChildPid, survivingChildStartTime),
+      true,
+      "child exited before owner2 check",
+    );
 
     owner2 = spawnWorker(["--mode", "hold", "--state-root", stateRoot, "--project-key", projectKey]);
     const acquired2 = await owner2.nextEvent();
     assert.equal(acquired2.event, "acquired");
     assert.equal(acquired2.epoch, 2);
-    assert.equal(isProcessAliveNonZombie(survivingChildPid), true, "child must still be alive when owner2 acquires");
+    assert.equal(
+      isSameProcessAlive(survivingChildPid, survivingChildStartTime),
+      true,
+      "child must still be alive when owner2 acquires",
+    );
 
     const exit2 = await owner2.releaseAndWait();
     assert.equal(exit2.code, 0);
+    assert.equal(retireExternalIfDead(acquired2.holderPid, acquired2.holderStartTime), true);
 
     return `parent opened ${ioFds.length} holder socket/pipe fd(s) all with O_CLOEXEC (flags=${ioFds[0].flagsOct}); child(pid=${survivingChildPid}) fds=[${acquired1.childFds.map((f) => `${f.fd}:${f.target}`).join(",")}]; SIGKILL owner1(pid=${owner1.pid}) released lock in ${releaseMs}ms and owner2 acquired epoch=2 while child remained alive`;
   } finally {
-    forceKillPid(owner1.pid);
-    await owner1.exited;
+    await owner1.ensureStopped();
     if (owner2) {
-      forceKillPid(owner2.pid);
-      await owner2.exited;
+      await owner2.ensureStopped();
     }
-    if (survivingChildPid) {
-      forceKillPid(survivingChildPid);
-      trackedPids.delete(survivingChildPid);
+    if (survivingChildPid === null && fs.existsSync(childPidFile)) {
+      try {
+        const saved = JSON.parse(fs.readFileSync(childPidFile, "utf8"));
+        survivingChildPid = saved.pid;
+        survivingChildStartTime = saved.startTime;
+      } catch {
+        // Ignore partial or removed pid file.
+      }
     }
+    if (survivingChildPid !== null && survivingChildStartTime !== null) {
+      await stopExternalAndRetire(survivingChildPid, survivingChildStartTime, "detached-child");
+    }
+    fs.rmSync(childPidFile, { force: true });
   }
 }
 
@@ -760,8 +962,11 @@ async function check6LinkedWorktrees(scratchRoot) {
 
     const exitAlpha = await ownerAlpha.releaseAndWait();
     assert.equal(exitAlpha.code, 0);
+    assert.equal(retireExternalIfDead(acquiredAlpha.holderPid, acquiredAlpha.holderStartTime), true);
+
     const exitSep = await ownerSeparate.releaseAndWait();
     assert.equal(exitSep.code, 0);
+    assert.equal(retireExternalIfDead(acquiredSep.holderPid, acquiredSep.holderStartTime), true);
     ownerSeparate = null;
 
     // After alpha releases, beta acquires the shared lease cleanly at epoch=2.
@@ -773,26 +978,17 @@ async function check6LinkedWorktrees(scratchRoot) {
 
     return `wt-alpha, completely-different-name, wt-beta-symlink, and main-clone all resolved to projectKey=${expectedKey}; beta and symlink both failed with owner_conflict (exit 2) while alpha held lease; separate-clone resolved to distinct key=${idSeparate.projectKey} and acquired independently; after alpha released, beta acquired epoch=2`;
   } finally {
-    forceKillPid(ownerAlpha.pid);
-    await ownerAlpha.exited;
+    await ownerAlpha.ensureStopped();
     if (ownerSeparate) {
-      forceKillPid(ownerSeparate.pid);
-      await ownerSeparate.exited;
+      await ownerSeparate.ensureStopped();
     }
   }
 }
 
 async function main() {
   const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-captain-p2-"));
-  const bunVersion = typeof Bun !== "undefined" ? Bun.version : "not-bun";
-  const flockVersion = execFileSync("flock", ["--version"], { encoding: "utf8" }).trim();
-  const gitVersion = runGit(["--version"]);
-  const kernel = `${os.type()} ${os.release()} ${os.arch()}`;
-
-  console.log("Probe P2: owner lease lifecycle faults");
-  console.log(`runtime: bun ${bunVersion} | ${flockVersion} | ${gitVersion} | ${kernel}`);
-  console.log("scratchRoot: <scratch>");
-  console.log("");
+  let passed = 0;
+  let failed = 0;
 
   const checks = [
     { id: "check-1", name: "second owner fails with owner_conflict and leaves owner.json untouched", fn: check1OwnerConflict },
@@ -803,10 +999,17 @@ async function main() {
     { id: "check-6", name: "differently named linked worktrees share projectKey and contend for one lease", fn: check6LinkedWorktrees },
   ];
 
-  let passed = 0;
-  let failed = 0;
-
   try {
+    const bunVersion = typeof Bun !== "undefined" ? Bun.version : "not-bun";
+    const flockVersion = execFileSync("flock", ["--version"], { encoding: "utf8" }).trim();
+    const gitVersion = runGit(["--version"]);
+    const platform = `${os.type()} ${os.arch()}`;
+
+    console.log("Probe P2: owner lease lifecycle faults");
+    console.log(`runtime: bun ${bunVersion} | ${flockVersion} | ${gitVersion} | ${platform}`);
+    console.log("scratchRoot: <scratch>");
+    console.log("");
+
     for (const check of checks) {
       const start = performance.now();
       try {
@@ -823,7 +1026,7 @@ async function main() {
       }
     }
   } finally {
-    cleanupTrackedPids();
+    await cleanupAllTracked();
     fs.rmSync(scratchRoot, { recursive: true, force: true });
   }
 
@@ -832,8 +1035,12 @@ async function main() {
   process.exit(failed === 0 ? 0 : 1);
 }
 
-main().catch((err) => {
-  cleanupTrackedPids();
+main().catch(async (err) => {
+  try {
+    await cleanupAllTracked();
+  } catch (cleanupErr) {
+    console.error(cleanupErr instanceof Error ? cleanupErr.stack : String(cleanupErr));
+  }
   console.error(err instanceof Error ? err.stack : String(err));
   process.exit(1);
 });

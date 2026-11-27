@@ -131,26 +131,73 @@ function writeOwnerRecordAtomic(stateRoot, record) {
   }
 }
 
-export function isProcessAliveNonZombie(pid) {
+export function readProcessStat(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
+    return null;
   }
   let statRaw;
   try {
     statRaw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
   } catch (err) {
     if (err && typeof err === "object" && (err.code === "ENOENT" || err.code === "ESRCH")) {
-      return false;
+      return null;
     }
     throw err;
   }
 
   const closeParen = statRaw.lastIndexOf(")");
   if (closeParen === -1 || closeParen + 2 >= statRaw.length) {
+    return null;
+  }
+  const fields = statRaw.slice(closeParen + 2).trim().split(/\s+/);
+  if (fields.length < 20) {
+    return null;
+  }
+  return {
+    state: fields[0],
+    startTime: fields[19],
+  };
+}
+
+export function isProcessAliveNonZombie(pid) {
+  const info = readProcessStat(pid);
+  if (info === null) {
     return false;
   }
-  const stateChar = statRaw[closeParen + 2];
-  return stateChar !== "Z" && stateChar !== "X" && stateChar !== "x";
+  return info.state !== "Z" && info.state !== "X" && info.state !== "x";
+}
+
+export function isSameProcessAlive(pid, expectedStartTime) {
+  if (typeof expectedStartTime !== "string" || expectedStartTime.length === 0) {
+    return false;
+  }
+  const info = readProcessStat(pid);
+  if (info === null || info.startTime !== expectedStartTime) {
+    return false;
+  }
+  return info.state !== "Z" && info.state !== "X" && info.state !== "x";
+}
+
+export async function terminateExternalProcess(pid, expectedStartTime, timeoutMs = 2000) {
+  if (!isSameProcessAlive(pid, expectedStartTime)) {
+    return true;
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (err) {
+    if (err && typeof err === "object" && err.code === "ESRCH") {
+      return true;
+    }
+    throw err;
+  }
+  const deadline = performance.now() + timeoutMs;
+  while (isSameProcessAlive(pid, expectedStartTime)) {
+    if (performance.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return true;
 }
 
 function safeEndStdin(child) {
@@ -230,12 +277,16 @@ function spawnFlockHolder(lockPath, acquireTimeoutMs) {
         return;
       }
       settled = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Ignore if already gone.
+      if (!exited) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Ignore if already gone.
+        }
       }
-      reject(new LeaseError("lease_acquire_error", `Timed out waiting for holder ready line after ${acquireTimeoutMs}ms`));
+      exitedPromise.then(() => {
+        reject(new LeaseError("lease_acquire_error", `Timed out waiting for holder ready line after ${acquireTimeoutMs}ms`));
+      });
     }, acquireTimeoutMs);
 
     const finishReject = (err) => {
@@ -331,6 +382,7 @@ export async function acquireLease({
   fs.mkdirSync(stateRoot, { recursive: true });
   const lockPath = path.join(stateRoot, "owner.lock");
   const holder = await spawnFlockHolder(lockPath, acquireTimeoutMs);
+  const holderStartTime = readProcessStat(holder.child.pid)?.startTime ?? null;
 
   let ownerRecord;
   try {
@@ -361,7 +413,11 @@ export async function acquireLease({
   let queueTail = Promise.resolve();
   let revokePromise = null;
 
-  const isHolderAlive = () => !holder.isExited() && isProcessAliveNonZombie(holder.child.pid);
+  const isHolderAlive = () =>
+    !holder.isExited() &&
+    (holderStartTime !== null
+      ? isSameProcessAlive(holder.child.pid, holderStartTime)
+      : isProcessAliveNonZombie(holder.child.pid));
 
   const assertValid = () => {
     if (revoked) {
@@ -450,6 +506,7 @@ export async function acquireLease({
     epoch: ownerRecord.epoch,
     pid: process.pid,
     holderPid: holder.child.pid,
+    holderStartTime,
     moduleInstanceId: MODULE_INSTANCE_ID,
     ownerRecord,
     isRevoked: () => revoked,
