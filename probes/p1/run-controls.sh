@@ -498,8 +498,13 @@ PY
 
   local install_out="$base/install-fabric.log"
   local rc=0
-  run_bounded_in_dir 120 "$install_out" "$base/cwd" "${env_cmd[@]}" pi install "$PI_FABRIC_SPEC" || rc=$?
+  # shellcheck disable=SC2016 # positional args expand inside inner bash -c
+  run_bounded_in_dir 120 "$install_out" "$base/cwd" \
+    bash -euo pipefail -c 'source "$1"; SAFE_PATH="$PATH"; RESOLVED_BUN_INSTALL="$2"; PI_PKG_DIR="$3"; run_fixture_cmd "$4" "$5" pi install "$6"' \
+    _ "$REPO_ROOT/probes/p1/run.sh" "$RESOLVED_BUN_INSTALL" "$PI_PKG_DIR" "$base/agent" "$base" "$PI_FABRIC_SPEC" || rc=$?
   assert_exit_code "$rc" 0 "Control 5 setup (install pi-fabric)" "$install_out" || return 1
+  assert_contains "$install_out" "Resolved Pi getAgentDir()=$base/agent" "Control 5 setup (install pi-fabric)" || return 1
+  grep -E '^(Resolved Pi getAgentDir\(\)=|Installing |Installed )' "$install_out" || return 1
 
   local drift_out="$base/drift.log"
   rc=0
