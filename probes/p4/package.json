@@ -1,0 +1,15 @@
+{
+  "name": "herdr-captain-probe-p4",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Probe P4: gdp-wired compiled kernel packaging audit for herdr-captain ADR-0003",
+  "scripts": {
+    "probe": "node scripts/run-p4.mjs",
+    "verify-manifest": "node scripts/verify-manifest.mjs",
+    "verify-offline": "node scripts/run-compiled-offline.mjs"
+  },
+  "devDependencies": {
+    "gdp-wired": "0.62.0"
+  }
+}

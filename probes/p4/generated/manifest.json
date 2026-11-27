@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "prover": "gdp-wired@0.62.0",
+  "rule": "attempt_budget",
+  "rawCompileJsSha256": "6f1636a87a66920270e875cbc3d471a55d15b16a09bc9bcad9c18deaffefcb4b",
+  "emittedHelpers": [
+    "$n",
+    "$x"
+  ],
+  "prunedHelpers": [
+    "$wordDivisionValue"
+  ],
+  "inputs": {
+    "rules/attempt-budget.mjs": "ae2312b719d1211aefdab213189aa7e9e8a20ade4d38f384ad4a729a6d6e4c20",
+    "scripts/compile-kernel.mjs": "e5576d59a0ea7c935996591cb9472859ba7cff1b5f0decf682bd42f153732d90",
+    "scripts/verify-manifest.mjs": "d66598b1c680a5008b5f9d9fe6e6156c4248321c7d8c274f41a8a45a4a9c680a"
+  },
+  "outputs": {
+    "generated/attempt-budget.js": "11ec29f5b144b1d43434a7d4bc1145febc28b12a1fb043a24cca09b5672313ed",
+    "generated/attempt-budget.d.ts": "5f3ef736a715fc750fb1999209840a267d3613453637d473f98e7bc3557e99ae"
+  },
+  "laws": [
+    "totalAttemptsUsed never exceeds totalAttemptCap",
+    "fixRoundsUsed never exceeds fixRoundCap",
+    "at most one attempt is open"
+  ],
+  "stepLaws": [
+    "an accepted fix attempt charges both totalAttemptsUsed and fixRoundsUsed",
+    "any fixRoundsUsed increase also charges totalAttemptsUsed and opens one attempt",
+    "an accepted build attempt charges totalAttemptsUsed without charging fixRoundsUsed",
+    "opening an attempt is refused while another attempt is open",
+    "settling an open attempt closes it without changing counters",
+    "counters never decrease and caps remain unchanged"
+  ]
+}
