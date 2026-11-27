@@ -934,30 +934,48 @@ function readIdentityDecisionFile(
   return parseIdentityDecision(rawText, filePath, expectedNewProjectKey);
 }
 
-function validateSerializedDecision(
-  payload: string,
-  filePath: string,
-  expectedNewProjectKey: string,
-): IdentityDecision {
-  const bytes = Buffer.from(payload, "utf8");
-  if (bytes.byteLength >= MAX_DECISION_RECORD_BYTES) {
-    throw new IdentityError(
-      "invalid_decision",
-      `${path.basename(filePath)} is ${bytes.byteLength} UTF-8 bytes; must be fewer than ${MAX_DECISION_RECORD_BYTES} bytes`,
-      { details: { filePath, byteLength: bytes.byteLength, maxBytes: MAX_DECISION_RECORD_BYTES } },
-    );
-  }
-  let decoded: string;
-  try {
-    decoded = UTF8_FATAL_DECODER.decode(bytes);
-  } catch (err) {
-    throw new IdentityError("invalid_decision", `Invalid UTF-8 in ${filePath}`, { cause: err });
-  }
-  return parseIdentityDecision(decoded, filePath, expectedNewProjectKey);
-}
-
 function decisionFilePath(stateBase: string, newProjectKey: string): string {
   return path.join(stateBase, IDENTITY_DECISIONS_DIR, `${newProjectKey}.json`);
+}
+
+function assertDecisionMatchesLive(
+  decision: IdentityDecision,
+  decisionPath: string,
+  live: LiveProjectIdentity,
+): void {
+  if (
+    decision.newProjectKey !== live.projectKey ||
+    decision.newCanonicalCommonDir !== live.canonicalCommonDir
+  ) {
+    throw new IdentityError(
+      "decision_mismatch",
+      `Identity decision at ${decisionPath} names ${decision.newCanonicalCommonDir}, which does not match live repository at ${live.canonicalCommonDir}`,
+      {
+        details: {
+          decisionPath,
+          decisionId: decision.decisionId,
+          newProjectKey: live.projectKey,
+          decisionCanonicalCommonDir: decision.newCanonicalCommonDir,
+          liveCanonicalCommonDir: live.canonicalCommonDir,
+        },
+      },
+    );
+  }
+  if (!sameStringArray(decision.rootCommitShas, live.rootCommitShas)) {
+    throw new IdentityError(
+      "decision_mismatch",
+      `Identity decision at ${decisionPath} has rootCommitShas that do not match live repository at ${live.canonicalCommonDir}`,
+      {
+        details: {
+          decisionPath,
+          decisionId: decision.decisionId,
+          newProjectKey: live.projectKey,
+          decisionRootCommitShas: [...decision.rootCommitShas],
+          liveRootCommitShas: [...live.rootCommitShas],
+        },
+      },
+    );
+  }
 }
 
 function isInterruptedRebindDecisionMatch(
@@ -1098,39 +1116,6 @@ function readAndFinishFolderIfInterrupted(
   return finishInterruptedRebind(io, folderStateRoot, record, folderDecision);
 }
 
-function matchesExistingDecisionSourceReadOnly(
-  resolvedStateBase: string,
-  oldProjectKey: string,
-  oldCanonicalCommonDir: string,
-  rootCommitShas: readonly string[],
-): boolean {
-  const oldStateRoot = path.join(resolvedStateBase, oldProjectKey);
-  const oldDirStat = lstatOrNull(oldStateRoot);
-  if (
-    oldDirStat === null ||
-    !oldDirStat.isDirectory() ||
-    lstatOrNull(path.join(oldStateRoot, PROJECT_RECORD_FILENAME)) === null
-  ) {
-    return false;
-  }
-  const record = readVerifiedFolderRecord(oldStateRoot);
-  const recordKey = record.commonDirSha256.slice(0, 16);
-  if (recordKey === oldProjectKey) {
-    return (
-      record.canonicalCommonDir === oldCanonicalCommonDir &&
-      sameStringArray(record.rootCommitShas, rootCommitShas) &&
-      !pathExistsAsDirectory(record.canonicalCommonDir)
-    );
-  }
-  const oldDecision = findInterruptedRebindDecision(resolvedStateBase, oldProjectKey, record);
-  return (
-    oldDecision !== null &&
-    oldDecision.newCanonicalCommonDir === oldCanonicalCommonDir &&
-    sameStringArray(record.rootCommitShas, rootCommitShas) &&
-    !pathExistsAsDirectory(oldDecision.newCanonicalCommonDir)
-  );
-}
-
 function resolveDecisionSourceRecord(
   io: IdentityFsOps,
   resolvedStateBase: string,
@@ -1204,108 +1189,15 @@ function writeFreshProjectRecord(
   };
 }
 
-function recoverAfterConcurrentRebindRename(
+function listSiblingProjectRecords(
   io: IdentityFsOps,
   resolvedStateBase: string,
-  oldProjectKey: string,
-  oldStateRoot: string,
-  newStateRoot: string,
-  newProjectJsonPath: string,
-  decision: IdentityDecision,
-  live: LiveProjectIdentity,
-  renameErr: unknown,
-): OpenProjectResult {
-  const destStat = lstatOrNull(newStateRoot);
-  if (destStat === null) {
-    throw new IdentityError(
-      "decision_candidate_not_found",
-      `Rebind source folder ${oldStateRoot} disappeared before rename and ${newStateRoot} does not exist`,
-      {
-        details: {
-          oldProjectKey,
-          newProjectKey: live.projectKey,
-          oldStateRoot,
-          stateRoot: newStateRoot,
-        },
-        cause: renameErr,
-      },
-    );
-  }
-  if (!destStat.isDirectory() || lstatOrNull(newProjectJsonPath) === null) {
-    throw new IdentityError(
-      "invalid_project_record",
-      `Unexpected destination state at ${newStateRoot} after concurrent rebind rename`,
-      {
-        details: { oldProjectKey, newProjectKey: live.projectKey, stateRoot: newStateRoot },
-        cause: renameErr,
-      },
-    );
-  }
-
-  const destRecord = readProjectRecordFile(newProjectJsonPath);
-  if (isMatchingInterruptedRebind(destRecord, decision, live)) {
-    fsyncDir(resolvedStateBase);
-    const updatedRecord = finishInterruptedRebind(io, newStateRoot, destRecord, decision);
-    return {
-      projectKey: live.projectKey,
-      stateRoot: newStateRoot,
-      record: cloneProjectRecord(updatedRecord),
-      originDrift: computeOriginDrift(updatedRecord.originUrl, live.originUrl),
-      created: false,
-      rebound: true,
-      appliedDecisionId: decision.decisionId,
-    };
-  }
-
-  if (
-    destRecord.canonicalCommonDir === live.canonicalCommonDir &&
-    destRecord.commonDirSha256 === live.commonDirSha256
-  ) {
-    const completedForPair =
-      destRecord.reboundFrom !== undefined &&
-      destRecord.reboundFrom.includes(oldProjectKey) &&
-      sameStringArray(destRecord.rootCommitShas, decision.rootCommitShas);
-    if (completedForPair) {
-      return {
-        projectKey: live.projectKey,
-        stateRoot: newStateRoot,
-        record: cloneProjectRecord(destRecord),
-        originDrift: computeOriginDrift(destRecord.originUrl, live.originUrl),
-        created: false,
-        rebound: false,
-        appliedDecisionId: null,
-      };
-    }
-    throw new IdentityError(
-      "rebind_destination_exists",
-      `Destination ${live.projectKey} already exists and was not rebound from ${oldProjectKey}`,
-      {
-        details: { oldProjectKey, newProjectKey: live.projectKey, stateRoot: newStateRoot },
-        cause: renameErr,
-      },
-    );
-  }
-
-  throw new IdentityError(
-    "identity_mismatch",
-    `Destination ${newStateRoot} holds ${destRecord.canonicalCommonDir}, which does not match rebind from ${oldProjectKey} to ${live.projectKey}`,
-    {
-      details: {
-        oldProjectKey,
-        newProjectKey: live.projectKey,
-        storedCanonicalCommonDir: destRecord.canonicalCommonDir,
-        liveCanonicalCommonDir: live.canonicalCommonDir,
-      },
-      cause: renameErr,
-    },
-  );
-}
-
-function scanRelocationCandidates(
-  io: IdentityFsOps,
-  resolvedStateBase: string,
-  live: LiveProjectIdentity,
-): RelocationCandidate[] {
+  excludeProjectKey: string,
+): Array<{
+  readonly projectKey: string;
+  readonly stateRoot: string;
+  readonly record: ProjectRecord;
+}> {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(resolvedStateBase, { withFileTypes: true }) as fs.Dirent[];
@@ -1317,13 +1209,17 @@ function scanRelocationCandidates(
     throw err;
   }
 
-  const candidates: RelocationCandidate[] = [];
+  const siblings: Array<{
+    readonly projectKey: string;
+    readonly stateRoot: string;
+    readonly record: ProjectRecord;
+  }> = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) {
       continue;
     }
     const siblingKey = entry.name;
-    if (!PROJECT_KEY_PATTERN.test(siblingKey) || siblingKey === live.projectKey) {
+    if (!PROJECT_KEY_PATTERN.test(siblingKey) || siblingKey === excludeProjectKey) {
       continue;
     }
 
@@ -1339,15 +1235,44 @@ function scanRelocationCandidates(
       siblingKey,
       siblingStateRoot,
     );
+    siblings.push({ projectKey: siblingKey, stateRoot: siblingStateRoot, record });
+  }
 
+  return siblings;
+}
+
+function hasStateFolderReboundFrom(
+  io: IdentityFsOps,
+  resolvedStateBase: string,
+  projectKey: string,
+): boolean {
+  for (const sibling of listSiblingProjectRecords(io, resolvedStateBase, projectKey)) {
+    if (sibling.record.reboundFrom?.includes(projectKey)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function scanRelocationCandidates(
+  io: IdentityFsOps,
+  resolvedStateBase: string,
+  live: LiveProjectIdentity,
+): RelocationCandidate[] {
+  const candidates: RelocationCandidate[] = [];
+  for (const { projectKey, stateRoot, record } of listSiblingProjectRecords(
+    io,
+    resolvedStateBase,
+    live.projectKey,
+  )) {
     if (
       sameStringArray(record.rootCommitShas, live.rootCommitShas) &&
       record.originUrl === live.originUrl &&
       !pathExistsAsDirectory(record.canonicalCommonDir)
     ) {
       candidates.push({
-        projectKey: siblingKey,
-        stateRoot: siblingStateRoot,
+        projectKey,
+        stateRoot,
         slug: record.slug,
         canonicalCommonDir: record.canonicalCommonDir,
         commonDirSha256: record.commonDirSha256,
@@ -1457,14 +1382,14 @@ export function recordIdentityDecision(
   let existingDecision: IdentityDecision | null = null;
   if (lstatOrNull(decisionPath) !== null) {
     existingDecision = readIdentityDecisionFile(decisionPath, live.projectKey);
-    const destMatches =
-      existingDecision.newProjectKey === live.projectKey &&
-      existingDecision.newCanonicalCommonDir === live.canonicalCommonDir &&
-      sameStringArray(existingDecision.rootCommitShas, live.rootCommitShas);
-    if (!destMatches) {
+    assertDecisionMatchesLive(existingDecision, decisionPath, live);
+    if (
+      existingDecision.choice === "new_project" &&
+      hasStateFolderReboundFrom(DEFAULT_FS_OPS, resolvedStateBase, live.projectKey)
+    ) {
       throw new IdentityError(
         "decision_mismatch",
-        `Existing identity decision at ${decisionPath} names another pair`,
+        `Existing identity decision at ${decisionPath} was already used for a new project that has moved on`,
         {
           details: {
             decisionPath,
@@ -1495,12 +1420,13 @@ export function recordIdentityDecision(
         );
       }
       if (
-        !matchesExistingDecisionSourceReadOnly(
+        resolveDecisionSourceRecord(
+          DEFAULT_FS_OPS,
           resolvedStateBase,
           existingDecision.oldProjectKey,
           existingDecision.oldCanonicalCommonDir,
           existingDecision.rootCommitShas,
-        )
+        ) === null
       ) {
         throw new IdentityError(
           "decision_mismatch",
@@ -1562,8 +1488,6 @@ export function recordIdentityDecision(
   const decisionsDir = path.join(resolvedStateBase, IDENTITY_DECISIONS_DIR);
   const fileName = `${live.projectKey}.json`;
   const payload = `${JSON.stringify(decision, null, 2)}\n`;
-  // Check the serialized decision with the reader's own rules before publishing.
-  const validatedDecision = validateSerializedDecision(payload, decisionPath, live.projectKey);
   const writtenPath = writePayloadExclusive(
     decisionsDir,
     fileName,
@@ -1574,21 +1498,16 @@ export function recordIdentityDecision(
 
   return {
     decisionPath: writtenPath,
-    decision: cloneIdentityDecision(validatedDecision),
+    decision: cloneIdentityDecision(decision),
   };
 }
 
-export function openProject(
-  cwd: string,
-  stateBase: string,
-  options?: IdentityOperationOptions,
+function openProjectAttempt(
+  io: IdentityFsOps,
+  resolvedStateBase: string,
+  live: LiveProjectIdentity,
+  canRetryLostRebindRace: boolean,
 ): OpenProjectResult {
-  requireNonEmptyString(cwd, "cwd");
-  requireNonEmptyString(stateBase, "stateBase");
-
-  const io = resolveFsOps(options?.fs);
-  const resolvedStateBase = path.resolve(stateBase);
-  const live = resolveProjectIdentity(cwd);
   const newStateRoot = path.join(resolvedStateBase, live.projectKey);
   const newProjectJsonPath = path.join(newStateRoot, PROJECT_RECORD_FILENAME);
   const decisionPath = decisionFilePath(resolvedStateBase, live.projectKey);
@@ -1597,6 +1516,10 @@ export function openProject(
     lstatOrNull(decisionPath) !== null
       ? readIdentityDecisionFile(decisionPath, live.projectKey)
       : null;
+
+  if (decision !== null) {
+    assertDecisionMatchesLive(decision, decisionPath, live);
+  }
 
   const destStat = lstatOrNull(newStateRoot);
   if (destStat !== null) {
@@ -1651,32 +1574,18 @@ export function openProject(
         );
       }
 
-      if (decision !== null) {
-        if (decision.newCanonicalCommonDir !== live.canonicalCommonDir) {
+      if (decision !== null && decision.choice === "rebind") {
+        const rebindCompleted =
+          decision.oldProjectKey !== null &&
+          stored.reboundFrom !== undefined &&
+          stored.reboundFrom.includes(decision.oldProjectKey) &&
+          sameStringArray(stored.rootCommitShas, decision.rootCommitShas);
+        if (!rebindCompleted) {
           throw new IdentityError(
-            "decision_mismatch",
-            `Identity decision at ${decisionPath} does not match live repository for ${live.projectKey}`,
-            {
-              details: {
-                decisionPath,
-                decisionId: decision.decisionId,
-                newProjectKey: live.projectKey,
-              },
-            },
+            "rebind_destination_exists",
+            `Destination ${live.projectKey} already exists and was not rebound from ${String(decision.oldProjectKey)}`,
+            { details: { oldProjectKey: decision.oldProjectKey, newProjectKey: live.projectKey } },
           );
-        }
-        if (decision.choice === "rebind") {
-          const rebindCompleted =
-            decision.oldProjectKey !== null &&
-            stored.reboundFrom !== undefined &&
-            stored.reboundFrom.includes(decision.oldProjectKey);
-          if (!rebindCompleted) {
-            throw new IdentityError(
-              "rebind_destination_exists",
-              `Destination ${live.projectKey} already exists and was not rebound from ${String(decision.oldProjectKey)}`,
-              { details: { oldProjectKey: decision.oldProjectKey, newProjectKey: live.projectKey } },
-            );
-          }
         }
       }
 
@@ -1700,6 +1609,7 @@ export function openProject(
         );
       }
       if (isMatchingInterruptedRebind(stored, decision, live)) {
+        fsyncDir(resolvedStateBase);
         const updatedRecord = finishInterruptedRebind(io, newStateRoot, stored, decision);
         return {
           projectKey: live.projectKey,
@@ -1745,25 +1655,20 @@ export function openProject(
     return writeFreshProjectRecord(io, live, newStateRoot, null);
   }
 
-  if (
-    decision.newProjectKey !== live.projectKey ||
-    decision.newCanonicalCommonDir !== live.canonicalCommonDir ||
-    !sameStringArray(decision.rootCommitShas, live.rootCommitShas)
-  ) {
-    throw new IdentityError(
-      "decision_mismatch",
-      `Identity decision at ${decisionPath} does not match live repository at ${live.canonicalCommonDir}`,
-      {
-        details: {
-          decisionPath,
-          decisionId: decision.decisionId,
-          newProjectKey: live.projectKey,
-        },
-      },
-    );
-  }
-
   if (decision.choice === "new_project") {
+    if (hasStateFolderReboundFrom(io, resolvedStateBase, live.projectKey)) {
+      throw new IdentityError(
+        "decision_mismatch",
+        `Identity decision at ${decisionPath} was already used for a new project that has moved on`,
+        {
+          details: {
+            decisionPath,
+            decisionId: decision.decisionId,
+            newProjectKey: live.projectKey,
+          },
+        },
+      );
+    }
     if (decision.oldProjectKey !== null && decision.oldCanonicalCommonDir !== null) {
       const oldSource = resolveDecisionSourceRecord(
         io,
@@ -1798,14 +1703,42 @@ export function openProject(
     throw new IdentityError("invalid_decision", `Rebind decision at ${decisionPath} is missing oldProjectKey`);
   }
 
-  const oldSource = resolveDecisionSourceRecord(
-    io,
-    resolvedStateBase,
-    oldProjectKey,
-    oldCanonicalCommonDir,
-    decision.rootCommitShas,
-  );
+  let oldSource: { readonly stateRoot: string; readonly record: ProjectRecord } | null;
+  try {
+    oldSource = resolveDecisionSourceRecord(
+      io,
+      resolvedStateBase,
+      oldProjectKey,
+      oldCanonicalCommonDir,
+      decision.rootCommitShas,
+    );
+  } catch (err) {
+    const code = getErrnoCode(err);
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      if (canRetryLostRebindRace) {
+        return openProjectAttempt(io, resolvedStateBase, live, false);
+      }
+      throw new IdentityError(
+        "decision_mismatch",
+        `Identity decision at ${decisionPath} names ${oldProjectKey} -> ${decision.newProjectKey}, whose source folder disappeared during rebind`,
+        {
+          details: {
+            decisionPath,
+            decisionId: decision.decisionId,
+            oldProjectKey,
+            newProjectKey: live.projectKey,
+          },
+          cause: err,
+        },
+      );
+    }
+    throw err;
+  }
+
   if (oldSource === null) {
+    if (canRetryLostRebindRace && lstatOrNull(newStateRoot) !== null) {
+      return openProjectAttempt(io, resolvedStateBase, live, false);
+    }
     throw new IdentityError(
       "decision_mismatch",
       `Identity decision at ${decisionPath} names ${oldProjectKey} -> ${decision.newProjectKey}, which does not match the current move`,
@@ -1840,14 +1773,6 @@ export function openProject(
     "project_record_too_large",
   );
 
-  if (lstatOrNull(newStateRoot) !== null) {
-    throw new IdentityError(
-      "rebind_destination_exists",
-      `Rebind destination already exists: ${newStateRoot}`,
-      { details: { oldProjectKey, newProjectKey: live.projectKey, stateRoot: newStateRoot } },
-    );
-  }
-
   // Step 1: Move old project folder to new key in one rename; no file inside is rewritten.
   // An empty directory appearing between the existence check and rename(2) is atomically
   // replaced by POSIX rename(2); it holds no files or state, so replacing it loses nothing.
@@ -1855,7 +1780,31 @@ export function openProject(
     io.renameSync(oldStateRoot, newStateRoot);
   } catch (err) {
     const code = getErrnoCode(err);
-    if (code === "ENOTEMPTY" || code === "EEXIST" || code === "ENOTDIR" || code === "EISDIR") {
+    if (
+      code === "ENOENT" ||
+      code === "ENOTEMPTY" ||
+      code === "EEXIST" ||
+      code === "ENOTDIR" ||
+      code === "EISDIR"
+    ) {
+      if (canRetryLostRebindRace) {
+        return openProjectAttempt(io, resolvedStateBase, live, false);
+      }
+      if (code === "ENOENT") {
+        throw new IdentityError(
+          "decision_mismatch",
+          `Identity decision at ${decisionPath} names ${oldProjectKey} -> ${decision.newProjectKey}, whose source folder disappeared before rename`,
+          {
+            details: {
+              decisionPath,
+              decisionId: decision.decisionId,
+              oldProjectKey,
+              newProjectKey: live.projectKey,
+            },
+            cause: err,
+          },
+        );
+      }
       throw new IdentityError(
         "rebind_destination_exists",
         `Rebind destination already exists with content: ${newStateRoot}`,
@@ -1863,19 +1812,6 @@ export function openProject(
           details: { oldProjectKey, newProjectKey: live.projectKey, stateRoot: newStateRoot },
           cause: err,
         },
-      );
-    }
-    if (code === "ENOENT") {
-      return recoverAfterConcurrentRebindRename(
-        io,
-        resolvedStateBase,
-        oldProjectKey,
-        oldStateRoot,
-        newStateRoot,
-        newProjectJsonPath,
-        decision,
-        live,
-        err,
       );
     }
     throw err;
@@ -1902,4 +1838,18 @@ export function openProject(
     rebound: true,
     appliedDecisionId: decision.decisionId,
   };
+}
+
+export function openProject(
+  cwd: string,
+  stateBase: string,
+  options?: IdentityOperationOptions,
+): OpenProjectResult {
+  requireNonEmptyString(cwd, "cwd");
+  requireNonEmptyString(stateBase, "stateBase");
+
+  const io = resolveFsOps(options?.fs);
+  const resolvedStateBase = path.resolve(stateBase);
+  const live = resolveProjectIdentity(cwd);
+  return openProjectAttempt(io, resolvedStateBase, live, true);
 }
