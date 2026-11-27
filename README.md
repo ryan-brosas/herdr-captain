@@ -51,4 +51,4 @@ Run the five pre-build walking-skeleton probes in [docs/proof-plan.md](docs/proo
 
 ## Licence
 
-The licence is not chosen yet.
+MIT. See [LICENSE](LICENSE).
