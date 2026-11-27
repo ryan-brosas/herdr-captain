@@ -1,12 +1,26 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const FABRIC_PROVIDER_REGISTER_EVENT = "pi-fabric:provider:register:v1";
-const FABRIC_PROVIDER_DISCOVER_EVENT = "pi-fabric:provider:discover:v1";
-const FABRIC_PROVIDER_WITHDRAW_EVENT = "pi-fabric:provider:withdraw:v1";
-const FABRIC_PROGRAM_RUN_EVENT = "pi-fabric:program:run:v1";
+const ALLOWED_ENV_KEYS = new Set([
+  "BUN_INSTALL",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_TERMINAL_PROMPT",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "PATH",
+  "PI_CODING_AGENT_DIR",
+  "PI_SKIP_VERSION_CHECK",
+  "TMPDIR",
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+]);
 
 interface CliArgs {
   scratchDir: string;
@@ -14,7 +28,15 @@ interface CliArgs {
   cwd: string;
   label: string;
   expectedVersion: string;
-  expectedPackagePath?: string;
+  expectedPackagePath: string;
+  piPackageDir?: string;
+}
+
+interface FabricProtocolModule {
+  FABRIC_PROVIDER_REGISTER_EVENT?: unknown;
+  FABRIC_PROVIDER_DISCOVER_EVENT?: unknown;
+  FABRIC_PROVIDER_WITHDRAW_EVENT?: unknown;
+  FABRIC_PROGRAM_RUN_EVENT?: unknown;
 }
 
 interface ProgramRunReply {
@@ -48,18 +70,22 @@ function parseArgs(argv: string[]): CliArgs {
     return value;
   };
 
-  const expectedPackagePath = values.get("expected-package-path");
+  const piPackageDir = values.get("pi-package-dir");
   return {
     scratchDir: requireFlag("scratch"),
     agentDir: requireFlag("agent-dir"),
     cwd: requireFlag("cwd"),
     label: values.get("label") ?? "default",
     expectedVersion: requireFlag("expected-version"),
-    ...(expectedPackagePath !== undefined ? { expectedPackagePath } : {}),
+    expectedPackagePath: requireFlag("expected-package-path"),
+    ...(piPackageDir !== undefined ? { piPackageDir } : {}),
   };
 }
 
-function findPiCodingAgentPackageDir(): string {
+function findPiCodingAgentPackageDir(explicitDir?: string): string {
+  if (explicitDir && existsSync(join(explicitDir, "package.json"))) {
+    return realpathSync(explicitDir);
+  }
   const envOverride = process.env.PI_CODING_AGENT_PACKAGE_DIR;
   if (envOverride && existsSync(join(envOverride, "package.json"))) {
     return realpathSync(envOverride);
@@ -134,6 +160,7 @@ function assertWithinScratch(targetPath: string, scratchDir: string, label: stri
 
 function runFabricProgram(
   eventBus: { emit(channel: string, data: unknown): void },
+  programRunEvent: string,
   code: string,
   timeoutMs = 30_000,
 ): Promise<ProgramRunReply> {
@@ -145,7 +172,7 @@ function runFabricProgram(
       rejectPromise(new Error(`Timed out after ${timeoutMs}ms waiting for Fabric program reply`));
     }, timeoutMs);
 
-    eventBus.emit(FABRIC_PROGRAM_RUN_EVENT, {
+    eventBus.emit(programRunEvent, {
       code,
       reply(result: ProgramRunReply) {
         if (settled) return;
@@ -159,6 +186,7 @@ function runFabricProgram(
 
 async function verifyActiveFleet(
   eventBus: { emit(channel: string, data: unknown): void },
+  programRunEvent: string,
   expectedVersion: string,
   phase: string,
 ) {
@@ -172,7 +200,7 @@ async function verifyActiveFleet(
     const toolsCallResult = await tools.call({ ref: "fleet.status", args: {} });
     return { providers, listed, searched, described, directZeroArgs, directResult, toolsCallResult };
   `;
-  const reply = await runFabricProgram(eventBus, statusProgram);
+  const reply = await runFabricProgram(eventBus, programRunEvent, statusProgram);
   assert(reply.ok, `${phase}: status program failed: ${reply.error ?? "unknown error"}`);
 
   const value = reply.value as {
@@ -240,7 +268,7 @@ async function verifyActiveFleet(
       };
     }
   `;
-  const rejectReply = await runFabricProgram(eventBus, rejectExtraArgProgram);
+  const rejectReply = await runFabricProgram(eventBus, programRunEvent, rejectExtraArgProgram);
   assert(
     rejectReply.ok,
     `${phase}: closed-schema check program failed: ${rejectReply.error ?? "unknown error"}`,
@@ -264,6 +292,7 @@ async function verifyActiveFleet(
 
 async function verifyWithdrawnFleet(
   eventBus: { emit(channel: string, data: unknown): void },
+  programRunEvent: string,
   phase: string,
 ) {
   const withdrawnProgram = `
@@ -293,7 +322,7 @@ async function verifyWithdrawnFleet(
     };
   `;
 
-  const reply = await runFabricProgram(eventBus, withdrawnProgram);
+  const reply = await runFabricProgram(eventBus, programRunEvent, withdrawnProgram);
   assert(reply.ok, `${phase}: withdrawal verification program failed: ${reply.error ?? "unknown error"}`);
   const value = reply.value as {
     providers: Array<{ name?: string }>;
@@ -339,11 +368,32 @@ async function verifyWithdrawnFleet(
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const piPackageDir = findPiCodingAgentPackageDir();
+
+  // Verify process environment allowlist and scratch HOME before loading Pi or pi-fabric.
+  const initialEnvKeys = Object.keys(process.env).sort();
+  const unexpectedEnvKeys = initialEnvKeys.filter((key) => !ALLOWED_ENV_KEYS.has(key));
+  assert(
+    unexpectedEnvKeys.length === 0,
+    `Unexpected inherited environment variables in fixture: ${unexpectedEnvKeys.join(", ")}`,
+  );
+  const resolvedHome = assertWithinScratch(homedir(), args.scratchDir, "os.homedir()");
+  assert(
+    typeof process.env.HOME === "string" && realpathSync(process.env.HOME) === resolvedHome,
+    `process.env.HOME (${String(process.env.HOME)}) !== os.homedir() (${resolvedHome})`,
+  );
+
+  const piPackageDir = findPiCodingAgentPackageDir(args.piPackageDir);
   const piModuleUrl = pathToFileURL(join(piPackageDir, "dist", "index.js")).href;
   const piSdk = (await import(piModuleUrl)) as {
     createAgentSession: (options: Record<string, unknown>) => Promise<{
       session: {
+        model?: { provider?: string; id?: string };
+        modelRuntime: {
+          getAvailableSnapshot(): unknown[];
+          getProviders(): Array<{ id: string }>;
+          hasConfiguredAuth(providerId: string): boolean;
+          checkAuth(providerId: string): Promise<unknown>;
+        };
         bindExtensions(bindings: Record<string, unknown>): Promise<void>;
         reload(options?: Record<string, unknown>): Promise<void>;
         dispose(): void;
@@ -353,6 +403,7 @@ async function main(): Promise<void> {
         errors: Array<{ path: string; error: string }>;
         warnings?: Array<{ path: string; warning: string }>;
       };
+      modelFallbackMessage?: string;
     }>;
     createEventBus: () => {
       emit(channel: string, data: unknown): void;
@@ -381,12 +432,70 @@ async function main(): Promise<void> {
   assert(!existsSync(join(resolvedPiAgentDir, "auth.json")), "Fixture agentDir must not have auth.json");
 
   const resolvedCwd = assertWithinScratch(args.cwd, args.scratchDir, "cwd");
-  const piFabricPkgPath = join(resolvedPiAgentDir, "npm", "node_modules", "pi-fabric", "package.json");
+  const piFabricDir = join(resolvedPiAgentDir, "npm", "node_modules", "pi-fabric");
+  const piFabricPkgPath = join(piFabricDir, "package.json");
   assert(existsSync(piFabricPkgPath), `pi-fabric is not installed in fixture at ${piFabricPkgPath}`);
-  const piFabricPkg = JSON.parse(readFileSync(piFabricPkgPath, "utf8")) as { version?: string };
+  const piFabricPkg = JSON.parse(readFileSync(piFabricPkgPath, "utf8")) as {
+    version?: string;
+    exports?: Record<string, { import?: string } | string>;
+  };
   assert(
     piFabricPkg.version === "0.140.1",
     `Expected pi-fabric 0.140.1 in fixture, got ${String(piFabricPkg.version)}`,
+  );
+
+  // Verify the three event channel literals in src/index.ts match installed pi-fabric's protocol export.
+  const protocolExport = piFabricPkg.exports?.["./protocol"];
+  const protocolRelPath =
+    typeof protocolExport === "string"
+      ? protocolExport
+      : typeof protocolExport === "object" && protocolExport !== null
+        ? protocolExport.import
+        : undefined;
+  assert(
+    typeof protocolRelPath === "string" && protocolRelPath.length > 0,
+    "Installed pi-fabric package.json is missing ./protocol import export",
+  );
+  const fabricProtocolPath = realpathSync(resolve(piFabricDir, protocolRelPath));
+  const fabricProtocol = (await import(pathToFileURL(fabricProtocolPath).href)) as FabricProtocolModule;
+
+  const expectedRoot = realpathSync(resolve(args.expectedPackagePath));
+  const captainEntryPath = join(expectedRoot, "src", "index.ts");
+  assert(existsSync(captainEntryPath), `herdr-captain entry not found at ${captainEntryPath}`);
+  const captainModule = (await import(pathToFileURL(captainEntryPath).href)) as FabricProtocolModule;
+
+  const requireEventString = (value: unknown, label: string): string => {
+    assert(typeof value === "string" && value.length > 0, `${label} must be a non-empty string`);
+    return value;
+  };
+  const fabricRegisterEvent = requireEventString(
+    fabricProtocol.FABRIC_PROVIDER_REGISTER_EVENT,
+    "pi-fabric FABRIC_PROVIDER_REGISTER_EVENT",
+  );
+  const fabricDiscoverEvent = requireEventString(
+    fabricProtocol.FABRIC_PROVIDER_DISCOVER_EVENT,
+    "pi-fabric FABRIC_PROVIDER_DISCOVER_EVENT",
+  );
+  const fabricWithdrawEvent = requireEventString(
+    fabricProtocol.FABRIC_PROVIDER_WITHDRAW_EVENT,
+    "pi-fabric FABRIC_PROVIDER_WITHDRAW_EVENT",
+  );
+  const fabricProgramRunEvent = requireEventString(
+    fabricProtocol.FABRIC_PROGRAM_RUN_EVENT,
+    "pi-fabric FABRIC_PROGRAM_RUN_EVENT",
+  );
+
+  assert(
+    captainModule.FABRIC_PROVIDER_REGISTER_EVENT === fabricRegisterEvent,
+    `FABRIC_PROVIDER_REGISTER_EVENT drift: src/index.ts=${String(captainModule.FABRIC_PROVIDER_REGISTER_EVENT)} vs pi-fabric=${fabricRegisterEvent}`,
+  );
+  assert(
+    captainModule.FABRIC_PROVIDER_DISCOVER_EVENT === fabricDiscoverEvent,
+    `FABRIC_PROVIDER_DISCOVER_EVENT drift: src/index.ts=${String(captainModule.FABRIC_PROVIDER_DISCOVER_EVENT)} vs pi-fabric=${fabricDiscoverEvent}`,
+  );
+  assert(
+    captainModule.FABRIC_PROVIDER_WITHDRAW_EVENT === fabricWithdrawEvent,
+    `FABRIC_PROVIDER_WITHDRAW_EVENT drift: src/index.ts=${String(captainModule.FABRIC_PROVIDER_WITHDRAW_EVENT)} vs pi-fabric=${fabricWithdrawEvent}`,
   );
 
   // Passive observers on the real Pi event bus (no mocking or stubbing).
@@ -404,13 +513,13 @@ async function main(): Promise<void> {
     counters.fleetWithdrawEvents = 0;
   };
 
-  eventBus.on(FABRIC_PROVIDER_REGISTER_EVENT, (payload: unknown) => {
+  eventBus.on(fabricRegisterEvent, (payload: unknown) => {
     const provider = (payload as { provider?: { name?: unknown } } | null)?.provider;
     if (provider?.name === "fleet") {
       counters.fleetRegisterEvents += 1;
     }
   });
-  eventBus.on(FABRIC_PROVIDER_DISCOVER_EVENT, (payload: unknown) => {
+  eventBus.on(fabricDiscoverEvent, (payload: unknown) => {
     const discovery = payload as {
       version?: unknown;
       register?: (provider: { name?: unknown }, options?: unknown) => void;
@@ -427,7 +536,7 @@ async function main(): Promise<void> {
       originalRegister(provider, options);
     };
   });
-  eventBus.on(FABRIC_PROVIDER_WITHDRAW_EVENT, (payload: unknown) => {
+  eventBus.on(fabricWithdrawEvent, (payload: unknown) => {
     const name = (payload as { name?: unknown } | null)?.name;
     if (name === "fleet") {
       counters.fleetWithdrawEvents += 1;
@@ -454,18 +563,15 @@ async function main(): Promise<void> {
   );
 
   const loadedPaths = initialExtensions.extensions.map((ext) => realpathSync(ext.resolvedPath));
-  const hasPiFabric = loadedPaths.some((p) => p.startsWith(join(resolvedPiAgentDir, "npm", "node_modules", "pi-fabric")));
+  const hasPiFabric = loadedPaths.some((p) => p.startsWith(piFabricDir));
   assert(hasPiFabric, `pi-fabric extension did not load from fixture: ${JSON.stringify(loadedPaths)}`);
-  if (args.expectedPackagePath) {
-    const expectedRoot = realpathSync(resolve(args.expectedPackagePath));
-    const hasCaptain = loadedPaths.some((p) => p === join(expectedRoot, "src", "index.ts"));
-    assert(
-      hasCaptain,
-      `herdr-captain extension did not load from expected path ${expectedRoot}: ${JSON.stringify(loadedPaths)}`,
-    );
-  }
+  const hasCaptain = loadedPaths.some((p) => p === captainEntryPath);
+  assert(
+    hasCaptain,
+    `herdr-captain extension did not load from expected path ${expectedRoot}: ${JSON.stringify(loadedPaths)}`,
+  );
 
-  const { session } = await piSdk.createAgentSession({
+  const { session, modelFallbackMessage } = await piSdk.createAgentSession({
     cwd: resolvedCwd,
     agentDir: resolvedPiAgentDir,
     resourceLoader,
@@ -474,10 +580,49 @@ async function main(): Promise<void> {
   });
 
   try {
+    // Prove Pi's ModelRuntime sees zero credentials and zero available models.
+    const availableModels = session.modelRuntime.getAvailableSnapshot();
+    assert(
+      availableModels.length === 0,
+      `Fixture ModelRuntime unexpectedly saw ${availableModels.length} available model(s)`,
+    );
+    const runtimeProviders = session.modelRuntime.getProviders();
+    assert(runtimeProviders.length > 0, "Expected Pi ModelRuntime to expose builtin providers for auth audit");
+    const configuredAuthProviders: string[] = [];
+    for (const provider of runtimeProviders) {
+      if (session.modelRuntime.hasConfiguredAuth(provider.id)) {
+        configuredAuthProviders.push(provider.id);
+        continue;
+      }
+      const checked = await session.modelRuntime.checkAuth(provider.id);
+      if (checked !== undefined) {
+        configuredAuthProviders.push(provider.id);
+      }
+    }
+    assert(
+      configuredAuthProviders.length === 0,
+      `Fixture ModelRuntime unexpectedly detected auth for provider(s): ${configuredAuthProviders.join(", ")}`,
+    );
+    // When findInitialModel returns undefined, pi-agent-core fills Agent.state.model
+    // with its sentinel DEFAULT_MODEL ({ provider: "unknown", id: "unknown" }) and
+    // createAgentSession sets modelFallbackMessage to the no-models-available guidance.
+    const selectedModel = session.model;
+    const isUnconfiguredModel =
+      selectedModel === undefined ||
+      (selectedModel.provider === "unknown" && selectedModel.id === "unknown");
+    assert(
+      isUnconfiguredModel,
+      `Fixture session unexpectedly selected model ${String(selectedModel?.provider)}/${String(selectedModel?.id)}`,
+    );
+    assert(
+      typeof modelFallbackMessage === "string" && modelFallbackMessage.length > 0,
+      "Expected Pi createAgentSession to report no available models in credential-free fixture",
+    );
+
     await session.bindExtensions({});
 
     // Phase 1: Startup registration, discovery, status invocation, closed schema.
-    const startupProof = await verifyActiveFleet(eventBus, args.expectedVersion, "startup");
+    const startupProof = await verifyActiveFleet(eventBus, fabricProgramRunEvent, args.expectedVersion, "startup");
     const startupCounts = { ...counters };
     assert(
       startupCounts.discoverEventsEmitted === 1,
@@ -496,7 +641,7 @@ async function main(): Promise<void> {
       reload1LifecycleCounts.fleetWithdrawEvents === 1,
       `reload1: expected 1 fleet withdraw event on session_shutdown, got ${reload1LifecycleCounts.fleetWithdrawEvents}`,
     );
-    const reload1Proof = await verifyActiveFleet(eventBus, args.expectedVersion, "reload1");
+    const reload1Proof = await verifyActiveFleet(eventBus, fabricProgramRunEvent, args.expectedVersion, "reload1");
     const reload1DiscoverCounts = {
       discoverEventsEmitted: counters.discoverEventsEmitted,
       fleetDiscoverResponses: counters.fleetDiscoverResponses,
@@ -518,7 +663,7 @@ async function main(): Promise<void> {
       reload2LifecycleCounts.fleetWithdrawEvents === 1,
       `reload2: expected 1 fleet withdraw event on session_shutdown, got ${reload2LifecycleCounts.fleetWithdrawEvents}`,
     );
-    const reload2Proof = await verifyActiveFleet(eventBus, args.expectedVersion, "reload2");
+    const reload2Proof = await verifyActiveFleet(eventBus, fabricProgramRunEvent, args.expectedVersion, "reload2");
     const reload2DiscoverCounts = {
       discoverEventsEmitted: counters.discoverEventsEmitted,
       fleetDiscoverResponses: counters.fleetDiscoverResponses,
@@ -534,14 +679,15 @@ async function main(): Promise<void> {
 
     // Phase 4: Direct withdrawal while Fabric runtime is active.
     resetCounters();
-    eventBus.emit(FABRIC_PROVIDER_WITHDRAW_EVENT, { name: "fleet" });
-    const withdrawProof = await verifyWithdrawnFleet(eventBus, "withdraw");
+    eventBus.emit(fabricWithdrawEvent, { name: "fleet" });
+    const withdrawProof = await verifyWithdrawnFleet(eventBus, fabricProgramRunEvent, "withdraw");
 
     // Verify a post-withdrawal reload cleanly restores exactly one registration.
     resetCounters();
     await session.reload();
     const postWithdrawReloadProof = await verifyActiveFleet(
       eventBus,
+      fabricProgramRunEvent,
       args.expectedVersion,
       "post-withdraw-reload",
     );
@@ -581,7 +727,7 @@ async function main(): Promise<void> {
         unloadLifecycleWithdraws === 1,
         `unload: expected 1 fleet withdraw event during session_shutdown, got ${unloadLifecycleWithdraws}`,
       );
-      unloadReloadProof = await verifyWithdrawnFleet(eventBus, "unload-reload");
+      unloadReloadProof = await verifyWithdrawnFleet(eventBus, fabricProgramRunEvent, "unload-reload");
       unloadDiscoverResponses = counters.fleetDiscoverResponses;
       assert(
         counters.discoverEventsEmitted === 1,
@@ -598,6 +744,24 @@ async function main(): Promise<void> {
     const summary = {
       label: args.label,
       piFabricVersion: piFabricPkg.version,
+      isolation: {
+        homeInScratch: true,
+        agentDirInScratch: true,
+        envKeys: initialEnvKeys,
+        checkedProviderCount: runtimeProviders.length,
+        configuredAuthProviders,
+        availableModelCount: availableModels.length,
+        selectedModel: selectedModel
+          ? `${String(selectedModel.provider)}/${String(selectedModel.id)}`
+          : null,
+        noModelsFallbackReported: true,
+      },
+      protocolCheck: {
+        matched: true,
+        register: fabricRegisterEvent,
+        discover: fabricDiscoverEvent,
+        withdraw: fabricWithdrawEvent,
+      },
       loadedExtensionCount: loadedPaths.length,
       extensionOrder: loadedPaths.map((p) =>
         p.includes(`${sep}pi-fabric${sep}`) ? "pi-fabric" : p.endsWith(`${sep}src${sep}index.ts`) ? "herdr-captain" : "other",

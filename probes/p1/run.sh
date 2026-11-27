@@ -10,6 +10,8 @@ readonly GITHUB_REPO_PREFIX="git:github.com/ryan-brosas/herdr-captain"
 
 SCRATCH=""
 PI_PKG_DIR=""
+SAFE_PATH=""
+RESOLVED_BUN_INSTALL=""
 
 err() {
   printf 'probe-p1 error: %s\n' "$*" >&2
@@ -31,6 +33,18 @@ Options:
                       (and verify the Fabric provider seam on the cloned package).
   -h, --help          Show this help text.
 EOF
+}
+
+resolve_bun_install_dir() {
+  if [[ -n "${BUN_INSTALL:-}" && -d "${BUN_INSTALL}" ]]; then
+    realpath -- "${BUN_INSTALL}"
+    return 0
+  fi
+  if [[ -n "${HOME:-}" && -d "${HOME}/.bun" ]]; then
+    realpath -- "${HOME}/.bun"
+    return 0
+  fi
+  return 0
 }
 
 resolve_pi_coding_agent_dir() {
@@ -75,23 +89,83 @@ read_package_version() {
   bun -e 'const p = JSON.parse(await Bun.file(process.argv[1]).text()); if (!p.version) process.exit(1); console.log(p.version);' "$pkg_json"
 }
 
+init_scratch_home() {
+  local scratch_real="$1"
+  mkdir -p -- \
+    "$scratch_real/home" \
+    "$scratch_real/xdg/config" \
+    "$scratch_real/xdg/cache" \
+    "$scratch_real/xdg/data" \
+    "$scratch_real/xdg/state" \
+    "$scratch_real/tmp"
+}
+
+run_with_allowlisted_env() {
+  local offline="$1"
+  local agent_dir="$2"
+  local scratch_real="$3"
+  shift 3
+
+  local resolved_agent_dir
+  resolved_agent_dir="$(realpath -- "$agent_dir")"
+  local -a env_cmd=(
+    env -i
+    "PATH=$SAFE_PATH"
+    "HOME=$scratch_real/home"
+    "XDG_CONFIG_HOME=$scratch_real/xdg/config"
+    "XDG_CACHE_HOME=$scratch_real/xdg/cache"
+    "XDG_DATA_HOME=$scratch_real/xdg/data"
+    "XDG_STATE_HOME=$scratch_real/xdg/state"
+    "TMPDIR=$scratch_real/tmp"
+    "LANG=C.UTF-8"
+    "LC_ALL=C.UTF-8"
+    "GIT_CONFIG_NOSYSTEM=1"
+    "GIT_CONFIG_GLOBAL=/dev/null"
+    "GIT_TERMINAL_PROMPT=0"
+    "PI_CODING_AGENT_DIR=$resolved_agent_dir"
+    "PI_SKIP_VERSION_CHECK=1"
+  )
+  if [[ -n "$RESOLVED_BUN_INSTALL" ]]; then
+    env_cmd+=("BUN_INSTALL=$RESOLVED_BUN_INSTALL")
+  fi
+
+  if (( offline == 1 )); then
+    unshare -rn -- "${env_cmd[@]}" "$@"
+  else
+    "${env_cmd[@]}" "$@"
+  fi
+}
+
 assert_isolated_agent_dir() {
-  local agent_dir="$1"
-  local scratch_real="$2"
+  local offline="$1"
+  local agent_dir="$2"
+  local scratch_real="$3"
   mkdir -p -- "$agent_dir"
 
   local resolved_agent_dir
   resolved_agent_dir="$(realpath -- "$agent_dir")"
-  local pi_agent_dir
-  pi_agent_dir="$(
-    PI_CODING_AGENT_DIR="$resolved_agent_dir" bun -e '
+  local probe_output
+  probe_output="$(
+    run_with_allowlisted_env "$offline" "$resolved_agent_dir" "$scratch_real" bun -e '
+      import { homedir } from "node:os";
       import { pathToFileURL } from "node:url";
       const mod = await import(pathToFileURL(process.argv[1]).href);
       console.log(mod.getAgentDir());
+      console.log(homedir());
     ' "$PI_PKG_DIR/dist/config.js"
   )"
+
+  local pi_agent_dir=""
+  local resolved_home_raw=""
+  {
+    IFS= read -r pi_agent_dir
+    IFS= read -r resolved_home_raw
+  } <<< "$probe_output"
+
   local resolved_pi_agent_dir
   resolved_pi_agent_dir="$(realpath -- "$pi_agent_dir")"
+  local resolved_home
+  resolved_home="$(realpath -- "$resolved_home_raw")"
   printf 'Resolved Pi getAgentDir()=%s\n' "$resolved_pi_agent_dir"
 
   if [[ "$resolved_pi_agent_dir" != "$resolved_agent_dir" ]]; then
@@ -100,6 +174,10 @@ assert_isolated_agent_dir() {
   fi
   if [[ "$resolved_pi_agent_dir" != "$scratch_real/"* ]]; then
     err "Isolation check failed: $resolved_pi_agent_dir is outside $scratch_real"
+    return 1
+  fi
+  if [[ "$resolved_home" != "$scratch_real/home" ]]; then
+    err "Isolation check failed: HOME ($resolved_home) !== $scratch_real/home"
     return 1
   fi
   if [[ -e "$resolved_pi_agent_dir/auth.json" ]]; then
@@ -113,28 +191,17 @@ run_fixture_cmd() {
   local scratch_real="$2"
   shift 2
 
-  assert_isolated_agent_dir "$agent_dir" "$scratch_real"
-  local resolved_agent_dir
-  resolved_agent_dir="$(realpath -- "$agent_dir")"
+  assert_isolated_agent_dir 0 "$agent_dir" "$scratch_real"
+  run_with_allowlisted_env 0 "$agent_dir" "$scratch_real" "$@"
+}
 
-  local -a clean_env=(
-    env
-    -u ANTHROPIC_API_KEY
-    -u OPENAI_API_KEY
-    -u GEMINI_API_KEY
-    -u GOOGLE_API_KEY
-    -u OPENROUTER_API_KEY
-    -u XAI_API_KEY
-    -u GROQ_API_KEY
-    -u MISTRAL_API_KEY
-    -u DEEPSEEK_API_KEY
-    -u TOGETHER_API_KEY
-    -u FIREWORKS_API_KEY
-    -u COHERE_API_KEY
-    "PI_CODING_AGENT_DIR=$resolved_agent_dir"
-    "PI_SKIP_VERSION_CHECK=1"
-  )
-  "${clean_env[@]}" "$@"
+run_offline_fixture_cmd() {
+  local agent_dir="$1"
+  local scratch_real="$2"
+  shift 2
+
+  assert_isolated_agent_dir 1 "$agent_dir" "$scratch_real"
+  run_with_allowlisted_env 1 "$agent_dir" "$scratch_real" "$@"
 }
 
 setup_probe_host() {
@@ -172,37 +239,16 @@ run_check_2_offline_install() {
   local agent_dir="$scratch_real/agent-offline"
 
   printf '\n=== Check 2: Offline local-path install (unshare -rn) ===\n'
-  assert_isolated_agent_dir "$agent_dir" "$scratch_real"
-  local resolved_agent_dir
-  resolved_agent_dir="$(realpath -- "$agent_dir")"
-
   if ! command -v unshare >/dev/null 2>&1; then
     err "Check 2 failed: unshare command not found"
     return 1
   fi
-
-  local -a clean_env=(
-    env
-    -u ANTHROPIC_API_KEY
-    -u OPENAI_API_KEY
-    -u GEMINI_API_KEY
-    -u GOOGLE_API_KEY
-    -u OPENROUTER_API_KEY
-    -u XAI_API_KEY
-    -u GROQ_API_KEY
-    -u MISTRAL_API_KEY
-    -u DEEPSEEK_API_KEY
-    -u TOGETHER_API_KEY
-    -u FIREWORKS_API_KEY
-    -u COHERE_API_KEY
-    "PI_CODING_AGENT_DIR=$resolved_agent_dir"
-    "PI_SKIP_VERSION_CHECK=1"
-  )
+  mkdir -p -- "$agent_dir"
 
   if command -v ip >/dev/null 2>&1; then
-    unshare -rn -- ip -brief link show
+    run_with_allowlisted_env 1 "$agent_dir" "$scratch_real" ip -brief link show
   fi
-  unshare -rn -- bun -e '
+  run_with_allowlisted_env 1 "$agent_dir" "$scratch_real" bun -e '
     try {
       await fetch("https://registry.npmjs.org/", { signal: AbortSignal.timeout(3000) });
       process.exit(1);
@@ -211,13 +257,13 @@ run_check_2_offline_install() {
       console.log("Offline namespace negative control blocked network: " + String(code));
     }
   '
-  unshare -rn -- "${clean_env[@]}" pi install "$REPO_ROOT"
+  run_offline_fixture_cmd "$agent_dir" "$scratch_real" pi install "$REPO_ROOT"
   if [[ ! -f "$agent_dir/settings.json" ]]; then
     err "Check 2 failed: expected $agent_dir/settings.json to be written"
     return 1
   fi
   local list_output
-  list_output="$(unshare -rn -- "${clean_env[@]}" pi list)"
+  list_output="$(run_offline_fixture_cmd "$agent_dir" "$scratch_real" pi list)"
   printf '%s\n' "$list_output"
   if [[ "$list_output" != *"$REPO_ROOT"* ]]; then
     err "Check 2 failed: offline pi list did not include $REPO_ROOT"
@@ -241,6 +287,7 @@ run_checks_3_and_4_fabric_seam() {
     --scratch "$scratch_real" \
     --agent-dir "$agent_a" \
     --cwd "$fixture_cwd" \
+    --pi-package-dir "$PI_PKG_DIR" \
     --label "fabric-first" \
     --expected-version "$pkg_version" \
     --expected-package-path "$REPO_ROOT"
@@ -254,6 +301,7 @@ run_checks_3_and_4_fabric_seam() {
     --scratch "$scratch_real" \
     --agent-dir "$agent_b" \
     --cwd "$fixture_cwd" \
+    --pi-package-dir "$PI_PKG_DIR" \
     --label "captain-first" \
     --expected-version "$pkg_version" \
     --expected-package-path "$REPO_ROOT"
@@ -286,7 +334,7 @@ run_check_5_pinned_git() {
     return 1
   fi
   local checked_out_sha
-  checked_out_sha="$(git -C "$clone_dir" rev-parse HEAD)"
+  checked_out_sha="$(run_with_allowlisted_env 0 "$agent_git" "$scratch_real" git -C "$clone_dir" rev-parse HEAD)"
   printf 'Checked out git SHA=%s\n' "$checked_out_sha"
   if [[ "$checked_out_sha" != "$git_sha" ]]; then
     err "Check 5 failed: checked out SHA $checked_out_sha !== requested $git_sha"
@@ -297,6 +345,7 @@ run_check_5_pinned_git() {
     --scratch "$scratch_real" \
     --agent-dir "$agent_git" \
     --cwd "$fixture_cwd" \
+    --pi-package-dir "$PI_PKG_DIR" \
     --label "pinned-git" \
     --expected-version "$pkg_version" \
     --expected-package-path "$clone_dir"
@@ -345,6 +394,9 @@ main() {
   SCRATCH="$(mktemp -d /tmp/herdr-captain-p1.XXXXXX)"
   local scratch_real
   scratch_real="$(realpath -- "$SCRATCH")"
+  init_scratch_home "$scratch_real"
+  SAFE_PATH="$PATH"
+  RESOLVED_BUN_INSTALL="$(resolve_bun_install_dir)"
   PI_PKG_DIR="$(resolve_pi_coding_agent_dir)"
 
   local pkg_version
