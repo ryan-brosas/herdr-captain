@@ -23,6 +23,7 @@ import {
   acquireSkippingRegistryCleanup,
   createBrokenLivenessAdapter,
   createBrokenRevokedAfterDrainAdapter,
+  MISSING_ZOMBIE_REJECTION_CAUSE,
   verifyControlledRevocationDrain,
   verifyReloadHandoffStep,
   verifyUnreapedZombiePreEffect,
@@ -36,6 +37,7 @@ import {
   OWNER_WORKER_PATH,
   ProcessTracker,
   readFirstLine,
+  scanProcessesByEnvToken,
   snapshotFile,
   stopProcessesByEnvToken,
   waitForKernelLockRelease,
@@ -49,6 +51,79 @@ function makeStatLine(pid: number, comm: string, state: string, startTime: strin
   // Linux /proc/<pid>/stat: fields 3..22 after ") " -> state is field[0], starttime is field[19].
   const middle = Array.from({ length: 18 }, () => "0").join(" ");
   return `${pid} (${comm}) ${state} ${middle} ${startTime} 0 0\n`;
+}
+
+interface FixtureProcEntry {
+  pid: number;
+  stat?: string;
+  statMode?: number;
+  environ?: string;
+  environMode?: number;
+  uids?: [number, number, number, number];
+  uidMap?: string;
+}
+
+function createFixtureProcRoot(
+  procRoot: string,
+  selfStartTime: string,
+  entries: FixtureProcEntry[],
+  selfUidMap?: string,
+): { procRoot: string; restoreModes: () => void } {
+  const chmodPaths: string[] = [];
+  fs.mkdirSync(path.join(procRoot, "self"), { recursive: true });
+  fs.writeFileSync(
+    path.join(procRoot, "self", "stat"),
+    makeStatLine(process.pid, "bun", "R", selfStartTime),
+    "utf8",
+  );
+  fs.writeFileSync(path.join(procRoot, "self", "environ"), "PATH=/usr/bin\0", "utf8");
+  if (selfUidMap !== undefined) {
+    fs.writeFileSync(path.join(procRoot, "self", "uid_map"), selfUidMap, "utf8");
+  }
+
+  for (const entry of entries) {
+    const pidDir = path.join(procRoot, String(entry.pid));
+    fs.mkdirSync(pidDir, { recursive: true });
+    if (entry.uids !== undefined) {
+      fs.writeFileSync(
+        path.join(pidDir, "status"),
+        `Name:\tfixture\nUid:\t${entry.uids.join("\t")}\n`,
+        "utf8",
+      );
+    }
+    if (entry.uidMap !== undefined) {
+      fs.writeFileSync(path.join(pidDir, "uid_map"), entry.uidMap, "utf8");
+    }
+    if (entry.stat !== undefined) {
+      const statPath = path.join(pidDir, "stat");
+      fs.writeFileSync(statPath, entry.stat, "utf8");
+      if (entry.statMode !== undefined) {
+        fs.chmodSync(statPath, entry.statMode);
+        chmodPaths.push(statPath);
+      }
+    }
+    if (entry.environ !== undefined) {
+      const envPath = path.join(pidDir, "environ");
+      fs.writeFileSync(envPath, entry.environ, "utf8");
+      if (entry.environMode !== undefined) {
+        fs.chmodSync(envPath, entry.environMode);
+        chmodPaths.push(envPath);
+      }
+    }
+  }
+
+  return {
+    procRoot,
+    restoreModes: () => {
+      for (const filePath of chmodPaths) {
+        try {
+          fs.chmodSync(filePath, 0o644);
+        } catch {
+          // Ignore if already removed.
+        }
+      }
+    },
+  };
 }
 
 function makeFakeFlockScript(binDir: string, scriptBody: string): string {
@@ -267,6 +342,11 @@ describe("Rule (a): no stealing, conflict exit code, and owner.lock preservation
 
     owner1.sendLine("write:owner1-proof.txt");
     const wrote = await owner1.nextEvent();
+    if (wrote.event === "released" && wrote.reason === "stdin_eof") {
+      assert.fail(
+        `Command "write:owner1-proof.txt" never reached owner-worker: worker stdin ended before the command arrived (event=${JSON.stringify(wrote)})`,
+      );
+    }
     expect(wrote.event).toBe("wrote");
     expect(wrote.epoch).toBe(1);
     expect(fs.readFileSync(path.join(stateRoot, "owner1-proof.txt"), "utf8")).toBe("epoch=1\n");
@@ -274,6 +354,61 @@ describe("Rule (a): no stealing, conflict exit code, and owner.lock preservation
     const exit1 = await owner1.releaseAndWait();
     expect(exit1.code).toBe(0);
     expect(suiteTracker.retireExternalIfDead(holderPid, holderStartTime)).toBe(true);
+  });
+
+  test("owner-worker hold mode distinguishes stdin_eof from release_command on final released event", async () => {
+    const stateRoot = path.join(scratchRoot, "worker-release-reason");
+    const projectKey = "0101010101010102";
+
+    // 1. Closing worker stdin without sending a `release` line reports reason="stdin_eof".
+    const eofWorker = suiteTracker.spawnWorker([
+      "--mode",
+      "hold",
+      "--state-root",
+      stateRoot,
+      "--project-key",
+      projectKey,
+    ]);
+    const acquired1 = await eofWorker.nextEvent();
+    expect(acquired1.event).toBe("acquired");
+    expect(acquired1.epoch).toBe(1);
+    const holder1Pid = acquired1.holderPid as number;
+    const holder1Start = acquired1.holderStartTime as string;
+
+    eofWorker.child.stdin?.end();
+    const releasedEof = await eofWorker.nextEvent();
+    expect(releasedEof.event).toBe("released");
+    expect(releasedEof.reason).toBe("stdin_eof");
+    expect(releasedEof.epoch).toBe(1);
+
+    const exit1 = await eofWorker.exited;
+    expect(exit1.code).toBe(0);
+    expect(suiteTracker.retireExternalIfDead(holder1Pid, holder1Start)).toBe(true);
+
+    // 2. Sending an explicit `release` line reports reason="release_command".
+    const cmdWorker = suiteTracker.spawnWorker([
+      "--mode",
+      "hold",
+      "--state-root",
+      stateRoot,
+      "--project-key",
+      projectKey,
+    ]);
+    const acquired2 = await cmdWorker.nextEvent();
+    expect(acquired2.event).toBe("acquired");
+    expect(acquired2.epoch).toBe(2);
+    const holder2Pid = acquired2.holderPid as number;
+    const holder2Start = acquired2.holderStartTime as string;
+
+    cmdWorker.sendLine("release");
+    const releasedCmd = await cmdWorker.nextEvent();
+    expect(releasedCmd.event).toBe("released");
+    expect(releasedCmd.reason).toBe("release_command");
+    expect(releasedCmd.epoch).toBe(2);
+
+    const exit2 = await cmdWorker.exited;
+    expect(exit2.code).toBe(0);
+    expect(suiteTracker.retireExternalIfDead(holder2Pid, holder2Start)).toBe(true);
   });
 
   test("P2 gap-2: raw flock --conflict-exit-code 200 separates conflict from holder failure and missing directory", async () => {
@@ -2082,9 +2217,10 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
     try {
       await assertControlFailed(
         () => verifyUnreapedZombiePreEffect(brokenNoGuard, stateRoot),
-        /expected pre-effect check to reject dead unreaped holder with no longer alive/,
+        MISSING_ZOMBIE_REJECTION_CAUSE,
         "ctrl-4a removed holder-liveness guard on zombie",
       );
+      expect(fs.existsSync(path.join(stateRoot, "forbidden-after-holder-kill.marker"))).toBe(true);
     } finally {
       await realLease.release();
       expect(suiteTracker.retireExternalIfDead(realLease.holderPid, realLease.holderStartTime)).toBe(
@@ -2114,9 +2250,10 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
     try {
       await assertControlFailed(
         () => verifyUnreapedZombiePreEffect(brokenKillZero, stateRoot),
-        /expected pre-effect check to reject dead unreaped holder with no longer alive/,
+        MISSING_ZOMBIE_REJECTION_CAUSE,
         "ctrl-4b kill(pid, 0) liveness on zombie",
       );
+      expect(fs.existsSync(path.join(stateRoot, "forbidden-after-holder-kill.marker"))).toBe(true);
     } finally {
       await realLease.release();
       expect(suiteTracker.retireExternalIfDead(realLease.holderPid, realLease.holderStartTime)).toBe(
@@ -2306,7 +2443,7 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
       },
       {
         label: "check-4-liveness",
-        expected: /expected pre-effect check to reject dead unreaped holder with no longer alive/,
+        expected: MISSING_ZOMBIE_REJECTION_CAUSE,
       },
     ];
 
@@ -2329,6 +2466,90 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
       () => assertControlFailed(async () => "unexpected-ok", /expected/, "unexpected-pass"),
       /Negative control unexpectedly passed/,
     );
+
+    // Go through verifyUnreapedZombiePreEffect itself with an unrelated rejection:
+    // the verifier must rethrow the rejection as itself, and the collector must reject it.
+    const stateRoot = path.join(scratchRoot, "ctrl8-verifier-unrelated");
+    const realLease = await acquireLease({ projectKey: "f801010101010101", stateRoot });
+    suiteTracker.trackExternal(realLease.holderPid, realLease.holderStartTime, "ctrl8-holder");
+    try {
+      const unrelatedErr = new Error("unrelated_fixture_error_from_enqueue");
+      const brokenUnrelated: OwnerLease = {
+        ...realLease,
+        enqueue: async () => {
+          throw unrelatedErr;
+        },
+      };
+
+      await assert.rejects(
+        () =>
+          assertControlFailed(
+            () => verifyUnreapedZombiePreEffect(brokenUnrelated, stateRoot),
+            MISSING_ZOMBIE_REJECTION_CAUSE,
+            "ctrl-8 verifier unrelated rejection",
+          ),
+        (err: unknown) =>
+          err instanceof Error &&
+          err.message.includes("did not match expected cause") &&
+          err.message.includes("unrelated_fixture_error_from_enqueue"),
+      );
+
+      await assert.rejects(
+        () => verifyUnreapedZombiePreEffect(brokenUnrelated, stateRoot),
+        (err: unknown) => err === unrelatedErr,
+      );
+
+      // A LeaseError with the wrong message must also reach the caller as itself and fail the collector.
+      const wrongReasonLeaseErr = new LeaseError("lease_revoked", "Owner lease has been revoked");
+      const brokenWrongLeaseErr: OwnerLease = {
+        ...realLease,
+        enqueue: async () => {
+          throw wrongReasonLeaseErr;
+        },
+      };
+
+      await assert.rejects(
+        () =>
+          assertControlFailed(
+            () => verifyUnreapedZombiePreEffect(brokenWrongLeaseErr, stateRoot),
+            MISSING_ZOMBIE_REJECTION_CAUSE,
+            "ctrl-8 verifier wrong LeaseError message",
+          ),
+        (err: unknown) =>
+          err instanceof Error &&
+          err.message.includes("did not match expected cause") &&
+          err.message.includes("Owner lease has been revoked"),
+      );
+
+      await assert.rejects(
+        () => verifyUnreapedZombiePreEffect(brokenWrongLeaseErr, stateRoot),
+        (err: unknown) => err === wrongReasonLeaseErr,
+      );
+
+      // A no-op enqueue that resolves without running write/effect must not match the zombie-control cause.
+      const brokenNoOp: OwnerLease = {
+        ...realLease,
+        enqueue: async <TWrite = unknown, TEffect = unknown>() => ({
+          writeResult: undefined as TWrite,
+          effectResult: undefined as TEffect,
+        }),
+      };
+
+      await assert.rejects(
+        () =>
+          assertControlFailed(
+            () => verifyUnreapedZombiePreEffect(brokenNoOp, stateRoot),
+            MISSING_ZOMBIE_REJECTION_CAUSE,
+            "ctrl-8 verifier no-op enqueue",
+          ),
+        /did not match expected cause/,
+      );
+    } finally {
+      await realLease.release();
+      expect(suiteTracker.retireExternalIfDead(realLease.holderPid, realLease.holderStartTime)).toBe(
+        true,
+      );
+    }
   });
 
   test("P2 ctrl-9: uncaught harness error prints original error, stops live processes, removes scratch, and exits non-zero", async () => {
@@ -2391,5 +2612,280 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
         fs.chmodSync(noAccessProc, 0o755);
       }
     }
+  });
+
+  test("fixture proc root: unreadable entry that may be ours is reported uncertain and fails cleanup", async () => {
+    if (typeof process.getuid !== "function" || process.getuid() === 0) {
+      return;
+    }
+    const myUid = process.getuid();
+    const otherUid = 0;
+    const sameNsUidMap = `${myUid} ${myUid} 1\n`;
+    const fixture = createFixtureProcRoot(
+      path.join(scratchRoot, "proc-unreadable-ours"),
+      "50000",
+      [
+        {
+          pid: 9000001,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000001, "worker", "S", "50000"),
+          environ: "HERDR_TEST_TOKEN=tok-ours\0",
+          environMode: 0o000,
+        },
+        {
+          pid: 9000002,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000002, "worker", "S", "50010"),
+          environ: "HERDR_TEST_TOKEN=tok-ours\0",
+          environMode: 0o000,
+        },
+        {
+          // Setuid-like process where real UID is ours and effective/saved/fs UIDs are root: still may be ours.
+          pid: 9000003,
+          uids: [myUid, otherUid, otherUid, otherUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000003, "helper", "S", "50020"),
+          environ: "HERDR_TEST_TOKEN=tok-ours\0",
+          environMode: 0o000,
+        },
+        {
+          // Unreadable stat for same-user process without status file (falls back to dir owner).
+          pid: 9000004,
+          stat: makeStatLine(9000004, "worker", "S", "50030"),
+          statMode: 0o000,
+          environ: "PATH=/usr/bin\0",
+        },
+      ],
+      sameNsUidMap,
+    );
+
+    try {
+      const scan = scanProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-ours", fixture.procRoot);
+      expect(scan.matches).toEqual([]);
+      const uncertainSorted = [...scan.uncertain].sort((a, b) => a.pid - b.pid);
+      expect(uncertainSorted).toEqual([
+        { pid: 9000001, startTime: "50000", reason: "unreadable_environ" },
+        { pid: 9000002, startTime: "50010", reason: "unreadable_environ" },
+        { pid: 9000003, startTime: "50020", reason: "unreadable_environ" },
+        { pid: 9000004, reason: "unreadable_stat" },
+      ]);
+
+      expect(() =>
+        findProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-ours", fixture.procRoot),
+      ).toThrow(/Uncertain process cleanup.*pid=9000001/);
+      await expect(
+        stopProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-ours", 200, fixture.procRoot),
+      ).rejects.toThrow(/Uncertain process cleanup.*unreadable_environ/);
+      expect(() => confirmProcessDead(9000004, "50030", fixture.procRoot)).toThrow();
+    } finally {
+      fixture.restoreModes();
+    }
+  });
+
+  test("fixture proc root: unreadable entry proven not ours (other user or older start time) is skipped cleanly", async () => {
+    if (typeof process.getuid !== "function" || process.getuid() === 0) {
+      return;
+    }
+    const myUid = process.getuid();
+    const otherUid = myUid === 0 ? 65534 : 0;
+    const sameNsUidMap = `${myUid} ${myUid} 1\n`;
+    const fixture = createFixtureProcRoot(
+      path.join(scratchRoot, "proc-unreadable-not-ours"),
+      "50000",
+      [
+        {
+          // Proof 1: owned by another user (all 4 UIDs != myUid), even though started after us.
+          pid: 9000011,
+          uids: [otherUid, otherUid, otherUid, otherUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000011, "daemon", "S", "50050"),
+          environ: "SECRET=1\0",
+          environMode: 0o000,
+        },
+        {
+          // Proof 1 with unreadable stat: owned by another user.
+          pid: 9000012,
+          uids: [otherUid, otherUid, otherUid, otherUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000012, "daemon", "S", "50050"),
+          statMode: 0o000,
+          environ: "SECRET=1\0",
+          environMode: 0o000,
+        },
+        {
+          // Proof 2: same user, but started strictly before our run's token existed (e.g. a key agent).
+          pid: 9000013,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000013, "ssh-agent", "S", "49999"),
+          environ: "SSH_AUTH_SOCK=/tmp/agent\0",
+          environMode: 0o000,
+        },
+        {
+          // Ancestor/host user namespace viewed from inside `unshare -c -n`: lower UID 4294967295 (unmapped).
+          pid: 9000015,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: "0 4294967295 4294967295\n",
+          stat: makeStatLine(9000015, "host-proc", "S", "50050"),
+          environ: "HOST=1\0",
+          environMode: 0o000,
+        },
+      ],
+      sameNsUidMap,
+    );
+
+    const minStartFixture = createFixtureProcRoot(
+      path.join(scratchRoot, "proc-min-start-time"),
+      "50000",
+      [
+        {
+          pid: 9000014,
+          uids: [myUid, myUid, myUid, myUid],
+          stat: makeStatLine(9000014, "agent", "S", "50005"),
+          environ: "AGENT=1\0",
+          environMode: 0o000,
+        },
+      ],
+    );
+
+    try {
+      expect(scanProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-not-ours", fixture.procRoot)).toEqual({
+        matches: [],
+        uncertain: [],
+      });
+      expect(findProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-not-ours", fixture.procRoot)).toEqual(
+        [],
+      );
+      expect(
+        await stopProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-not-ours", 200, fixture.procRoot),
+      ).toEqual([]);
+
+      // Explicit minStartTime boundary: 50005 >= 50000 is uncertain, 50005 < 50010 is proven older.
+      expect(
+        scanProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-min", minStartFixture.procRoot).uncertain,
+      ).toEqual([{ pid: 9000014, startTime: "50005", reason: "unreadable_environ" }]);
+      expect(
+        findProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-min", minStartFixture.procRoot, {
+          minStartTime: "50010",
+        }),
+      ).toEqual([]);
+    } finally {
+      fixture.restoreModes();
+      minStartFixture.restoreModes();
+    }
+  });
+
+  test("fixture proc root: malformed or cut-off stat throws in confirmProcessDead and fails env-token cleanup", async () => {
+    const myUid = typeof process.getuid === "function" ? process.getuid() : 1000;
+    const fixture = createFixtureProcRoot(path.join(scratchRoot, "proc-malformed-stat"), "50000", [
+      {
+        pid: 9000021,
+        uids: [myUid, myUid, myUid, myUid],
+        stat: "9000021 (sleep) S 1 2 3 4\n",
+        environ: "PATH=/usr/bin\0",
+      },
+      {
+        pid: 9000022,
+        uids: [myUid, myUid, myUid, myUid],
+        stat: "9000022 (broken S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20\n",
+        environ: "PATH=/usr/bin\0",
+      },
+      {
+        pid: 9000023,
+        uids: [myUid, myUid, myUid, myUid],
+        stat: makeStatLine(9000023, "sleep", "S", "notanumber"),
+        environ: "PATH=/usr/bin\0",
+      },
+      {
+        pid: 9000024,
+        uids: [myUid, myUid, myUid, myUid],
+        stat: "",
+        environ: "PATH=/usr/bin\0",
+      },
+    ]);
+
+    for (const pid of [9000021, 9000022, 9000023, 9000024]) {
+      expect(() => confirmProcessDead(pid, "50000", fixture.procRoot)).toThrow(
+        /Malformed \/proc stat/,
+      );
+    }
+
+    const scan = scanProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-malformed", fixture.procRoot);
+    expect(scan.matches).toEqual([]);
+    expect(
+      scan.uncertain.map((u) => ({ pid: u.pid, reason: u.reason })).sort((a, b) => a.pid - b.pid),
+    ).toEqual([
+      { pid: 9000021, reason: "malformed_stat" },
+      { pid: 9000022, reason: "malformed_stat" },
+      { pid: 9000023, reason: "malformed_stat" },
+      { pid: 9000024, reason: "malformed_stat" },
+    ]);
+    expect(() =>
+      findProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-malformed", fixture.procRoot),
+    ).toThrow(/Uncertain process cleanup.*malformed_stat/);
+    await expect(
+      stopProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-malformed", 200, fixture.procRoot),
+    ).rejects.toThrow(/Uncertain process cleanup.*malformed_stat/);
+  });
+
+  test("fixture proc root: absent entry or different startTime confirms death while live matching entry stays alive", async () => {
+    const myUid = typeof process.getuid === "function" ? process.getuid() : 1000;
+    const fixture = createFixtureProcRoot(path.join(scratchRoot, "proc-absent-and-live"), "50000", [
+      {
+        // Directory exists but stat is absent (ENOENT on stat).
+        pid: 9000032,
+        uids: [myUid, myUid, myUid, myUid],
+      },
+      {
+        // Valid live stat, absent environ (ENOENT on environ).
+        pid: 9000033,
+        uids: [myUid, myUid, myUid, myUid],
+        stat: makeStatLine(9000033, "exiting", "S", "50020"),
+      },
+      {
+        // Different startTime (PID reused).
+        pid: 9000034,
+        uids: [myUid, myUid, myUid, myUid],
+        stat: makeStatLine(9000034, "reused", "S", "60000"),
+        environ: "PATH=/usr/bin\0",
+      },
+      {
+        // Same startTime, live state S.
+        pid: 9000035,
+        uids: [myUid, myUid, myUid, myUid],
+        stat: makeStatLine(9000035, "alive", "S", "50020"),
+        environ: "PATH=/usr/bin\0",
+      },
+      {
+        // Same startTime, dead zombie state Z.
+        pid: 9000036,
+        uids: [myUid, myUid, myUid, myUid],
+        stat: makeStatLine(9000036, "zombie", "Z", "50020"),
+        environ: "PATH=/usr/bin\0",
+      },
+    ]);
+
+    // 9000031 has no directory at all (ENOENT).
+    expect(confirmProcessDead(9000031, "50020", fixture.procRoot)).toBe(true);
+    // 9000032 has directory but no stat file (ENOENT).
+    expect(confirmProcessDead(9000032, "50020", fixture.procRoot)).toBe(true);
+    // 9000034 has a different startTime (PID reused).
+    expect(confirmProcessDead(9000034, "50020", fixture.procRoot)).toBe(true);
+    // 9000035 has matching startTime and live state S.
+    expect(confirmProcessDead(9000035, "50020", fixture.procRoot)).toBe(false);
+    // 9000036 has matching startTime and dead state Z.
+    expect(confirmProcessDead(9000036, "50020", fixture.procRoot)).toBe(true);
+
+    // Absent stat/environ entries are skipped cleanly (not uncertain) during env-token scans.
+    expect(scanProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-absent", fixture.procRoot)).toEqual({
+      matches: [],
+      uncertain: [],
+    });
+    expect(findProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-absent", fixture.procRoot)).toEqual([]);
+    expect(
+      await stopProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-absent", 200, fixture.procRoot),
+    ).toEqual([]);
   });
 });

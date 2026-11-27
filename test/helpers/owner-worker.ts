@@ -342,10 +342,12 @@ async function main(): Promise<void> {
         ownerRecord: lease.ownerRecord,
       });
 
+      let endReason: "release_command" | "stdin_eof" = "stdin_eof";
       const rl = readline.createInterface({ input: process.stdin });
       for await (const rawLine of rl) {
         const cmd = rawLine.trim();
         if (cmd === "release") {
+          endReason = "release_command";
           break;
         }
         if (cmd.startsWith("write:")) {
@@ -371,7 +373,12 @@ async function main(): Promise<void> {
         }
       }
 
-      const releasedInfo = { pid: lease.pid, holderPid: lease.holderPid, epoch: lease.epoch };
+      const releasedInfo = {
+        pid: lease.pid,
+        holderPid: lease.holderPid,
+        epoch: lease.epoch,
+        reason: endReason,
+      };
       await lease.release();
       lease = null;
       emit({ event: "released", ...releasedInfo });

@@ -52,6 +52,9 @@ export async function assertControlFailed(
   return { error, message: detail };
 }
 
+export const MISSING_ZOMBIE_REJECTION_CAUSE =
+  /AssertionError.*pre-effect check did not reject dead unreaped holder/;
+
 /**
  * Reusable Check-4 controlled-revocation verifier.
  * Runs against the real `src/lease.ts` lease (passes) and against a broken adapter
@@ -63,10 +66,9 @@ export async function verifyControlledRevocationDrain(
     stateRoot: string;
     projectKey: string;
     tracker: ProcessTracker;
-    expectLockReleasedAfter?: boolean;
   },
 ): Promise<{ trace: string[] }> {
-  const { stateRoot, projectKey, tracker, expectLockReleasedAfter = true } = opts;
+  const { stateRoot, projectKey, tracker } = opts;
   const item0WriteFile = path.join(stateRoot, "item0-write.ok");
   const forbiddenWriteMarker = path.join(stateRoot, "forbidden-write.marker");
   const forbiddenEffectMarker = path.join(stateRoot, "forbidden-effect.marker");
@@ -182,17 +184,15 @@ export async function verifyControlledRevocationDrain(
       "holder still alive after revoke resolved",
     );
 
-    if (expectLockReleasedAfter) {
-      const afterRevoke = await tracker.runTryOnce([
-        "--state-root",
-        stateRoot,
-        "--project-key",
-        projectKey,
-      ]);
-      assert.equal(afterRevoke.exit.code, 0);
-      assert.equal(afterRevoke.event.event, "acquired");
-      assert.equal(afterRevoke.event.epoch, lease.epoch + 1);
-    }
+    const afterRevoke = await tracker.runTryOnce([
+      "--state-root",
+      stateRoot,
+      "--project-key",
+      projectKey,
+    ]);
+    assert.equal(afterRevoke.exit.code, 0);
+    assert.equal(afterRevoke.event.event, "acquired");
+    assert.equal(afterRevoke.event.epoch, lease.epoch + 1);
 
     return { trace };
   } finally {
@@ -351,39 +351,63 @@ export async function verifyUnreapedZombiePreEffect(
   let sawZombieState = false;
   let sawKillZeroOnZombie = false;
 
-  await assert.rejects(
-    () =>
-      lease.enqueue({
-        write: () => {
-          fs.writeFileSync(killWriteOk, `epoch=${lease.epoch}\n`, "utf8");
-          process.kill(lease.holderPid, "SIGKILL");
-          const waitRes = spawnSync("flock", ["--exclusive", "--timeout", "5", lockPath, "true"]);
-          assert.equal(waitRes.status, 0, `synchronous flock release wait failed: ${waitRes.status}`);
+  let rejected = false;
+  let caught: unknown = undefined;
+  try {
+    await lease.enqueue({
+      write: () => {
+        fs.writeFileSync(killWriteOk, `epoch=${lease.epoch}\n`, "utf8");
+        process.kill(lease.holderPid, "SIGKILL");
+        const waitRes = spawnSync("flock", ["--exclusive", "--timeout", "5", lockPath, "true"]);
+        assert.equal(waitRes.status, 0, `synchronous flock release wait failed: ${waitRes.status}`);
 
-          let stat = readProcessStat(lease.holderPid);
-          const zDeadline = performance.now() + 500;
-          while (stat !== null && stat.state !== "Z" && performance.now() < zDeadline) {
-            stat = readProcessStat(lease.holderPid);
-          }
-          sawRevokedFalseBeforePreEffect = lease.isRevoked() === false;
-          sawZombieState = stat !== null && stat.state === "Z";
-          try {
-            process.kill(lease.holderPid, 0);
-            sawKillZeroOnZombie = true;
-          } catch {
-            sawKillZeroOnZombie = false;
-          }
-        },
-        effect: () => {
-          fs.writeFileSync(killMarker, "should-not-effect\n", "utf8");
-        },
-      }),
-    (err: unknown) =>
-      err instanceof LeaseError &&
-      err.code === "lease_revoked" &&
-      err.message.includes("no longer alive"),
-    "expected pre-effect check to reject dead unreaped holder with no longer alive",
-  );
+        let stat = readProcessStat(lease.holderPid);
+        const zDeadline = performance.now() + 500;
+        while (stat !== null && stat.state !== "Z" && performance.now() < zDeadline) {
+          stat = readProcessStat(lease.holderPid);
+        }
+        sawRevokedFalseBeforePreEffect = lease.isRevoked() === false;
+        sawZombieState = stat !== null && stat.state === "Z";
+        try {
+          process.kill(lease.holderPid, 0);
+          sawKillZeroOnZombie = true;
+        } catch {
+          sawKillZeroOnZombie = false;
+        }
+      },
+      effect: () => {
+        fs.writeFileSync(killMarker, "should-not-effect\n", "utf8");
+      },
+    });
+  } catch (err: unknown) {
+    rejected = true;
+    caught = err;
+  }
+
+  if (!rejected) {
+    assert.equal(
+      sawRevokedFalseBeforePreEffect,
+      true,
+      "exit callback ran before pre-effect liveness guard",
+    );
+    assert.equal(sawZombieState, true, "expected unreaped zombie state Z before event loop poll");
+    assert.equal(sawKillZeroOnZombie, true, "expected kill(pid, 0) to succeed on Linux zombie");
+    assert.equal(fs.existsSync(killWriteOk), true, "write step did not run before pre-effect check");
+    assert.equal(fs.existsSync(killMarker), true, "enqueue resolved without running effect");
+    assert.fail(
+      "pre-effect check did not reject dead unreaped holder (effect ran after holder death)",
+    );
+  }
+
+  const isExpectedRejection =
+    caught instanceof LeaseError &&
+    caught.code === "lease_revoked" &&
+    caught.message.includes("no longer alive");
+  if (!isExpectedRejection) {
+    // Re-throw any other rejection as itself so callers and negative controls
+    // never mistake an unrelated error for the missing-rejection failure.
+    throw caught;
+  }
 
   assert.equal(sawRevokedFalseBeforePreEffect, true, "exit callback ran before pre-effect liveness guard");
   assert.equal(sawZombieState, true, "expected unreaped zombie state Z before event loop poll");

@@ -7,11 +7,11 @@ import { fileURLToPath } from "node:url";
 import {
   CONFLICT_EXIT_CODE,
   isSameProcessAlive,
-  readProcessStat,
   type ProcessStat,
 } from "../../src/lease.ts";
 
 const DEAD_PROCESS_STATES = new Set(["Z", "X", "x"]);
+const INVALID_LINUX_UID = "4294967295";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const OWNER_WORKER_PATH = path.join(HERE, "owner-worker.ts");
 export const HARNESS_RUNNER_PATH = path.join(HERE, "harness-runner.ts");
@@ -26,6 +26,33 @@ export interface TrackedProcessIdentity {
   pid: number;
   startTime: string;
 }
+
+export type UncertainProcessReason =
+  | "unreadable_stat"
+  | "malformed_stat"
+  | "unreadable_environ"
+  | "unreadable_stat_after"
+  | "malformed_stat_after";
+
+export interface UncertainProcessEntry {
+  pid: number;
+  startTime?: string;
+  reason: UncertainProcessReason;
+}
+
+export interface EnvTokenScanOptions {
+  minStartTime?: string;
+}
+
+export interface EnvTokenScanResult {
+  matches: TrackedProcessIdentity[];
+  uncertain: UncertainProcessEntry[];
+}
+
+type ProcessStatReadResult =
+  | { status: "ok"; stat: ProcessStat }
+  | { status: "absent" }
+  | { status: "malformed"; raw: string };
 
 export interface FdInfo {
   fd: string;
@@ -95,17 +122,12 @@ export function createDeferred<T = void>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-export function assertProcReadable(procRoot = "/proc"): void {
-  fs.readdirSync(procRoot);
-  fs.readFileSync(path.join(procRoot, "self", "stat"), "utf8");
-}
-
-function readProcessStatAt(pid: number, procRoot = "/proc"): ProcessStat | null {
-  if (procRoot === "/proc") {
-    return readProcessStat(pid);
-  }
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
-    return null;
+function readProcessStatStrict(
+  pid: number | "self",
+  procRoot = "/proc",
+): ProcessStatReadResult {
+  if (pid !== "self" && (!Number.isSafeInteger(pid) || pid <= 0)) {
+    throw new Error(`Invalid pid for readProcessStatStrict: ${String(pid)}`);
   }
   let statRaw: string;
   try {
@@ -113,31 +135,50 @@ function readProcessStatAt(pid: number, procRoot = "/proc"): ProcessStat | null 
   } catch (err: unknown) {
     const code = getErrorCode(err);
     if (code === "ENOENT" || code === "ESRCH") {
-      return null;
+      return { status: "absent" };
     }
     throw err;
   }
+  const openParen = statRaw.indexOf("(");
   const closeParen = statRaw.lastIndexOf(")");
-  if (closeParen === -1 || closeParen + 2 >= statRaw.length || statRaw[closeParen + 1] !== " ") {
-    return null;
+  if (
+    openParen <= 1 ||
+    closeParen <= openParen ||
+    closeParen + 2 >= statRaw.length ||
+    statRaw[openParen - 1] !== " " ||
+    statRaw[closeParen + 1] !== " "
+  ) {
+    return { status: "malformed", raw: statRaw };
+  }
+  const pidField = statRaw.slice(0, openParen - 1);
+  if (!/^\d+$/.test(pidField)) {
+    return { status: "malformed", raw: statRaw };
   }
   const fields = statRaw.slice(closeParen + 2).trim().split(/\s+/);
   if (fields.length < 20) {
-    return null;
+    return { status: "malformed", raw: statRaw };
   }
   const state = fields[0];
   const startTime = fields[19];
-  if (!state || !startTime || !/^\d+$/.test(startTime)) {
-    return null;
+  if (!state || !/^[A-Za-z]$/.test(state) || !startTime || !/^\d+$/.test(startTime)) {
+    return { status: "malformed", raw: statRaw };
   }
-  return { state, startTime };
+  return { status: "ok", stat: { state, startTime } };
+}
+
+export function assertProcReadable(procRoot = "/proc"): ProcessStat {
+  fs.readdirSync(procRoot);
+  const selfResult = readProcessStatStrict("self", procRoot);
+  if (selfResult.status !== "ok") {
+    throw new Error(`Unusable self/stat under ${procRoot}: ${selfResult.status}`);
+  }
+  return selfResult.stat;
 }
 
 /**
  * Confirms a tracked process identity is no longer running.
- * Unlike liveness checks (which fail closed to "not alive" on unreadable /proc),
- * cleanup verification MUST throw when /proc is unreadable so cleanup never
- * reports success without checking.
+ * Distinguishes process absence (ENOENT/ESRCH) from malformed /proc/<pid>/stat data:
+ * malformed or unreadable records throw rather than reporting the process dead.
  */
 export function confirmProcessDead(
   pid: number,
@@ -151,14 +192,17 @@ export function confirmProcessDead(
     throw new Error(`Invalid expectedStartTime for confirmProcessDead: ${String(expectedStartTime)}`);
   }
   assertProcReadable(procRoot);
-  const info = readProcessStatAt(pid, procRoot);
-  if (info === null) {
+  const result = readProcessStatStrict(pid, procRoot);
+  if (result.status === "absent") {
     return true;
   }
-  if (info.startTime !== expectedStartTime) {
+  if (result.status === "malformed") {
+    throw new Error(`Malformed /proc stat for pid=${pid} under ${procRoot}`);
+  }
+  if (result.stat.startTime !== expectedStartTime) {
     return true;
   }
-  return DEAD_PROCESS_STATES.has(info.state);
+  return DEAD_PROCESS_STATES.has(result.stat.state);
 }
 
 export async function terminateExternalProcess(
@@ -188,27 +232,130 @@ export async function terminateExternalProcess(
   return true;
 }
 
-export function findProcessesByEnvToken(
+function hasUnmappedLowerUid(uidMapRaw: string): boolean {
+  for (const rawLine of uidMapRaw.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0) {
+      continue;
+    }
+    const parts = line.split(/\s+/);
+    if (parts.length === 3 && parts[1] === INVALID_LINUX_UID) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function readSelfUidMapUsable(procRoot: string): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(procRoot, "self", "uid_map"), "utf8");
+    return raw.trim().length > 0 && !hasUnmappedLowerUid(raw);
+  } catch {
+    return false;
+  }
+}
+
+function getProcessOwnerProof(
+  pid: number,
+  procRoot: string,
+  myUid: number | null,
+  canCheckUidMap: boolean,
+): "other_user" | "maybe_ours" | "absent" {
+  const pidDir = path.join(procRoot, String(pid));
+  let dirStat: fs.Stats;
+  try {
+    dirStat = fs.statSync(pidDir);
+  } catch (err: unknown) {
+    const code = getErrorCode(err);
+    if (code === "ENOENT" || code === "ESRCH") {
+      return "absent";
+    }
+    return "maybe_ours";
+  }
+
+  // Inside an unshared user namespace (e.g. `unshare -c -n`), processes in an
+  // ancestor/host user namespace show lower UID 4294967295 (INVALID_UID) in
+  // `/proc/<pid>/uid_map`. No child of our process can live in an ancestor
+  // user namespace, whereas same-namespace non-dumpable children keep our map.
+  if (canCheckUidMap) {
+    try {
+      const uidMapRaw = fs.readFileSync(path.join(pidDir, "uid_map"), "utf8");
+      if (hasUnmappedLowerUid(uidMapRaw)) {
+        return "other_user";
+      }
+    } catch (err: unknown) {
+      const code = getErrorCode(err);
+      if ((code === "ENOENT" || code === "ESRCH") && !fs.existsSync(pidDir)) {
+        return "absent";
+      }
+    }
+  }
+
+  if (myUid === null) {
+    return "maybe_ours";
+  }
+
+  try {
+    const statusRaw = fs.readFileSync(path.join(pidDir, "status"), "utf8");
+    const uidMatch = statusRaw.match(/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/m);
+    if (uidMatch) {
+      const uids = [
+        Number(uidMatch[1]),
+        Number(uidMatch[2]),
+        Number(uidMatch[3]),
+        Number(uidMatch[4]),
+      ];
+      return uids.every((uid) => uid !== myUid) ? "other_user" : "maybe_ours";
+    }
+  } catch (err: unknown) {
+    const code = getErrorCode(err);
+    if ((code === "ENOENT" || code === "ESRCH") && !fs.existsSync(pidDir)) {
+      return "absent";
+    }
+  }
+
+  return dirStat.uid !== myUid ? "other_user" : "maybe_ours";
+}
+
+function formatUncertainProcesses(uncertain: UncertainProcessEntry[], procRoot: string): string {
+  const details = uncertain
+    .map((u) => `pid=${u.pid}${u.startTime ? ` startTime=${u.startTime}` : ""} (${u.reason})`)
+    .join(", ");
+  return `Uncertain process cleanup under ${procRoot}: could not rule out ${uncertain.length} process(es) [${details}]`;
+}
+
+export function scanProcessesByEnvToken(
   envName: string,
   token: string,
   procRoot = "/proc",
-): TrackedProcessIdentity[] {
+  options?: EnvTokenScanOptions,
+): EnvTokenScanResult {
   if (
     typeof envName !== "string" ||
     envName.length === 0 ||
     typeof token !== "string" ||
     token.length === 0
   ) {
-    return [];
+    return { matches: [], uncertain: [] };
   }
 
-  // Fail closed (throw) if /proc or own environ is unreadable so sweeps never
+  // Fail closed (throw) if /proc, own stat, or own environ is unreadable so sweeps never
   // treat an unreadable /proc as "zero leftover processes".
   const entries = fs.readdirSync(procRoot);
+  const selfStat = assertProcReadable(procRoot);
   fs.readFileSync(path.join(procRoot, "self", "environ"), "utf8");
+
+  const minStartTimeRaw = options?.minStartTime ?? selfStat.startTime;
+  if (typeof minStartTimeRaw !== "string" || !/^\d+$/.test(minStartTimeRaw)) {
+    throw new Error(`Invalid minStartTime for env-token scan: ${String(minStartTimeRaw)}`);
+  }
+  const minStartTicks = BigInt(minStartTimeRaw);
+  const myUid = typeof process.getuid === "function" ? process.getuid() : null;
+  const canCheckUidMap = readSelfUidMapUsable(procRoot);
 
   const needle = `${envName}=${token}`;
   const matches: TrackedProcessIdentity[] = [];
+  const uncertain: UncertainProcessEntry[] = [];
 
   for (const name of entries) {
     if (!/^\d+$/.test(name)) {
@@ -218,17 +365,34 @@ export function findProcessesByEnvToken(
     if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) {
       continue;
     }
-    let statBefore: ProcessStat | null;
+
+    let statBefore: ProcessStatReadResult;
     try {
-      statBefore = readProcessStatAt(pid, procRoot);
+      statBefore = readProcessStatStrict(pid, procRoot);
     } catch (err: unknown) {
       const code = getErrorCode(err);
       if (code === "EACCES" || code === "EPERM") {
+        const owner = getProcessOwnerProof(pid, procRoot, myUid, canCheckUidMap);
+        if (owner === "other_user" || owner === "absent") {
+          continue;
+        }
+        uncertain.push({ pid, reason: "unreadable_stat" });
         continue;
       }
       throw err;
     }
-    if (statBefore === null || DEAD_PROCESS_STATES.has(statBefore.state)) {
+    if (statBefore.status === "absent") {
+      continue;
+    }
+    if (statBefore.status === "malformed") {
+      const owner = getProcessOwnerProof(pid, procRoot, myUid, canCheckUidMap);
+      if (owner === "other_user" || owner === "absent") {
+        continue;
+      }
+      uncertain.push({ pid, reason: "malformed_stat" });
+      continue;
+    }
+    if (DEAD_PROCESS_STATES.has(statBefore.stat.state)) {
       continue;
     }
 
@@ -237,7 +401,22 @@ export function findProcessesByEnvToken(
       envRaw = fs.readFileSync(path.join(procRoot, String(pid), "environ"), "utf8");
     } catch (err: unknown) {
       const code = getErrorCode(err);
-      if (code === "ENOENT" || code === "ESRCH" || code === "EACCES" || code === "EPERM") {
+      if (code === "ENOENT" || code === "ESRCH") {
+        continue;
+      }
+      if (code === "EACCES" || code === "EPERM") {
+        const owner = getProcessOwnerProof(pid, procRoot, myUid, canCheckUidMap);
+        if (owner === "other_user" || owner === "absent") {
+          continue;
+        }
+        if (BigInt(statBefore.stat.startTime) < minStartTicks) {
+          continue;
+        }
+        uncertain.push({
+          pid,
+          startTime: statBefore.stat.startTime,
+          reason: "unreadable_environ",
+        });
         continue;
       }
       throw err;
@@ -246,26 +425,54 @@ export function findProcessesByEnvToken(
       continue;
     }
 
-    let statAfter: ProcessStat | null;
+    let statAfter: ProcessStatReadResult;
     try {
-      statAfter = readProcessStatAt(pid, procRoot);
+      statAfter = readProcessStatStrict(pid, procRoot);
     } catch (err: unknown) {
       const code = getErrorCode(err);
       if (code === "EACCES" || code === "EPERM") {
+        uncertain.push({
+          pid,
+          startTime: statBefore.stat.startTime,
+          reason: "unreadable_stat_after",
+        });
         continue;
       }
       throw err;
     }
+    if (statAfter.status === "absent") {
+      continue;
+    }
+    if (statAfter.status === "malformed") {
+      uncertain.push({
+        pid,
+        startTime: statBefore.stat.startTime,
+        reason: "malformed_stat_after",
+      });
+      continue;
+    }
     if (
-      statAfter === null ||
-      statAfter.startTime !== statBefore.startTime ||
-      DEAD_PROCESS_STATES.has(statAfter.state)
+      statAfter.stat.startTime !== statBefore.stat.startTime ||
+      DEAD_PROCESS_STATES.has(statAfter.stat.state)
     ) {
       continue;
     }
-    matches.push({ pid, startTime: statAfter.startTime });
+    matches.push({ pid, startTime: statAfter.stat.startTime });
   }
 
+  return { matches, uncertain };
+}
+
+export function findProcessesByEnvToken(
+  envName: string,
+  token: string,
+  procRoot = "/proc",
+  options?: EnvTokenScanOptions,
+): TrackedProcessIdentity[] {
+  const { matches, uncertain } = scanProcessesByEnvToken(envName, token, procRoot, options);
+  if (uncertain.length > 0) {
+    throw new Error(formatUncertainProcesses(uncertain, procRoot));
+  }
   return matches;
 }
 
@@ -274,14 +481,18 @@ export async function stopProcessesByEnvToken(
   token: string,
   timeoutMs = 3000,
   procRoot = "/proc",
+  options?: EnvTokenScanOptions,
 ): Promise<TrackedProcessIdentity[]> {
   const stopped: TrackedProcessIdentity[] = [];
   const seen = new Set<string>();
   const deadline = performance.now() + timeoutMs;
 
   while (true) {
-    const matches = findProcessesByEnvToken(envName, token, procRoot);
+    const { matches, uncertain } = scanProcessesByEnvToken(envName, token, procRoot, options);
     if (matches.length === 0) {
+      if (uncertain.length > 0) {
+        throw new Error(formatUncertainProcesses(uncertain, procRoot));
+      }
       return stopped;
     }
     for (const proc of matches) {
@@ -297,11 +508,14 @@ export async function stopProcessesByEnvToken(
       }
     }
     if (performance.now() >= deadline) {
-      const remainingMatches = findProcessesByEnvToken(envName, token, procRoot);
-      if (remainingMatches.length > 0) {
+      const remaining = scanProcessesByEnvToken(envName, token, procRoot, options);
+      if (remaining.matches.length > 0) {
         throw new Error(
-          `Timed out waiting for token-owned processes to terminate: ${remainingMatches.map((m) => m.pid).join(",")}`,
+          `Timed out waiting for token-owned processes to terminate: ${remaining.matches.map((m) => m.pid).join(",")}`,
         );
+      }
+      if (remaining.uncertain.length > 0) {
+        throw new Error(formatUncertainProcesses(remaining.uncertain, procRoot));
       }
       return stopped;
     }
@@ -312,10 +526,11 @@ export function stopProcessesByEnvTokenSync(
   envName: string,
   token: string,
   procRoot = "/proc",
+  options?: EnvTokenScanOptions,
 ): void {
   let matches: TrackedProcessIdentity[];
   try {
-    matches = findProcessesByEnvToken(envName, token, procRoot);
+    matches = scanProcessesByEnvToken(envName, token, procRoot, options).matches;
   } catch {
     return;
   }
