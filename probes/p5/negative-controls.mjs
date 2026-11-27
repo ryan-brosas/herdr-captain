@@ -54,30 +54,22 @@ const CONTROLS = [
   {
     id: "ctrl-2",
     check: "check-2",
-    description: "omit --outlive-parent from tracer hc.run launch",
-    pattern: "check-2:",
+    description: "omit --outlive-parent from hc.run launch flags",
+    testNameFilter: "check-2:",
     mutate(p5Dir) {
       replaceExact(
-        path.join(p5Dir, "tracer.mjs"),
-        `        const runRes = await hc.run({
-          name: terminalName,
-          cwd,
-          argv: workerArgv,
-          outliveParent: true,`,
-        `        const runRes = await hc.run({
-          name: terminalName,
-          cwd,
-          argv: workerArgv,
-          outliveParent: false,`,
+        path.join(p5Dir, "hc-boundary.mjs"),
+        `const args = ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", name];`,
+        `const args = ["run", "--bg", "--json", "--no-parent", "--no-notify", "--name", name];`,
       );
     },
-    expectedErrorRe: /--outlive-parent/,
+    expectedErrorRe: /error: hc run argv must include --outlive-parent[\s\S]*Expected to contain:\s*"--outlive-parent"/,
   },
   {
     id: "ctrl-3",
     check: "check-3",
     description: "fall back to bare 'hc' on PATH when --hc-bin is omitted or non-explicit",
-    pattern: "check-3:",
+    testNameFilter: "check-3:",
     mutate(p5Dir) {
       replaceExact(
         path.join(p5Dir, "hc-boundary.mjs"),
@@ -100,13 +92,13 @@ const CONTROLS = [
   }`,
       );
     },
-    expectedErrorRe: /(missing_hc_bin|hc-tripwire|Received:\s*true)/,
+    expectedErrorRe: /error: PATH hc tripwire must never execute[\s\S]*Expected:\s*false[\s\S]*Received:\s*true/,
   },
   {
     id: "ctrl-4",
     check: "check-4",
     description: "accept captured output whenever hc read returns complete: true (skipping independent completeness check)",
-    pattern: "check-4:",
+    testNameFilter: "check-4:",
     mutate(p5Dir) {
       replaceExact(
         path.join(p5Dir, "capture.mjs"),
@@ -129,26 +121,27 @@ const CONTROLS = [
   // Independent framing check (does NOT trust readResult.complete === true).`,
       );
     },
-    expectedErrorRe: /Expected:\s*3[\s\S]*Received:\s*0/,
+    expectedErrorRe: /error: cropped complete:true read must fail capture verification[\s\S]*Expected:\s*3[\s\S]*Received:\s*0/,
   },
   {
     id: "ctrl-5",
     check: "check-5",
     description: "relaunch replacement worker when log ends in launch_intent and terminal is not found",
-    pattern: "check-5:",
+    testNameFilter: "check-5:",
     mutate(p5Dir) {
       replaceExact(
         path.join(p5Dir, "tracer.mjs"),
-        `      if (!lookup.ok && lookup.notFound) {
-        const rec = await lease.enqueue({`,
-        `      if (!lookup.ok && lookup.notFound) {
+        `    // Crash window: after launch_intent, before launch_receipt (section 8 row 2).
+    if (folded.recoveryAction === "reconcile_uncertain_launch") {
+      const reconciled = await reconcileUncertainLaunch({`,
+        `    // Crash window: after launch_intent, before launch_receipt (section 8 row 2).
+    if (folded.recoveryAction === "reconcile_uncertain_launch") {
+      const lookupFirst = await safeReadbackLookup(hc, attempt.terminalName, hcTimeoutMs);
+      if (!lookupFirst.ok && lookupFirst.notFound) {
         await hc.run({
           name: attempt.terminalName,
           cwd: attempt.intent.cwd,
           argv: ["sh", "-c", "echo replacement"],
-          outliveParent: true,
-          noParent: true,
-          noNotify: true,
           timeoutMs: hcTimeoutMs,
         });
         return {
@@ -159,16 +152,17 @@ const CONTROLS = [
             found: false,
           },
         };
-        const rec = await lease.enqueue({`,
+      }
+      const reconciled = await reconcileUncertainLaunch({`,
       );
     },
-    expectedErrorRe: /Expected:\s*"uncertain"[\s\S]*Received:\s*"relaunched"/,
+    expectedErrorRe: /error: launch_intent without receipt must settle uncertain, not relaunch[\s\S]*Expected:\s*"uncertain"[\s\S]*Received:\s*"relaunched"/,
   },
   {
     id: "ctrl-6a",
     check: "check-6",
     description: "allow forbidden --force flag through hc boundary",
-    pattern: "check-6:",
+    testNameFilter: "check-6:",
     mutate(p5Dir) {
       replaceExact(
         path.join(p5Dir, "hc-boundary.mjs"),
@@ -193,13 +187,13 @@ const CONTROLS = [
       }`,
       );
     },
-    expectedErrorRe: /expected refusal for --force on kill/,
+    expectedErrorRe: /error: expected refusal for --force on kill[\s\S]*Expected constructor:\s*\[class HcBoundaryError[\s\S]*Received value:\s*null/,
   },
   {
     id: "ctrl-6b",
     check: "check-6",
     description: "disable timeout kill on hung hc call",
-    pattern: "check-6:",
+    testNameFilter: "check-6:",
     mutate(p5Dir) {
       replaceExact(
         path.join(p5Dir, "hc-boundary.mjs"),
@@ -216,13 +210,13 @@ const CONTROLS = [
         timedOut = true;`,
       );
     },
-    expectedErrorRe: /Expected constructor:\s*\[class HcBoundaryError[\s\S]*Received value:\s*null/,
+    expectedErrorRe: /error: hung hc call must be killed at timeout with HcBoundaryError[\s\S]*Expected constructor:\s*\[class HcBoundaryError[\s\S]*Received value:\s*null/,
   },
   {
     id: "ctrl-7a",
     check: "check-7",
-    description: "cleanup removes unprefixed terminal as well",
-    pattern: "check-7:",
+    description: "cleanup removes unprefixed and near-miss terminals as well",
+    testNameFilter: "check-7:",
     mutate(p5Dir) {
       replaceExact(
         path.join(p5Dir, "hc-boundary.mjs"),
@@ -234,37 +228,104 @@ const CONTROLS = [
       );
       replaceExact(
         path.join(p5Dir, "tracer.mjs"),
-        `    if (
-      term &&
-      typeof term.name === "string" &&
-      term.name.startsWith(namespace) &&
-      typeof term.address === "string" &&
-      !term.address.includes("/")
-    ) {`,
-        `    if (
-      term &&
-      typeof term.address === "string" &&
-      !term.address.includes("/")
-    ) {`,
+        `      if (
+        term &&
+        hc.hasPrefix(term.name) &&
+        typeof term.address === "string" &&
+        !term.address.includes("/")
+      ) {`,
+        `      if (
+        term &&
+        typeof term.address === "string" &&
+        !term.address.includes("/")
+      ) {`,
       );
     },
-    expectedErrorRe: /Expected:\s*1[\s\S]*Received:\s*0/,
+    expectedErrorRe: /error: cleanup must skip unprefixed and near-miss terminals[\s\S]*Expected:\s*3[\s\S]*Received:\s*0/,
   },
   {
     id: "ctrl-7b",
     check: "check-7",
     description: "cleanup skips post-rm readback by address",
-    pattern: "check-7:",
+    testNameFilter: "check-7:",
     mutate(p5Dir) {
       replaceExact(
         path.join(p5Dir, "tracer.mjs"),
-        `    // Read each removed terminal back by address; expect exit 3 (not_found).
-    const readback = await hc.get(addr, { timeoutMs: hcTimeoutMs });`,
-        `    // Mutation: skip post-rm readback by address.
-    const readback = { ok: false, notFound: true, exitCode: 3, error: { kind: "not_found" } };`,
+        `      // Read each removed terminal back by address; expect exit 3 (not_found).
+      const readback = await hc.get(addr, { timeoutMs: hcTimeoutMs });`,
+        `      // Mutation: skip post-rm readback by address.
+      const readback = { ok: false, notFound: true, exitCode: 3, errorKind: "not_found" };`,
       );
     },
-    expectedErrorRe: /Expected:\s*>\s*\d+[\s\S]*Received:\s*-1/,
+    expectedErrorRe: /error: cleanup must run hc get by address after hc rm[\s\S]*Expected:\s*>\s*\d+[\s\S]*Received:\s*-1/,
+  },
+  {
+    id: "ctrl-r3",
+    check: "r3-holder-loss",
+    description: "write recovery screen artifact outside lease.enqueue before lease check",
+    testNameFilter: "r3-holder-loss:",
+    mutate(p5Dir) {
+      replaceExact(
+        path.join(p5Dir, "tracer.mjs"),
+        `  // Every store write (screen artifact + commit record) runs inside lease.enqueue.
+  const rec = await lease.enqueue({
+    write: () => {
+      const evidenceRefs = [];
+      if (screenRead.ok) {
+        const screenArtifact = writeArtifactOnce(ticketDir, screenRead.result.text);
+        evidenceRefs.push({
+          kind: "readback_screen",
+          sha256: screenArtifact.sha256,
+          bytes: screenArtifact.bytes,
+          truncated: !screenRead.result.complete,
+        });
+      }`,
+        `  // Mutation: write screen artifact outside lease.enqueue before lease re-check.
+  const preEvidenceRefs = [];
+  if (screenRead.ok) {
+    const screenArtifact = writeArtifactOnce(ticketDir, screenRead.result.text);
+    preEvidenceRefs.push({
+      kind: "readback_screen",
+      sha256: screenArtifact.sha256,
+      bytes: screenArtifact.bytes,
+      truncated: !screenRead.result.complete,
+    });
+  }
+  const rec = await lease.enqueue({
+    write: () => {
+      const evidenceRefs = preEvidenceRefs;`,
+      );
+    },
+    expectedErrorRe: /error: holder loss before enqueue must write zero new artifacts/,
+  },
+  {
+    id: "ctrl-r4",
+    check: "r4-replacement",
+    description: "re-trust terminal name instead of verified address after wait and drop address check",
+    testNameFilter: "r4-replacement:",
+    mutate(p5Dir) {
+      replaceExact(
+        path.join(p5Dir, "tracer.mjs"),
+        `      // Fetch post-wait metadata by verifiedAddress (never re-trust the name after wait).
+      const postLookup = await safeReadbackLookup(hc, verifiedAddress, hcTimeoutMs);
+      if (!postLookup.ok || postLookup.terminal.address !== verifiedAddress) {`,
+        `      // Mutation: re-fetch by name after wait and skip address comparison.
+      const postLookup = await safeReadbackLookup(hc, attempt.terminalName, hcTimeoutMs);
+      if (!postLookup.ok) {`,
+      );
+      replaceExact(
+        path.join(p5Dir, "tracer.mjs"),
+        `    // Read output by verifiedAddress (never by name after first verified lookup).
+    let readRes;
+    try {
+      readRes = await hc.read(verifiedAddress, {`,
+        `    // Mutation: read output by name instead of verifiedAddress.
+    let readRes;
+    try {
+      readRes = await hc.read(attempt.terminalName, {`,
+      );
+    },
+    expectedErrorRe: /error: replaced terminal under same name during wait must stay uncertain[\s\S]*Expected:\s*"uncertain"[\s\S]*Received:\s*"captured"/,
   },
 ];
 
@@ -281,7 +342,7 @@ for (const ctrl of CONTROLS) {
     const testPath = path.join(p5Dir, "p5.test.mjs");
     const res = spawnSync(
       process.execPath,
-      ["test", "--test-name-pattern", ctrl.pattern, testPath],
+      ["test", "--test-name-pattern", ctrl.testNameFilter, testPath],
       {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
@@ -299,12 +360,12 @@ for (const ctrl of CONTROLS) {
       passed += 1;
       const excerptLines = combined
         .split("\n")
-        .filter((l) => /error:|Expected:|Expected constructor:|Received:|Received value:|\(fail\)|check-\d/.test(l))
-        .slice(0, 8)
+        .filter((l) => /error:|Expected:|Expected to contain:|Expected constructor:|Received:|Received value:/.test(l))
+        .slice(0, 6)
         .map((l) => `    ${l.trim()}`)
         .join("\n");
       console.log(`PASS [${ctrl.id}] (${elapsedMs}ms) ${ctrl.check}: ${ctrl.description}`);
-      console.log(`  exit=${res.status}`);
+      console.log(`  exit=${res.status} pattern=${ctrl.expectedErrorRe}`);
       console.log(excerptLines);
     } else {
       failed += 1;

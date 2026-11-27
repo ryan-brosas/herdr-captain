@@ -1,9 +1,32 @@
 #!/usr/bin/env bun
-import { spawn } from "node:child_process";
+/**
+ * Fake `hc` executable for offline probe P5 tests.
+ *
+ * Responses copy `hc 0.1.22` field names, types, error kinds, and stderr error
+ * envelopes from `hc schema --json` and `hc --skill`.
+ *
+ * FIXTURE PROTOCOL (test harness control channel, NOT real `hc` behaviour):
+ * - FAKE_HC_STATE_DIR: required absolute temp folder for fixture state (`state.json`,
+ *   `calls.ndjson`, `outputs/`, `jobs/`, `ready/`). Exit code 2 reports missing or
+ *   non-absolute FAKE_HC_STATE_DIR.
+ * - FAKE_HC_PROC_TOKEN: env token propagated to worker children for deterministic cleanup.
+ * - FAKE_HC_HANG_CMD + FAKE_HC_HANG_MS: sleeps on the named command to test call timeouts.
+ * - FAKE_HC_RUN_FIRST_MSG_UNSENT: sets unsent `first_message` on launched terminal.
+ * - FAKE_HC_FAIL_RUN_MODE: injects run failures (`unparseable`, `unavailable`,
+ *   `error_with_address`, `unknown_kind`). Note: `unknown_kind` emits an unlisted kind
+ *   solely to test rejection of non-schema kinds.
+ * - FAKE_HC_KILL_HOLDER_ON_CMD + FAKE_HC_OWNER_JSON: sends SIGKILL to `owner.json`'s
+ *   `holderPid` after the named command completes its read and before it exits.
+ * - FAKE_HC_REPLACE_AFTER_WAIT: JSON `{name, argv}`; once `wait` sees the terminal finish,
+ *   removes the original terminal and creates a finished replacement under the same name.
+ * - FAKE_HC_INVALID_RESPONSE_CMD: emits a schema-invalid JSON response for the named command.
+ */
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isSameProcessAlive, readProcessStat } from "../p2/lease.mjs";
+import { isProcessAliveNonZombie, isSameProcessAlive, readProcessStat } from "../p2/lease.mjs";
+import { writeJsonAtomic } from "./fake-hc-runner.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER_PATH = path.join(HERE, "fake-hc-runner.mjs");
@@ -12,9 +35,10 @@ const TERMINAL_NAME_RE = /^[a-z0-9._-]{1,32}$/;
 const DEFAULT_ROWS = 120;
 const DEFAULT_COLS = 200;
 
+// Fixture protocol: require an explicit temp folder; exit 2 on bad setup.
 const STATE_DIR = process.env.FAKE_HC_STATE_DIR;
 if (!STATE_DIR || !path.isAbsolute(STATE_DIR)) {
-  process.stderr.write("fake-hc requires absolute FAKE_HC_STATE_DIR\n");
+  process.stderr.write("fake-hc fixture protocol error: requires absolute FAKE_HC_STATE_DIR\n");
   process.exit(2);
 }
 
@@ -70,9 +94,7 @@ function loadStateUnlocked() {
 }
 
 function saveStateUnlocked(state) {
-  const tmpPath = path.join(STATE_DIR, `.state.json.tmp.${process.pid}`);
-  fs.writeFileSync(tmpPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  fs.renameSync(tmpPath, STATE_PATH);
+  writeJsonAtomic(STATE_PATH, state, { pretty: true });
 }
 
 function recordCallUnlocked(state, argv, exitCode) {
@@ -84,6 +106,30 @@ function recordCallUnlocked(state, argv, exitCode) {
     exitCode,
   };
   fs.appendFileSync(CALLS_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+function maybeKillLeaseHolderForFixture(cmd) {
+  if (process.env.FAKE_HC_KILL_HOLDER_ON_CMD !== cmd) {
+    return;
+  }
+  const ownerJsonPath = process.env.FAKE_HC_OWNER_JSON;
+  if (!ownerJsonPath || !fs.existsSync(ownerJsonPath)) {
+    return;
+  }
+  const owner = JSON.parse(fs.readFileSync(ownerJsonPath, "utf8"));
+  const holderPid = owner?.holderPid;
+  if (!Number.isInteger(holderPid) || holderPid <= 0) {
+    return;
+  }
+  try {
+    process.kill(holderPid, "SIGKILL");
+  } catch {
+    // Ignore ESRCH if holder already exited.
+  }
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline && isProcessAliveNonZombie(holderPid)) {
+    sleepMsSync(5);
+  }
 }
 
 function refreshTerminal(rec) {
@@ -105,7 +151,6 @@ function refreshTerminal(rec) {
     }
   }
   if (rec.workerPid && rec.workerStartTime && !isSameProcessAlive(rec.workerPid, rec.workerStartTime)) {
-    // Runner may still be flushing exit.json; wait briefly.
     const waitDeadline = Date.now() + 200;
     while (Date.now() < waitDeadline) {
       if (fs.existsSync(exitPath)) {
@@ -133,8 +178,8 @@ function refreshTerminal(rec) {
 }
 
 /**
- * Emits the exact 27 top-level keys of `hc get --json` documented in docs/probes/p3.md,
- * plus optional `first_message` only when unsent (retaining P3 Behaviour 2 semantics).
+ * Emits `Terminal` / `RunResult` fields defined by `hc schema --json`,
+ * including all required fields and optional `first_message` only when unsent.
  */
 function toPublicTerminal(rec) {
   const out = {
@@ -172,39 +217,6 @@ function toPublicTerminal(rec) {
   return out;
 }
 
-/**
- * Emits the short terminal record returned by `hc run --bg --json` and `hc ls --all --json`
- * (matching docs/probes/p3.md steps a1, b1, c1, c8, d3).
- */
-function toShortTerminal(rec) {
-  const program = rec.argv[0] ?? "";
-  const agent = program.split("/").pop() || "";
-  const out = {
-    address: rec.address,
-    agent,
-    cwd: rec.cwd,
-    name: rec.name,
-    state: rec.state,
-    turn: rec.turn,
-  };
-  if (rec.parent !== null) {
-    out.parent = rec.parent;
-  }
-  if (rec.exit_code !== null) {
-    out.exit_code = rec.exit_code;
-  }
-  if (rec.signal !== null) {
-    out.signal = rec.signal;
-  }
-  if (rec.reason !== null) {
-    out.reason = rec.reason;
-  }
-  if (rec.first_message && rec.first_message.sent === false) {
-    out.first_message = rec.first_message;
-  }
-  return out;
-}
-
 function findTerminal(state, target) {
   if (state.terminals[target]) {
     return state.terminals[target];
@@ -226,15 +238,15 @@ function jsonOut(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
 }
 
+// Per `hc --skill` line 347: Errors are `{error: {kind, message, hint}}` on stderr.
 function errorOut(exitCode, kind, message, hint) {
-  jsonOut({ error: { hint, kind, message } });
+  process.stderr.write(`${JSON.stringify({ error: { hint, kind, message } })}\n`);
   return exitCode;
 }
 
 function killTerminalProcesses(rec) {
   if (rec.workerPid && rec.workerStartTime && isSameProcessAlive(rec.workerPid, rec.workerStartTime)) {
     try {
-      // Kill the worker's detached process group first so child commands (e.g. sleep) end too.
       process.kill(-rec.workerPid, "SIGKILL");
     } catch {
       try {
@@ -269,13 +281,93 @@ function splitOutputLines(rawText) {
   return lines;
 }
 
+function maybeReplaceTerminalAfterWaitUnlocked(state, rec) {
+  const rawSpec = process.env.FAKE_HC_REPLACE_AFTER_WAIT;
+  if (!rawSpec || state.replaceAfterWaitDone) {
+    return;
+  }
+  const spec = JSON.parse(rawSpec);
+  if (!spec || typeof spec.name !== "string" || !Array.isArray(spec.argv) || spec.argv.length === 0) {
+    return;
+  }
+  if (rec.name !== spec.name) {
+    return;
+  }
+  state.replaceAfterWaitDone = true;
+
+  // Remove the original terminal and replace it under the same name with a new address.
+  delete state.terminals[rec.address];
+
+  const replAddr = `t${state.nextId}`;
+  state.nextId += 1;
+  const runRes = spawnSync(spec.argv[0], spec.argv.slice(1), {
+    cwd: rec.cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5000,
+  });
+  const outText = `${runRes.stdout ?? ""}${runRes.stderr ?? ""}`;
+  fs.writeFileSync(path.join(STATE_DIR, "outputs", `${replAddr}.log`), outText, "utf8");
+
+  state.terminals[replAddr] = {
+    address: replAddr,
+    argv: spec.argv,
+    cols: DEFAULT_COLS,
+    created_ms: Date.now(),
+    cwd: rec.cwd,
+    die_with_parent: false,
+    exit_code: runRes.status ?? 0,
+    finished_ms: Date.now(),
+    first_message: null,
+    keep: false,
+    labels: {},
+    name: spec.name,
+    notify: false,
+    parent: null,
+    reason: "exited",
+    reported: false,
+    rm: false,
+    rows: DEFAULT_ROWS,
+    screen: "exact",
+    signal: null,
+    state: "finished",
+    status: null,
+    status_ms: null,
+    template: null,
+    turn: 0,
+    runnerPid: null,
+    runnerStartTime: null,
+    workerPid: null,
+    workerStartTime: null,
+  };
+}
+
 function runCommand(argv) {
   const cmd = argv[0];
 
-  // Fault injection for testing hc boundary timeout handling (env-only, invents no JSON fields).
+  // Fixture protocol: hang injection for timeout testing.
   if (process.env.FAKE_HC_HANG_CMD && process.env.FAKE_HC_HANG_CMD === cmd) {
     const hangMs = Number(process.env.FAKE_HC_HANG_MS ?? "5000");
+    if (cmd === "run") {
+      withStateLock(() => {
+        const state = loadStateUnlocked();
+        state.runCount = (state.runCount ?? 0) + 1;
+        recordCallUnlocked(state, argv, -1);
+        saveStateUnlocked(state);
+      });
+    }
     sleepMsSync(Number.isFinite(hangMs) && hangMs > 0 ? hangMs : 5000);
+  }
+
+  // Fixture protocol: schema-invalid response injection.
+  if (process.env.FAKE_HC_INVALID_RESPONSE_CMD && process.env.FAKE_HC_INVALID_RESPONSE_CMD === cmd) {
+    withStateLock(() => {
+      const state = loadStateUnlocked();
+      recordCallUnlocked(state, argv, 0);
+      saveStateUnlocked(state);
+    });
+    jsonOut({ address: "t1", state: 123 });
+    return 0;
   }
 
   if (cmd === "--version") {
@@ -320,10 +412,6 @@ function runCommand(argv) {
     let noParent = false;
     let noNotify = false;
     let outliveParent = false;
-    let keep = false;
-    let rm = false;
-    let parent = null;
-    const labels = {};
     const extraPositionals = [];
 
     for (let i = 0; i < flagsPart.length; i += 1) {
@@ -343,14 +431,6 @@ function runCommand(argv) {
         outliveParent = true;
         continue;
       }
-      if (tok === "--keep") {
-        keep = true;
-        continue;
-      }
-      if (tok === "--rm") {
-        rm = true;
-        continue;
-      }
       if (tok === "--name") {
         name = flagsPart[++i];
         continue;
@@ -367,18 +447,6 @@ function runCommand(argv) {
         cwd = tok.slice("--cwd=".length);
         continue;
       }
-      if (tok === "--parent") {
-        parent = flagsPart[++i];
-        continue;
-      }
-      if (tok === "--label") {
-        const kv = flagsPart[++i] ?? "";
-        const eq = kv.indexOf("=");
-        if (eq !== -1) {
-          labels[kv.slice(0, eq)] = kv.slice(eq + 1);
-        }
-        continue;
-      }
       extraPositionals.push(tok);
     }
 
@@ -389,11 +457,34 @@ function runCommand(argv) {
       // Always count every run call so hidden duplicate launches are impossible.
       state.runCount = (state.runCount ?? 0) + 1;
 
-      if (process.env.FAKE_HC_FAIL_RUN_NO_ADDR === "1") {
+      const failMode = process.env.FAKE_HC_FAIL_RUN_MODE;
+      if (failMode === "unparseable") {
+        recordCallUnlocked(state, argv, 1);
+        saveStateUnlocked(state);
+        process.stderr.write("fatal: broken pipe\n");
+        return { exitCode: 1 };
+      }
+      if (failMode === "unavailable") {
         recordCallUnlocked(state, argv, 1);
         saveStateUnlocked(state);
         return {
-          exitCode: errorOut(1, "spawn_failed", "simulated launch failure with no address", "check the program name and cwd"),
+          exitCode: errorOut(1, "unavailable", "core is unavailable", "retry after the core responds"),
+        };
+      }
+      if (failMode === "error_with_address") {
+        recordCallUnlocked(state, argv, 1);
+        saveStateUnlocked(state);
+        jsonOut({ address: "t99" });
+        return {
+          exitCode: errorOut(1, "spawn_failed", "failed after allocation", "inspect before retrying"),
+        };
+      }
+      // Fixture fault injection: emits an unlisted error kind to exercise R5 ambiguous handling.
+      if (failMode === "unknown_kind") {
+        recordCallUnlocked(state, argv, 1);
+        saveStateUnlocked(state);
+        return {
+          exitCode: errorOut(1, "registry_save_failed", "registry write failed", "check hc ls --all"),
         };
       }
 
@@ -434,7 +525,7 @@ function runCommand(argv) {
       const address = `t${state.nextId}`;
       state.nextId += 1;
 
-      const effectiveParent = noParent ? null : (parent ?? process.env.HC_TERMINAL_ID ?? null);
+      const effectiveParent = noParent ? null : (process.env.HC_TERMINAL_ID ?? null);
       const dieWithParent = effectiveParent !== null && !outliveParent;
       const firstMessageUnsent = process.env.FAKE_HC_RUN_FIRST_MSG_UNSENT
         ? { sent: false, reason: process.env.FAKE_HC_RUN_FIRST_MSG_UNSENT }
@@ -450,16 +541,16 @@ function runCommand(argv) {
         exit_code: null,
         finished_ms: null,
         first_message: firstMessageUnsent,
-        keep,
-        labels,
+        keep: false,
+        labels: {},
         name,
         notify: !noNotify,
         parent: effectiveParent,
         reason: null,
         reported: false,
-        rm,
+        rm: false,
         rows: DEFAULT_ROWS,
-        screen: process.env.FAKE_HC_SCREEN_INEXACT === "1" ? "inexact" : "exact",
+        screen: "exact",
         signal: null,
         state: "live",
         status: null,
@@ -519,7 +610,7 @@ function runCommand(argv) {
       sleepMsSync(5);
     }
 
-    const shortResult = withStateLock(() => {
+    const runResult = withStateLock(() => {
       const state = loadStateUnlocked();
       const stored = state.terminals[address];
       if (stored && readyInfo) {
@@ -536,10 +627,10 @@ function runCommand(argv) {
       }
       recordCallUnlocked(state, argv, 0);
       saveStateUnlocked(state);
-      return toShortTerminal(stored ?? rec);
+      return toPublicTerminal(stored ?? rec);
     });
 
-    jsonOut(shortResult);
+    jsonOut(runResult);
     return 0;
   }
 
@@ -555,7 +646,7 @@ function runCommand(argv) {
           hiddenFinished += 1;
           continue;
         }
-        terminals.push(toShortTerminal(rec));
+        terminals.push(toPublicTerminal(rec));
       }
       recordCallUnlocked(state, argv, 0);
       saveStateUnlocked(state);
@@ -610,7 +701,7 @@ function runCommand(argv) {
       }
     }
     const target = positionals[0];
-    return withStateLock(() => {
+    const rc = withStateLock(() => {
       const state = loadStateUnlocked();
       if (!target) {
         recordCallUnlocked(state, argv, 7);
@@ -628,28 +719,25 @@ function runCommand(argv) {
       const rawText = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, "utf8") : "";
       const allLines = splitOutputLines(rawText);
 
-      // Reproduces P3 c4/c5/c7: returns last (rows + lines) lines and STILL reports complete: true
+      // Reproduces P3 c4/c5/c7: returns last (rows + lines) lines and still reports complete: true
       // even when earlier lines were cropped by --lines.
       const windowSize = rec.rows + Math.max(0, linesArg);
       const sliced = allLines.length > windowSize ? allLines.slice(allLines.length - windowSize) : allLines;
       const text = sliced.length > 0 ? `${sliced.join("\n")}\n` : "";
       const how = linesArg > 0 ? "history" : "screen";
-      const complete = process.env.FAKE_HC_READ_INCOMPLETE === "1" ? false : true;
 
       recordCallUnlocked(state, argv, 0);
       saveStateUnlocked(state);
 
       if (wantJson) {
-        const res = { complete, how, text };
-        if (!complete) {
-          res.why = "working";
-        }
-        jsonOut(res);
+        jsonOut({ complete: true, how, text });
       } else {
         process.stdout.write(text);
       }
       return 0;
     });
+    maybeKillLeaseHolderForFixture("read");
+    return rc;
   }
 
   if (cmd === "wait") {
@@ -664,8 +752,6 @@ function runCommand(argv) {
         timeoutSecs = Number(argv[++i] ?? "180");
       } else if (tok.startsWith("--timeout=")) {
         timeoutSecs = Number(tok.slice("--timeout=".length));
-      } else if (tok === "--children" || tok === "--output") {
-        i += 1;
       } else if (!tok.startsWith("-")) {
         positionals.push(tok);
       }
@@ -688,13 +774,14 @@ function runCommand(argv) {
         if (!rec) {
           recordCallUnlocked(state, argv, 3);
           saveStateUnlocked(state);
-          return { done: true, exitCode: errorOut(3, "not_found", `no terminal "${target}"`, "run hc ls --all to list terminals") };
+          return {
+            done: true,
+            exitCode: errorOut(3, "not_found", `no terminal "${target}"`, "run hc ls --all to list terminals"),
+          };
         }
         refreshTerminal(rec);
         if (rec.state === "finished") {
-          recordCallUnlocked(state, argv, 0);
-          saveStateUnlocked(state);
-          jsonOut({
+          const waitPayload = {
             children: [],
             ended: true,
             exit_code: rec.exit_code,
@@ -703,7 +790,11 @@ function runCommand(argv) {
             status: null,
             terminal: rec.address,
             turn: rec.turn,
-          });
+          };
+          maybeReplaceTerminalAfterWaitUnlocked(state, rec);
+          recordCallUnlocked(state, argv, 0);
+          saveStateUnlocked(state);
+          jsonOut(waitPayload);
           return { done: true, exitCode: 0 };
         }
         if (Date.now() >= deadline) {
@@ -783,7 +874,7 @@ function runCommand(argv) {
       if (rec.state === "live") {
         recordCallUnlocked(state, argv, 1);
         saveStateUnlocked(state);
-        return errorOut(1, "still_live", `terminal "${rec.address}" is still live`, "kill it first");
+        return errorOut(1, "live", `terminal "${rec.address}" is still live`, "kill it first");
       }
       const addr = rec.address;
       delete state.terminals[addr];
@@ -798,9 +889,9 @@ function runCommand(argv) {
     const state = loadStateUnlocked();
     recordCallUnlocked(state, argv, 1);
     saveStateUnlocked(state);
-    return errorOut(1, "unknown_command", `unsupported command "${cmd ?? ""}"`, "check allowed commands");
+    return errorOut(1, "invalid_params", `unsupported command "${cmd}"`, "use an allowed command");
   });
 }
 
-const code = runCommand(process.argv.slice(2));
-process.exit(code);
+const exitCode = runCommand(process.argv.slice(2));
+process.exit(exitCode);

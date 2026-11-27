@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { acquireLease, formatError } from "../p2/lease.mjs";
+import { acquireLease, formatError, LeaseError } from "../p2/lease.mjs";
 import { buildStandInWorkerArgv, verifyCapturedOutput } from "./capture.mjs";
 import {
   buildDeterministicName,
   createHcClient,
+  generateRandomPrefix,
   HcBoundaryError,
   normalizePrefix,
   validateHcBin,
@@ -14,10 +15,11 @@ import {
   appendCommitRecord,
   foldCommitLog,
   getTicketDir,
+  LedgerError,
   writeArtifactOnce,
 } from "./ledger.mjs";
 
-export const CRASH_POINTS = Object.freeze([
+const CRASH_POINTS = Object.freeze([
   "after_intent_before_launch",
   "after_launch_before_receipt",
   "after_receipt",
@@ -37,12 +39,202 @@ function requireNonEmptyString(value, flagName) {
   return value;
 }
 
+async function safeReadbackLookup(hc, terminalName, hcTimeoutMs) {
+  try {
+    return await hc.get(terminalName, { timeoutMs: hcTimeoutMs });
+  } catch (err) {
+    if (err instanceof HcBoundaryError && (err.code === "hc_timeout" || err.code === "hc_killed")) {
+      return {
+        ok: false,
+        exitCode: null,
+        notFound: false,
+        schemaInvalid: false,
+        errorKind: null,
+        boundaryCode: err.code,
+      };
+    }
+    throw err;
+  }
+}
+
+async function safeScreenRead(hc, address, hcTimeoutMs) {
+  try {
+    return await hc.read(address, { lines: 0, timeoutMs: hcTimeoutMs });
+  } catch (err) {
+    if (err instanceof HcBoundaryError && (err.code === "hc_timeout" || err.code === "hc_killed")) {
+      return {
+        ok: false,
+        exitCode: null,
+        notFound: false,
+        schemaInvalid: false,
+        errorKind: null,
+        boundaryCode: err.code,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Reconciles an uncertain launch (either after an ambiguous `hc run` failure or after
+ * a crash between `launch_intent` and `launch_receipt`). Never launches again or resends.
+ */
+async function reconcileUncertainLaunch({
+  hc,
+  lease,
+  ticketDir,
+  projectKey,
+  issueRef,
+  attemptId,
+  terminalName,
+  counters,
+  hcTimeoutMs,
+  baseReasonNotFound,
+  baseReasonFound,
+  runFailureReason = null,
+  runErrorKind = null,
+}) {
+  const lookup = await safeReadbackLookup(hc, terminalName, hcTimeoutMs);
+
+  if (!lookup.ok && lookup.notFound) {
+    const rec = await lease.enqueue({
+      write: () =>
+        appendCommitRecord(ticketDir, {
+          ownerEpoch: lease.epoch,
+          projectKey,
+          issueRef,
+          event: "reconcile_unresolved",
+          attemptId,
+          receipt: {
+            lookupName: terminalName,
+            found: false,
+            boundAddress: null,
+            reason: runFailureReason ?? baseReasonNotFound,
+            errorKind: runErrorKind,
+          },
+          evidenceRefs: [],
+          countersAfter: counters,
+          phaseAfter: {
+            phase: "escalated",
+            attemptState: "uncertain",
+          },
+        }),
+    });
+    return {
+      found: false,
+      boundAddress: null,
+      terminalState: null,
+      statusState: null,
+      firstMessage: null,
+      reason: runFailureReason ?? baseReasonNotFound,
+      recordSeq: rec.writeResult.seq,
+    };
+  }
+
+  if (!lookup.ok) {
+    const reason = lookup.schemaInvalid
+      ? "invalid_response_schema"
+      : (runFailureReason ?? lookup.boundaryCode ?? "launch_readback_error");
+    const rec = await lease.enqueue({
+      write: () =>
+        appendCommitRecord(ticketDir, {
+          ownerEpoch: lease.epoch,
+          projectKey,
+          issueRef,
+          event: "reconcile_unresolved",
+          attemptId,
+          receipt: {
+            lookupName: terminalName,
+            found: null,
+            boundAddress: null,
+            reason,
+            errorKind: lookup.errorKind ?? runErrorKind,
+          },
+          evidenceRefs: [],
+          countersAfter: counters,
+          phaseAfter: {
+            phase: "escalated",
+            attemptState: "uncertain",
+          },
+        }),
+    });
+    return {
+      found: null,
+      boundAddress: null,
+      terminalState: null,
+      statusState: null,
+      firstMessage: null,
+      reason,
+      recordSeq: rec.writeResult.seq,
+    };
+  }
+
+  // Found by deterministic name: bind verified address and read screen once by address (--lines 0).
+  const term = lookup.terminal;
+  const verifiedAddress = term.address;
+  const screenRead = await safeScreenRead(hc, verifiedAddress, hcTimeoutMs);
+
+  const unsent = term.first_message && term.first_message.sent === false;
+  const reason = runFailureReason ?? (unsent ? "launch_first_message_unsent" : baseReasonFound);
+
+  // Every store write (screen artifact + commit record) runs inside lease.enqueue.
+  const rec = await lease.enqueue({
+    write: () => {
+      const evidenceRefs = [];
+      if (screenRead.ok) {
+        const screenArtifact = writeArtifactOnce(ticketDir, screenRead.result.text);
+        evidenceRefs.push({
+          kind: "readback_screen",
+          sha256: screenArtifact.sha256,
+          bytes: screenArtifact.bytes,
+          truncated: !screenRead.result.complete,
+        });
+      }
+      return appendCommitRecord(ticketDir, {
+        ownerEpoch: lease.epoch,
+        projectKey,
+        issueRef,
+        event: "reconcile_unresolved",
+        attemptId,
+        receipt: {
+          lookupName: terminalName,
+          found: true,
+          boundAddress: verifiedAddress,
+          terminalState: term.state,
+          statusState: term.status?.state ?? null,
+          turn: term.turn ?? 0,
+          firstMessage: term.first_message ?? null,
+          screenReadOk: screenRead.ok,
+          reason,
+          errorKind: runErrorKind,
+        },
+        evidenceRefs,
+        countersAfter: counters,
+        phaseAfter: {
+          phase: "escalated",
+          attemptState: "uncertain",
+        },
+      });
+    },
+  });
+
+  return {
+    found: true,
+    boundAddress: verifiedAddress,
+    terminalState: term.state,
+    statusState: term.status?.state ?? null,
+    firstMessage: term.first_message ?? null,
+    reason,
+    recordSeq: rec.writeResult.seq,
+  };
+}
+
 export async function runStart({
   hcBin,
   stateRoot,
   projectKey,
   issue,
-  prefix,
+  prefix = undefined,
   cwd,
   briefText = "Probe P5 stand-in recovery tracer brief",
   expectedLines = 250,
@@ -51,13 +243,14 @@ export async function runStart({
   delaySeconds = 0,
   crashAt = null,
   hcTimeoutMs = 10_000,
+  onPrefix = null,
 }) {
-  // Refuse to start without an explicit hc path BEFORE acquiring lease or touching hc.
+  // Validate hc path and prefix BEFORE acquiring lease or calling hc.
   validateHcBin(hcBin);
   requireNonEmptyString(stateRoot, "--state-root");
   requireNonEmptyString(projectKey, "--project-key");
   requireNonEmptyString(String(issue ?? ""), "--issue");
-  const { prefix: normPrefix } = normalizePrefix(prefix);
+  const { prefix: normPrefix } = normalizePrefix(prefix === undefined ? generateRandomPrefix() : prefix);
   requireNonEmptyString(cwd, "--cwd");
 
   if (crashAt !== null && !CRASH_POINT_SET.has(crashAt)) {
@@ -65,6 +258,8 @@ export async function runStart({
   }
 
   const hc = createHcClient({ hcBin, prefix: normPrefix, defaultTimeoutMs: hcTimeoutMs });
+  onPrefix?.(normPrefix);
+
   const ticketDir = getTicketDir(stateRoot, issue);
   const issueRef = `issue#${issue}`;
 
@@ -80,7 +275,7 @@ export async function runStart({
       );
     }
 
-    // Step 1: persist immutable brief artifact, then commit brief_committed inside lease queue.
+    // Step 1: persist immutable brief artifact, then commit brief_committed inside lease.enqueue.
     const briefCommit = await lease.enqueue({
       write: () => {
         const briefArtifact = writeArtifactOnce(ticketDir, briefText);
@@ -131,7 +326,13 @@ export async function runStart({
       delaySeconds,
     });
 
-    // Step 2: commit launch_intent durably BEFORE external hc run effect, both inside serialized lease queue.
+    const countersAfterIntent = {
+      attemptSeq: 1,
+      totalAttemptsUsed: 1,
+      fixRoundsUsed: 0,
+    };
+
+    // Step 2: commit launch_intent durably BEFORE external hc.run effect, both inside lease.enqueue.
     const launchStep = await lease.enqueue({
       write: () => {
         const intentRecord = appendCommitRecord(ticketDir, {
@@ -144,18 +345,11 @@ export async function runStart({
             terminalName,
             prefix: normPrefix,
             cwd,
-            outliveParent: true,
-            noParent: true,
-            noNotify: true,
             expectedLines,
             reportFile: reportFile ?? null,
           },
           evidenceRefs: [],
-          countersAfter: {
-            attemptSeq: 1,
-            totalAttemptsUsed: 1,
-            fixRoundsUsed: 0,
-          },
+          countersAfter: countersAfterIntent,
           phaseAfter: {
             phase: "building",
             attemptState: "intent",
@@ -172,9 +366,6 @@ export async function runStart({
           name: terminalName,
           cwd,
           argv: workerArgv,
-          outliveParent: true,
-          noParent: true,
-          noNotify: true,
           timeoutMs: hcTimeoutMs,
         });
 
@@ -187,11 +378,11 @@ export async function runStart({
 
     const runRes = launchStep.effectResult;
 
-    // Step 3: commit launch_receipt (or launch_failed_authoritative if hc run returned error with no address).
-    const receiptStep = await lease.enqueue({
-      write: () => {
-        if (!runRes.ok) {
-          return appendCommitRecord(ticketDir, {
+    // Step 3a: Definite non-delivery (all four conditions in R5 hold).
+    if (!runRes.ok && runRes.disposition === "not_delivered") {
+      const failStep = await lease.enqueue({
+        write: () =>
+          appendCommitRecord(ticketDir, {
             ownerEpoch: lease.epoch,
             projectKey,
             issueRef,
@@ -199,23 +390,76 @@ export async function runStart({
             attemptId,
             receipt: {
               exitCode: runRes.exitCode,
-              error: runRes.error,
+              errorKind: runRes.errorKind,
               disposition: "not_delivered",
             },
             evidenceRefs: [],
-            countersAfter: {
-              attemptSeq: 1,
-              totalAttemptsUsed: 1,
-              fixRoundsUsed: 0,
-            },
+            countersAfter: countersAfterIntent,
             phaseAfter: {
               phase: "ready",
               attemptState: null,
             },
-          });
-        }
+          }),
+      });
+      return {
+        exitCode: 1,
+        payload: {
+          outcome: "not_delivered",
+          prefix: normPrefix,
+          epoch: lease.epoch,
+          attemptId,
+          terminalName,
+          address: null,
+          errorKind: runRes.errorKind,
+          briefSeq: briefCommit.writeResult.seq,
+          intentSeq: launchStep.writeResult.seq,
+          receiptSeq: failStep.writeResult.seq,
+        },
+      };
+    }
 
-        const r = runRes.result;
+    // Step 3b: Ambiguous hc run failure (timeout, unparseable stderr, unavailable, unlisted kind, address in output, or invalid schema).
+    // Follow section 8 row 2: look up by deterministic name, stay uncertain, escalate, never launch again.
+    if (!runRes.ok) {
+      const reconciled = await reconcileUncertainLaunch({
+        hc,
+        lease,
+        ticketDir,
+        projectKey,
+        issueRef,
+        attemptId,
+        terminalName,
+        counters: countersAfterIntent,
+        hcTimeoutMs,
+        baseReasonNotFound: runRes.reason,
+        baseReasonFound: runRes.reason,
+        runFailureReason: runRes.reason,
+        runErrorKind: runRes.errorKind,
+      });
+      return {
+        exitCode: 1,
+        payload: {
+          outcome: "uncertain",
+          escalated: true,
+          prefix: normPrefix,
+          epoch: lease.epoch,
+          attemptId,
+          terminalName,
+          found: reconciled.found,
+          boundAddress: reconciled.boundAddress,
+          reason: reconciled.reason,
+          errorKind: runRes.errorKind,
+          briefSeq: briefCommit.writeResult.seq,
+          intentSeq: launchStep.writeResult.seq,
+          recordSeq: reconciled.recordSeq,
+        },
+      };
+    }
+
+    // Step 3c: Valid launch receipt.
+    const r = runRes.result;
+    const receiptStep = await lease.enqueue({
+      write: () => {
         const receiptRecord = appendCommitRecord(ticketDir, {
           ownerEpoch: lease.epoch,
           projectKey,
@@ -227,15 +471,10 @@ export async function runStart({
             name: r.name ?? terminalName,
             state: r.state,
             turn: r.turn ?? 0,
-            agent: r.agent ?? null,
             firstMessage: r.first_message ?? null,
           },
           evidenceRefs: [],
-          countersAfter: {
-            attemptSeq: 1,
-            totalAttemptsUsed: 1,
-            fixRoundsUsed: 0,
-          },
+          countersAfter: countersAfterIntent,
           phaseAfter: {
             phase: "building",
             attemptState: "delivered",
@@ -249,17 +488,17 @@ export async function runStart({
       },
     });
 
-    const outcome = runRes.ok ? "launched" : "not_delivered";
     return {
-      exitCode: runRes.ok ? 0 : 1,
+      exitCode: 0,
       payload: {
-        outcome,
+        outcome: "launched",
+        prefix: normPrefix,
         epoch: lease.epoch,
         pid: process.pid,
         holderPid: lease.holderPid,
         attemptId,
         terminalName,
-        address: runRes.ok ? runRes.result.address : null,
+        address: r.address,
         briefSeq: briefCommit.writeResult.seq,
         intentSeq: launchStep.writeResult.seq,
         receiptSeq: receiptStep.writeResult.seq,
@@ -344,159 +583,48 @@ export async function runRecover({
 
     // Crash window: after launch_intent, before launch_receipt (section 8 row 2).
     if (folded.recoveryAction === "reconcile_uncertain_launch") {
-      const lookup = await hc.get(attempt.terminalName, { timeoutMs: hcTimeoutMs });
-
-      if (!lookup.ok && lookup.notFound) {
-        const rec = await lease.enqueue({
-          write: () =>
-            appendCommitRecord(ticketDir, {
-              ownerEpoch: lease.epoch,
-              projectKey,
-              issueRef,
-              event: "reconcile_unresolved",
-              attemptId: attempt.attemptId,
-              receipt: {
-                lookupName: attempt.terminalName,
-                found: false,
-                boundAddress: null,
-                reason: "launch_intent_without_receipt_not_found",
-              },
-              evidenceRefs: [],
-              countersAfter: folded.counters,
-              phaseAfter: {
-                phase: "escalated",
-                attemptState: "uncertain",
-              },
-            }),
-        });
-        return {
-          exitCode: 0,
-          payload: {
-            outcome: "uncertain",
-            escalated: true,
-            found: false,
-            epoch: lease.epoch,
-            foldedFromSeq: folded.lastSeq,
-            foldedAttemptStateBefore: attempt.state,
-            terminalName: attempt.terminalName,
-            boundAddress: null,
-            recordSeq: rec.writeResult.seq,
-          },
-        };
-      }
-
-      if (!lookup.ok) {
-        const rec = await lease.enqueue({
-          write: () =>
-            appendCommitRecord(ticketDir, {
-              ownerEpoch: lease.epoch,
-              projectKey,
-              issueRef,
-              event: "reconcile_unresolved",
-              attemptId: attempt.attemptId,
-              receipt: {
-                lookupName: attempt.terminalName,
-                found: null,
-                boundAddress: null,
-                reason: "launch_readback_error",
-                error: lookup.error,
-              },
-              evidenceRefs: [],
-              countersAfter: folded.counters,
-              phaseAfter: {
-                phase: "escalated",
-                attemptState: "uncertain",
-              },
-            }),
-        });
-        return {
-          exitCode: 0,
-          payload: {
-            outcome: "uncertain",
-            escalated: true,
-            found: null,
-            epoch: lease.epoch,
-            foldedFromSeq: folded.lastSeq,
-            foldedAttemptStateBefore: attempt.state,
-            terminalName: attempt.terminalName,
-            boundAddress: null,
-            recordSeq: rec.writeResult.seq,
-          },
-        };
-      }
-
-      // Terminal found by deterministic name: per section 8 row 2, bind terminal,
-      // inspect first_message/state/status?.state/turn, read screen once with --lines 0,
-      // never launch a duplicate, stay uncertain and escalate.
-      const term = lookup.terminal;
-      const screenRead = await hc.read(attempt.terminalName, { lines: 0, timeoutMs: hcTimeoutMs });
-      const evidenceRefs = [];
-      if (screenRead.ok) {
-        const screenArtifact = writeArtifactOnce(ticketDir, screenRead.result.text);
-        evidenceRefs.push({
-          kind: "readback_screen",
-          sha256: screenArtifact.sha256,
-          bytes: screenArtifact.bytes,
-          truncated: !screenRead.result.complete,
-        });
-      }
-
-      const unsent = term.first_message && term.first_message.sent === false;
-      const reason = unsent ? "launch_first_message_unsent" : "launch_intent_without_receipt_found";
-
-      const rec = await lease.enqueue({
-        write: () =>
-          appendCommitRecord(ticketDir, {
-            ownerEpoch: lease.epoch,
-            projectKey,
-            issueRef,
-            event: "reconcile_unresolved",
-            attemptId: attempt.attemptId,
-            receipt: {
-              lookupName: attempt.terminalName,
-              found: true,
-              boundAddress: term.address,
-              terminalState: term.state,
-              statusState: term.status?.state ?? null,
-              turn: term.turn ?? 0,
-              firstMessage: term.first_message ?? null,
-              screenReadOk: screenRead.ok,
-              reason,
-            },
-            evidenceRefs,
-            countersAfter: folded.counters,
-            phaseAfter: {
-              phase: "escalated",
-              attemptState: "uncertain",
-            },
-          }),
+      const reconciled = await reconcileUncertainLaunch({
+        hc,
+        lease,
+        ticketDir,
+        projectKey,
+        issueRef,
+        attemptId: attempt.attemptId,
+        terminalName: attempt.terminalName,
+        counters: folded.counters,
+        hcTimeoutMs,
+        baseReasonNotFound: "launch_intent_without_receipt_not_found",
+        baseReasonFound: "launch_intent_without_receipt_found",
       });
-
       return {
         exitCode: 0,
         payload: {
           outcome: "uncertain",
           escalated: true,
-          found: true,
+          found: reconciled.found,
           epoch: lease.epoch,
           foldedFromSeq: folded.lastSeq,
           foldedAttemptStateBefore: attempt.state,
           terminalName: attempt.terminalName,
-          boundAddress: term.address,
-          terminalState: term.state,
-          statusState: term.status?.state ?? null,
-          firstMessage: term.first_message ?? null,
-          reason,
-          recordSeq: rec.writeResult.seq,
+          boundAddress: reconciled.boundAddress,
+          terminalState: reconciled.terminalState,
+          statusState: reconciled.statusState,
+          firstMessage: reconciled.firstMessage,
+          reason: reconciled.reason,
+          recordSeq: reconciled.recordSeq,
         },
       };
     }
 
     // Crash window: after launch_receipt was written (section 8 row 5).
-    // Always find the worker by its deterministic name from the folded log (never in-memory address).
-    let lookup = await hc.get(attempt.terminalName, { timeoutMs: hcTimeoutMs });
-    if (!lookup.ok) {
-      const reason = lookup.notFound ? "terminal_missing" : "readback_error";
+    // Step 1: First lookup by deterministic name from the folded log (never an in-memory address).
+    const initialLookup = await safeReadbackLookup(hc, attempt.terminalName, hcTimeoutMs);
+    if (!initialLookup.ok) {
+      const reason = initialLookup.schemaInvalid
+        ? "invalid_response_schema"
+        : initialLookup.notFound
+          ? "terminal_missing"
+          : (initialLookup.boundaryCode ?? "readback_error");
       const rec = await lease.enqueue({
         write: () =>
           appendCommitRecord(ticketDir, {
@@ -507,10 +635,10 @@ export async function runRecover({
             attemptId: attempt.attemptId,
             receipt: {
               lookupName: attempt.terminalName,
-              found: false,
+              found: initialLookup.notFound ? false : null,
               boundAddress: null,
               reason,
-              error: lookup.error,
+              errorKind: initialLookup.errorKind,
             },
             evidenceRefs: [],
             countersAfter: folded.counters,
@@ -533,7 +661,7 @@ export async function runRecover({
       };
     }
 
-    let term = lookup.terminal;
+    let term = initialLookup.terminal;
     if (attempt.address !== null && term.address !== attempt.address) {
       const rec = await lease.enqueue({
         write: () =>
@@ -565,10 +693,16 @@ export async function runRecover({
           escalated: true,
           reason: "terminal_address_mismatch",
           epoch: lease.epoch,
+          terminalName: attempt.terminalName,
+          expectedAddress: attempt.address,
+          observedAddress: term.address,
           recordSeq: rec.writeResult.seq,
         },
       };
     }
+
+    // After the first verified lookup, use the verified address for wait, get, and read (R4).
+    const verifiedAddress = term.address;
 
     if (term.keep === true) {
       const rec = await lease.enqueue({
@@ -580,7 +714,7 @@ export async function runRecover({
             event: "capture_unusable",
             attemptId: attempt.attemptId,
             receipt: {
-              address: term.address,
+              address: verifiedAddress,
               name: attempt.terminalName,
               reason: "kept_shell_rejected",
             },
@@ -605,12 +739,28 @@ export async function runRecover({
     }
 
     if (term.state === "live") {
-      const waitRes = await hc.wait(attempt.terminalName, {
-        timeoutSecs: waitTimeoutSecs,
-        timeoutMs: Math.max(hcTimeoutMs, Math.ceil(waitTimeoutSecs * 1000) + 5000),
-      });
-      if (!waitRes.ok) {
-        const reason = waitRes.notFound ? "terminal_missing" : "wait_error";
+      let waitRes;
+      try {
+        waitRes = await hc.wait(verifiedAddress, {
+          timeoutSecs: waitTimeoutSecs,
+          timeoutMs: Math.max(hcTimeoutMs, Math.ceil(waitTimeoutSecs * 1000) + 5000),
+        });
+      } catch (err) {
+        if (err instanceof HcBoundaryError && (err.code === "hc_timeout" || err.code === "hc_killed")) {
+          waitRes = { ok: false, notFound: false, schemaInvalid: false, errorKind: null, boundaryCode: err.code };
+        } else {
+          throw err;
+        }
+      }
+
+      if (!waitRes.ok || waitRes.result.terminal !== verifiedAddress) {
+        const reason = !waitRes.ok
+          ? (waitRes.schemaInvalid
+              ? "invalid_response_schema"
+              : waitRes.notFound
+                ? "terminal_missing"
+                : (waitRes.boundaryCode ?? "wait_error"))
+          : "terminal_address_mismatch";
         const rec = await lease.enqueue({
           write: () =>
             appendCommitRecord(ticketDir, {
@@ -621,10 +771,10 @@ export async function runRecover({
               attemptId: attempt.attemptId,
               receipt: {
                 lookupName: attempt.terminalName,
-                found: !waitRes.notFound,
-                boundAddress: term.address,
+                found: !waitRes.ok ? !waitRes.notFound : true,
+                boundAddress: verifiedAddress,
                 reason,
-                error: waitRes.error,
+                errorKind: waitRes.ok ? null : waitRes.errorKind,
               },
               evidenceRefs: [],
               countersAfter: folded.counters,
@@ -654,15 +804,22 @@ export async function runRecover({
             outcome: "still_running",
             epoch: lease.epoch,
             terminalName: attempt.terminalName,
-            address: term.address,
+            address: verifiedAddress,
             reason: waitRes.result.reason,
           },
         };
       }
 
-      lookup = await hc.get(attempt.terminalName, { timeoutMs: hcTimeoutMs });
-      if (!lookup.ok) {
-        const reason = lookup.notFound ? "terminal_missing_after_wait" : "readback_error";
+      // Fetch post-wait metadata by verifiedAddress (never re-trust the name after wait).
+      const postLookup = await safeReadbackLookup(hc, verifiedAddress, hcTimeoutMs);
+      if (!postLookup.ok || postLookup.terminal.address !== verifiedAddress) {
+        const reason = !postLookup.ok
+          ? (postLookup.schemaInvalid
+              ? "invalid_response_schema"
+              : postLookup.notFound
+                ? "terminal_missing_after_wait"
+                : (postLookup.boundaryCode ?? "readback_error"))
+          : "terminal_address_mismatch";
         const rec = await lease.enqueue({
           write: () =>
             appendCommitRecord(ticketDir, {
@@ -673,10 +830,11 @@ export async function runRecover({
               attemptId: attempt.attemptId,
               receipt: {
                 lookupName: attempt.terminalName,
-                found: !lookup.notFound,
-                boundAddress: term.address,
+                found: postLookup.ok ? true : (postLookup.notFound ? false : null),
+                boundAddress: postLookup.ok ? postLookup.terminal.address : verifiedAddress,
+                expectedAddress: verifiedAddress,
                 reason,
-                error: lookup.error,
+                errorKind: postLookup.ok ? null : postLookup.errorKind,
               },
               evidenceRefs: [],
               countersAfter: folded.counters,
@@ -693,18 +851,68 @@ export async function runRecover({
             escalated: true,
             reason,
             epoch: lease.epoch,
+            terminalName: attempt.terminalName,
+            expectedAddress: verifiedAddress,
             recordSeq: rec.writeResult.seq,
           },
         };
       }
-      term = lookup.terminal;
+      term = postLookup.terminal;
+
+      if (term.keep === true) {
+        const rec = await lease.enqueue({
+          write: () =>
+            appendCommitRecord(ticketDir, {
+              ownerEpoch: lease.epoch,
+              projectKey,
+              issueRef,
+              event: "capture_unusable",
+              attemptId: attempt.attemptId,
+              receipt: {
+                address: verifiedAddress,
+                name: attempt.terminalName,
+                reason: "kept_shell_rejected",
+              },
+              evidenceRefs: [],
+              countersAfter: folded.counters,
+              phaseAfter: {
+                phase: "escalated",
+                attemptState: "uncertain",
+              },
+            }),
+        });
+        return {
+          exitCode: 3,
+          payload: {
+            outcome: "capture_unusable",
+            reason: "kept_shell_rejected",
+            terminalKept: true,
+            epoch: lease.epoch,
+            recordSeq: rec.writeResult.seq,
+          },
+        };
+      }
     }
 
-    const readRes = await hc.read(attempt.terminalName, {
-      lines: readLines,
-      timeoutMs: hcTimeoutMs,
-    });
+    // Read output by verifiedAddress (never by name after first verified lookup).
+    let readRes;
+    try {
+      readRes = await hc.read(verifiedAddress, {
+        lines: readLines,
+        timeoutMs: hcTimeoutMs,
+      });
+    } catch (err) {
+      if (err instanceof HcBoundaryError && (err.code === "hc_timeout" || err.code === "hc_killed")) {
+        readRes = { ok: false, schemaInvalid: false, errorKind: null, boundaryCode: err.code };
+      } else {
+        throw err;
+      }
+    }
+
     if (!readRes.ok) {
+      const reason = readRes.schemaInvalid
+        ? "invalid_response_schema"
+        : (readRes.boundaryCode ?? "hc_read_failed");
       const rec = await lease.enqueue({
         write: () =>
           appendCommitRecord(ticketDir, {
@@ -714,10 +922,10 @@ export async function runRecover({
             event: "capture_unusable",
             attemptId: attempt.attemptId,
             receipt: {
-              address: term.address,
+              address: verifiedAddress,
               name: attempt.terminalName,
-              reason: "hc_read_failed",
-              error: readRes.error,
+              reason,
+              errorKind: readRes.errorKind,
             },
             evidenceRefs: [],
             countersAfter: folded.counters,
@@ -731,7 +939,7 @@ export async function runRecover({
         exitCode: 3,
         payload: {
           outcome: "capture_unusable",
-          reason: "hc_read_failed",
+          reason,
           terminalKept: true,
           epoch: lease.epoch,
           recordSeq: rec.writeResult.seq,
@@ -758,7 +966,7 @@ export async function runRecover({
             event: "capture_unusable",
             attemptId: attempt.attemptId,
             receipt: {
-              address: term.address,
+              address: verifiedAddress,
               name: attempt.terminalName,
               readHow: readRes.result.how,
               readComplete: readRes.result.complete,
@@ -783,13 +991,13 @@ export async function runRecover({
           terminalKept: true,
           epoch: lease.epoch,
           terminalName: attempt.terminalName,
-          address: term.address,
+          address: verifiedAddress,
           recordSeq: rec.writeResult.seq,
         },
       };
     }
 
-    // Section 4 & 8: persist artifact BEFORE committing capture_settled.
+    // Section 4 & 8: persist artifact BEFORE committing capture_settled, both inside lease.enqueue.
     const settled = await lease.enqueue({
       write: () => {
         const artifact = writeArtifactOnce(ticketDir, verified.payloadText);
@@ -800,7 +1008,7 @@ export async function runRecover({
           event: "capture_settled",
           attemptId: attempt.attemptId,
           receipt: {
-            address: term.address,
+            address: verifiedAddress,
             name: attempt.terminalName,
             state: term.state,
             exitCode: term.exit_code,
@@ -837,7 +1045,7 @@ export async function runRecover({
         epoch: lease.epoch,
         foldedFromSeq: folded.lastSeq,
         terminalName: attempt.terminalName,
-        address: term.address,
+        address: verifiedAddress,
         artifactSha256: settled.writeResult.artifact.sha256,
         artifactBytes: settled.writeResult.artifact.bytes,
         linesVerified: verified.linesVerified,
@@ -850,94 +1058,106 @@ export async function runRecover({
   }
 }
 
-export async function runCleanup({ hcBin, prefix, hcTimeoutMs = 10_000 }) {
+export async function runCleanup({ hcBin, stateRoot, projectKey, prefix, hcTimeoutMs = 10_000 }) {
+  // Validate hc path, lease args, and fixed prefix shape BEFORE acquiring lease or calling hc.
   validateHcBin(hcBin);
+  requireNonEmptyString(stateRoot, "--state-root");
+  requireNonEmptyString(projectKey, "--project-key");
   const { prefix: normPrefix, namespace } = normalizePrefix(prefix);
   const hc = createHcClient({ hcBin, prefix: normPrefix, defaultTimeoutMs: hcTimeoutMs });
 
-  const listed = await hc.ls({ all: true, timeoutMs: hcTimeoutMs });
-  const matching = [];
-  let skippedCount = 0;
+  const lease = await acquireLease({ projectKey, stateRoot });
+  try {
+    const listed = await hc.ls({ all: true, timeoutMs: hcTimeoutMs });
+    const matching = [];
+    let skippedCount = 0;
 
-  for (const term of listed.terminals) {
-    if (
-      term &&
-      typeof term.name === "string" &&
-      term.name.startsWith(namespace) &&
-      typeof term.address === "string" &&
-      !term.address.includes("/")
-    ) {
-      matching.push(term);
-    } else {
-      skippedCount += 1;
+    for (const term of listed.terminals) {
+      if (
+        term &&
+        hc.hasPrefix(term.name) &&
+        typeof term.address === "string" &&
+        !term.address.includes("/")
+      ) {
+        matching.push(term);
+      } else {
+        skippedCount += 1;
+      }
     }
-  }
 
-  const removed = [];
-  const failures = [];
+    const removed = [];
+    const failures = [];
 
-  for (const term of matching) {
-    const addr = term.address;
-    const wasLive = term.state === "live";
+    for (const term of matching) {
+      const addr = term.address;
+      const wasLive = term.state === "live";
 
-    if (wasLive) {
-      const killRes = await hc.kill(addr, { timeoutMs: hcTimeoutMs });
-      if (!killRes.ok && !killRes.notFound) {
-        failures.push({ address: addr, name: term.name, step: "kill", error: killRes.error });
+      if (wasLive) {
+        const killStep = await lease.enqueue({
+          effect: () => hc.kill(addr, { timeoutMs: hcTimeoutMs }),
+        });
+        const killRes = killStep.effectResult;
+        if (!killRes.ok && !killRes.notFound) {
+          failures.push({ address: addr, name: term.name, step: "kill", errorKind: killRes.errorKind });
+          continue;
+        }
+        if (killRes.ok && killRes.terminal?.state !== "finished") {
+          await hc.wait(addr, { timeoutSecs: 5, timeoutMs: Math.max(hcTimeoutMs, 6000) });
+        }
+      }
+
+      const rmStep = await lease.enqueue({
+        effect: () => hc.rm(addr, { timeoutMs: hcTimeoutMs }),
+      });
+      const rmRes = rmStep.effectResult;
+      if (!rmRes.ok && !rmRes.notFound) {
+        failures.push({ address: addr, name: term.name, step: "rm", errorKind: rmRes.errorKind });
         continue;
       }
-      if (killRes.ok && killRes.terminal?.state !== "finished") {
-        await hc.wait(addr, { timeoutSecs: 5, timeoutMs: Math.max(hcTimeoutMs, 6000) });
+
+      // Read each removed terminal back by address; expect exit 3 (not_found).
+      const readback = await hc.get(addr, { timeoutMs: hcTimeoutMs });
+      if (readback.ok || !readback.notFound || readback.exitCode !== 3) {
+        failures.push({
+          address: addr,
+          name: term.name,
+          step: "readback",
+          exitCode: readback.exitCode,
+          stillPresent: readback.ok,
+          errorKind: readback.errorKind ?? null,
+        });
+        continue;
       }
-    }
 
-    const rmRes = await hc.rm(addr, { timeoutMs: hcTimeoutMs });
-    if (!rmRes.ok && !rmRes.notFound) {
-      failures.push({ address: addr, name: term.name, step: "rm", error: rmRes.error });
-      continue;
-    }
-
-    // Read each removed terminal back by address; expect exit 3 (not_found).
-    const readback = await hc.get(addr, { timeoutMs: hcTimeoutMs });
-    if (readback.ok || !readback.notFound) {
-      failures.push({
+      removed.push({
         address: addr,
         name: term.name,
-        step: "readback",
-        exitCode: readback.exitCode,
-        stillPresent: readback.ok,
-        error: readback.error ?? null,
+        wasLive,
+        readbackExitCode: readback.exitCode,
+        readbackKind: readback.errorKind,
       });
-      continue;
     }
 
-    removed.push({
-      address: addr,
-      name: term.name,
-      wasLive,
-      readbackExitCode: readback.exitCode,
-      readbackKind: readback.error?.kind ?? "not_found",
-    });
+    const afterLs = await hc.ls({ all: true, timeoutMs: hcTimeoutMs });
+    const remainingPrefixed = afterLs.terminals.filter((t) => t && hc.hasPrefix(t.name));
+
+    const ok = failures.length === 0 && remainingPrefixed.length === 0;
+    return {
+      exitCode: ok ? 0 : 1,
+      payload: {
+        outcome: ok ? "cleaned" : "cleanup_incomplete",
+        epoch: lease.epoch,
+        prefix: normPrefix,
+        namespace,
+        removed,
+        skippedCount,
+        remainingPrefixedCount: remainingPrefixed.length,
+        failures,
+      },
+    };
+  } finally {
+    await lease.release();
   }
-
-  const afterLs = await hc.ls({ all: true, timeoutMs: hcTimeoutMs });
-  const remainingPrefixed = afterLs.terminals.filter(
-    (t) => t && typeof t.name === "string" && t.name.startsWith(namespace),
-  );
-
-  const ok = failures.length === 0 && remainingPrefixed.length === 0;
-  return {
-    exitCode: ok ? 0 : 1,
-    payload: {
-      outcome: ok ? "cleaned" : "cleanup_incomplete",
-      prefix: normPrefix,
-      namespace,
-      removed,
-      skippedCount,
-      remainingPrefixedCount: remainingPrefixed.length,
-      failures,
-    },
-  };
 }
 
 function parseCliArgs(argv) {
@@ -1003,9 +1223,15 @@ async function main() {
       expectedLines: parseOptionalInt(flags["expected-lines"], 250, "--expected-lines"),
       reportFile: flags["report-file"] ?? null,
       gateFifo: flags["gate-fifo"] ?? null,
-      delaySeconds: flags["delay-seconds"] !== undefined ? parseOptionalPositiveNumber(flags["delay-seconds"], 0, "--delay-seconds") : 0,
+      delaySeconds:
+        flags["delay-seconds"] !== undefined
+          ? parseOptionalPositiveNumber(flags["delay-seconds"], 0, "--delay-seconds")
+          : 0,
       crashAt: flags["crash-at"] ?? null,
       hcTimeoutMs: parseOptionalInt(flags["hc-timeout-ms"], 10_000, "--hc-timeout-ms"),
+      onPrefix: (p) => {
+        process.stderr.write(`prefix=${p}\n`);
+      },
     });
   } else if (cmd === "recover") {
     res = await runRecover({
@@ -1021,6 +1247,8 @@ async function main() {
   } else if (cmd === "cleanup") {
     res = await runCleanup({
       hcBin: flags["hc-bin"],
+      stateRoot: flags["state-root"],
+      projectKey: flags["project-key"],
       prefix: flags.prefix,
       hcTimeoutMs: parseOptionalInt(flags["hc-timeout-ms"], 10_000, "--hc-timeout-ms"),
     });
@@ -1035,7 +1263,10 @@ async function main() {
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isMain) {
   main().catch((err) => {
-    const code = err instanceof HcBoundaryError ? err.code : "tracer_error";
+    const code =
+      err instanceof HcBoundaryError || err instanceof LeaseError || err instanceof LedgerError
+        ? err.code
+        : "tracer_error";
     process.stderr.write(`${JSON.stringify({ error: { code, message: formatError(err) } })}\n`);
     process.exit(1);
   });

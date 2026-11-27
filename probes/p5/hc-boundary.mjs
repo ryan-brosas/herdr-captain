@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-export const ALLOWED_HC_COMMANDS = Object.freeze([
+const ALLOWED_HC_COMMANDS = Object.freeze([
   "run",
   "get",
   "ls",
@@ -14,7 +15,7 @@ export const ALLOWED_HC_COMMANDS = Object.freeze([
   "--version",
 ]);
 
-export const FORBIDDEN_HC_COMMANDS = Object.freeze([
+const FORBIDDEN_HC_COMMANDS = Object.freeze([
   "server",
   "update",
   "machine",
@@ -24,10 +25,25 @@ export const FORBIDDEN_HC_COMMANDS = Object.freeze([
 const ALLOWED_COMMAND_SET = new Set(ALLOWED_HC_COMMANDS);
 const FORBIDDEN_COMMAND_SET = new Set(FORBIDDEN_HC_COMMANDS);
 
+// Error kinds listed for terminal.run in hc schema --json, excluding unavailable.
+const TERMINAL_RUN_DEFINITE_ERROR_KINDS = new Set([
+  "invalid_params",
+  "name_taken",
+  "spawn_failed",
+  "invalid_template",
+  "not_found",
+  "machine_unknown",
+  "config",
+]);
+
 const MAX_TERMINAL_NAME_LENGTH = 32;
 const TERMINAL_NAME_RE = /^[a-z0-9._-]{1,32}$/;
 const LOCAL_ADDRESS_RE = /^t\d+$/;
-const PREFIX_RE = /^[a-z0-9][a-z0-9._-]{0,24}$/;
+const ANY_ADDRESS_EXACT_RE = /^(?:[a-z0-9._-]+\/)?t\d+$/;
+const ANY_ADDRESS_TOKEN_RE = /\b(?:[a-z0-9._-]+\/)?t\d+\b/;
+
+// Fixed prefix shape: tag "p5-" followed by 8 to 16 lowercase alphanumeric characters.
+const PREFIX_RE = /^p5-[a-z0-9]{8,16}$/;
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
@@ -40,35 +56,29 @@ export class HcBoundaryError extends Error {
   }
 }
 
+export function generateRandomPrefix() {
+  return `p5-${crypto.randomBytes(6).toString("hex")}`;
+}
+
 export function normalizePrefix(rawPrefix) {
-  if (typeof rawPrefix !== "string" || rawPrefix.length === 0) {
-    throw new HcBoundaryError("invalid_prefix", "Terminal name prefix must be a non-empty string");
-  }
-  if (!PREFIX_RE.test(rawPrefix)) {
+  if (typeof rawPrefix !== "string" || !PREFIX_RE.test(rawPrefix)) {
     throw new HcBoundaryError(
       "invalid_prefix",
       `Terminal name prefix must match ${PREFIX_RE} (got ${JSON.stringify(rawPrefix)})`,
     );
   }
-  const base = rawPrefix.endsWith("-") ? rawPrefix.slice(0, -1) : rawPrefix;
-  if (base.length === 0) {
-    throw new HcBoundaryError("invalid_prefix", "Terminal name prefix must not be only hyphens");
-  }
-  const namespace = `${base}-`;
-  if (namespace.length >= MAX_TERMINAL_NAME_LENGTH) {
-    throw new HcBoundaryError(
-      "invalid_prefix",
-      `Terminal name prefix ${JSON.stringify(rawPrefix)} leaves no room within 32 characters`,
-    );
-  }
-  return { prefix: base, namespace };
+  const namespace = `${rawPrefix}-`;
+  return { prefix: rawPrefix, namespace };
 }
 
 export function buildDeterministicName({ prefix, issue, attemptId }) {
   const { namespace } = normalizePrefix(prefix);
   const issueStr = String(issue);
   if (!/^[a-z0-9]+$/.test(issueStr)) {
-    throw new HcBoundaryError("invalid_name", `Issue identifier must be lowercase alphanumeric (got ${JSON.stringify(issue)})`);
+    throw new HcBoundaryError(
+      "invalid_name",
+      `Issue identifier must be lowercase alphanumeric (got ${JSON.stringify(issue)})`,
+    );
   }
   if (typeof attemptId !== "string" || !/^[a-z0-9._-]+$/.test(attemptId)) {
     throw new HcBoundaryError("invalid_name", `attemptId must use [a-z0-9._-] (got ${JSON.stringify(attemptId)})`);
@@ -126,6 +136,14 @@ export function validateHcBin(hcBin) {
   return resolved;
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonNegativeInt(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
 function isRemoteTarget(target) {
   return typeof target === "string" && (target.includes("/") || target.startsWith("+"));
 }
@@ -162,18 +180,6 @@ function extractFlagValue(hcArgs, index, flagName) {
   return null;
 }
 
-function parseJsonStrict(raw, commandLabel) {
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    throw new HcBoundaryError(
-      "invalid_json",
-      `hc ${commandLabel} returned non-JSON output`,
-      { raw: raw.slice(0, 500), cause: err instanceof Error ? err.message : String(err) },
-    );
-  }
-}
-
 function tryParseJson(raw) {
   if (typeof raw !== "string" || raw.trim().length === 0) {
     return null;
@@ -185,6 +191,238 @@ function tryParseJson(raw) {
   }
 }
 
+/**
+ * Parses the hc stderr error envelope documented in `hc --skill` (line 347):
+ * `{error: {kind, message, hint}}`.
+ * Only `kind` is returned for programmatic decisions; `message` and `hint`
+ * are free text and are validated only for JSON shape.
+ */
+function parseHcErrorEnvelope(stderr, { requireHint = false } = {}) {
+  const parsed = tryParseJson(stderr);
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.error)) {
+    return { ok: false, kind: null, rawParsed: parsed };
+  }
+  const errObj = parsed.error;
+  const hintMissing = requireHint && !("hint" in errObj);
+  const hintBadType =
+    "hint" in errObj && typeof errObj.hint !== "string" && errObj.hint !== null;
+  if (
+    typeof errObj.kind !== "string" ||
+    errObj.kind.length === 0 ||
+    typeof errObj.message !== "string" ||
+    hintMissing ||
+    hintBadType
+  ) {
+    return { ok: false, kind: null, rawParsed: parsed };
+  }
+  return { ok: true, kind: errObj.kind, rawParsed: parsed };
+}
+
+function objectContainsAddressField(value) {
+  if (Array.isArray(value)) {
+    return value.some(objectContainsAddressField);
+  }
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  for (const [key, val] of Object.entries(value)) {
+    if ((key === "address" || key === "terminal") && typeof val === "string" && ANY_ADDRESS_EXACT_RE.test(val)) {
+      return true;
+    }
+    if (typeof val === "object" && val !== null && objectContainsAddressField(val)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function outputContainsTerminalAddress(stdout, parsedStdout, parsedStderr) {
+  if (objectContainsAddressField(parsedStdout) || objectContainsAddressField(parsedStderr)) {
+    return true;
+  }
+  if (typeof stdout === "string" && ANY_ADDRESS_TOKEN_RE.test(stdout)) {
+    return true;
+  }
+  return false;
+}
+
+function isFirstMessageValid(fm) {
+  if (!isPlainObject(fm)) {
+    return false;
+  }
+  if (typeof fm.sent !== "boolean") {
+    return false;
+  }
+  if (fm.reason !== undefined && fm.reason !== null && typeof fm.reason !== "string") {
+    return false;
+  }
+  if (fm.started !== undefined && fm.started !== null && typeof fm.started !== "boolean") {
+    return false;
+  }
+  if (fm.turn !== undefined && fm.turn !== null && !isNonNegativeInt(fm.turn)) {
+    return false;
+  }
+  return true;
+}
+
+function isStatusValid(st) {
+  return isPlainObject(st) && typeof st.state === "string";
+}
+
+function isRunResultValid(obj) {
+  if (!isPlainObject(obj)) {
+    return false;
+  }
+  if (typeof obj.address !== "string" || obj.address.length === 0) {
+    return false;
+  }
+  if (obj.state !== "live" && obj.state !== "finished") {
+    return false;
+  }
+  if (obj.name !== undefined && obj.name !== null && typeof obj.name !== "string") {
+    return false;
+  }
+  if (obj.turn !== undefined && !isNonNegativeInt(obj.turn)) {
+    return false;
+  }
+  if (obj.first_message !== undefined && obj.first_message !== null && !isFirstMessageValid(obj.first_message)) {
+    return false;
+  }
+  return true;
+}
+
+function isTerminalValid(obj) {
+  if (!isPlainObject(obj)) {
+    return false;
+  }
+  // Required fields from hc schema --json Terminal:
+  if (typeof obj.address !== "string" || obj.address.length === 0) {
+    return false;
+  }
+  if (!isPlainObject(obj.labels)) {
+    return false;
+  }
+  if (!Array.isArray(obj.argv) || !obj.argv.every((x) => typeof x === "string")) {
+    return false;
+  }
+  if (typeof obj.cwd !== "string") {
+    return false;
+  }
+  if (obj.state !== "live" && obj.state !== "finished") {
+    return false;
+  }
+  if (!isNonNegativeInt(obj.created_ms)) {
+    return false;
+  }
+  if (typeof obj.screen !== "string") {
+    return false;
+  }
+  if (!isNonNegativeInt(obj.cols) || !isNonNegativeInt(obj.rows)) {
+    return false;
+  }
+  // Optional/defaulted fields read by the tracer and capture verifier:
+  if (obj.name !== undefined && obj.name !== null && typeof obj.name !== "string") {
+    return false;
+  }
+  if (obj.keep !== undefined && typeof obj.keep !== "boolean") {
+    return false;
+  }
+  if (obj.exit_code !== undefined && obj.exit_code !== null && !Number.isInteger(obj.exit_code)) {
+    return false;
+  }
+  if (obj.signal !== undefined && obj.signal !== null && !Number.isInteger(obj.signal)) {
+    return false;
+  }
+  if (obj.reason !== undefined && obj.reason !== null && typeof obj.reason !== "string") {
+    return false;
+  }
+  if (obj.turn !== undefined && !isNonNegativeInt(obj.turn)) {
+    return false;
+  }
+  if (obj.status !== undefined && obj.status !== null && !isStatusValid(obj.status)) {
+    return false;
+  }
+  if (obj.first_message !== undefined && obj.first_message !== null && !isFirstMessageValid(obj.first_message)) {
+    return false;
+  }
+  return true;
+}
+
+function isCompactTerminalValid(obj) {
+  if (!isPlainObject(obj)) {
+    return false;
+  }
+  if (typeof obj.address !== "string" || obj.address.length === 0) {
+    return false;
+  }
+  if (obj.state !== "live" && obj.state !== "finished") {
+    return false;
+  }
+  if (obj.name !== undefined && obj.name !== null && typeof obj.name !== "string") {
+    return false;
+  }
+  return true;
+}
+
+function isListResultValid(obj) {
+  if (!isPlainObject(obj)) {
+    return false;
+  }
+  if (!Array.isArray(obj.terminals) || !obj.terminals.every(isCompactTerminalValid)) {
+    return false;
+  }
+  if (!isNonNegativeInt(obj.hidden_finished)) {
+    return false;
+  }
+  if (obj.machines !== undefined && !Array.isArray(obj.machines)) {
+    return false;
+  }
+  return true;
+}
+
+function isReadResultValid(obj) {
+  if (!isPlainObject(obj)) {
+    return false;
+  }
+  if (typeof obj.text !== "string" || typeof obj.complete !== "boolean" || typeof obj.how !== "string") {
+    return false;
+  }
+  if (obj.why !== undefined && obj.why !== null && typeof obj.why !== "string") {
+    return false;
+  }
+  return true;
+}
+
+function isWaitResultValid(obj) {
+  if (!isPlainObject(obj)) {
+    return false;
+  }
+  if (
+    typeof obj.terminal !== "string" ||
+    obj.terminal.length === 0 ||
+    typeof obj.ended !== "boolean" ||
+    typeof obj.reason !== "string" ||
+    !isNonNegativeInt(obj.turn) ||
+    !Array.isArray(obj.children)
+  ) {
+    return false;
+  }
+  if (obj.exit_code !== undefined && obj.exit_code !== null && !Number.isInteger(obj.exit_code)) {
+    return false;
+  }
+  if (obj.signal !== undefined && obj.signal !== null && !Number.isInteger(obj.signal)) {
+    return false;
+  }
+  if (obj.status !== undefined && obj.status !== null && typeof obj.status !== "string") {
+    return false;
+  }
+  return true;
+}
+
+function isRemoveResultValid(obj) {
+  return isPlainObject(obj) && typeof obj.removed === "string" && obj.removed.length > 0;
+}
+
 export function createHcClient({
   hcBin,
   prefix,
@@ -194,20 +432,27 @@ export function createHcClient({
   const resolvedHcBin = validateHcBin(hcBin);
   const { prefix: normalizedPrefix, namespace } = normalizePrefix(prefix);
   if (!Number.isFinite(defaultTimeoutMs) || defaultTimeoutMs <= 0) {
-    throw new HcBoundaryError("invalid_timeout", `defaultTimeoutMs must be a positive finite number (got ${defaultTimeoutMs})`);
+    throw new HcBoundaryError(
+      "invalid_timeout",
+      `defaultTimeoutMs must be a positive finite number (got ${defaultTimeoutMs})`,
+    );
   }
 
-  // Tracks local terminal addresses (e.g. "t1") proven by run/ls/get responses to carry the required prefix.
+  // Tracks local addresses (e.g. "t1") proven by run/ls/get responses to belong to this prefix.
   const authorizedAddresses = new Set();
 
   function hasPrefix(name) {
-    return typeof name === "string" && name.startsWith(namespace);
+    return (
+      typeof name === "string" &&
+      name.startsWith(namespace) &&
+      name.length > namespace.length &&
+      TERMINAL_NAME_RE.test(name)
+    );
   }
 
   function recordAuthorizedTerminal(terminal) {
     if (
-      terminal &&
-      typeof terminal === "object" &&
+      isPlainObject(terminal) &&
       typeof terminal.address === "string" &&
       LOCAL_ADDRESS_RE.test(terminal.address) &&
       hasPrefix(terminal.name)
@@ -240,13 +485,6 @@ export function createHcClient({
         "prefix_violation",
         `hc ${command} refused terminal ${JSON.stringify(target)}: name lacks required prefix ${JSON.stringify(namespace)}`,
         { command, target, namespace },
-      );
-    }
-    if (!TERMINAL_NAME_RE.test(target)) {
-      throw new HcBoundaryError(
-        "invalid_name",
-        `hc ${command} terminal name ${JSON.stringify(target)} is invalid`,
-        { command, target },
       );
     }
   }
@@ -282,7 +520,7 @@ export function createHcClient({
       throw new HcBoundaryError("invalid_args", `Unexpected '--' separator for hc ${cmd}`);
     }
 
-    // Check forbidden flags across every command before '--'.
+    // Check globally forbidden flags across every command before '--'.
     for (const token of hcArgs) {
       if (token === "--force" || token.startsWith("--force=") || token === "-f") {
         throw new HcBoundaryError(
@@ -317,14 +555,8 @@ export function createHcClient({
     }
 
     if (cmd === "ls") {
-      for (let i = 0; i < hcArgs.length; i += 1) {
-        const token = hcArgs[i];
+      for (const token of hcArgs) {
         if (token === "--all" || token === "--json") {
-          continue;
-        }
-        const label = extractFlagValue(hcArgs, i, "--label");
-        if (label) {
-          i = label.nextIndex;
           continue;
         }
         assertNotRemoteTarget(token, "hc ls");
@@ -368,22 +600,6 @@ export function createHcClient({
           i = cwdOpt.nextIndex;
           continue;
         }
-        const labelOpt = extractFlagValue(hcArgs, i, "--label");
-        if (labelOpt) {
-          i = labelOpt.nextIndex;
-          continue;
-        }
-        const timeoutOpt = extractFlagValue(hcArgs, i, "--timeout");
-        if (timeoutOpt) {
-          i = timeoutOpt.nextIndex;
-          continue;
-        }
-        const parentOpt = extractFlagValue(hcArgs, i, "--parent");
-        if (parentOpt) {
-          assertAllowedTarget(parentOpt.value, "run --parent");
-          i = parentOpt.nextIndex;
-          continue;
-        }
         if (token.startsWith("-")) {
           throw new HcBoundaryError("forbidden_flag", `Unsupported flag ${JSON.stringify(token)} on hc run`);
         }
@@ -398,18 +614,18 @@ export function createHcClient({
         );
       }
       assertNotRemoteTarget(name, "hc run --name");
+      if (name.length > MAX_TERMINAL_NAME_LENGTH || !TERMINAL_NAME_RE.test(name)) {
+        throw new HcBoundaryError(
+          "invalid_name",
+          `hc run --name ${JSON.stringify(name)} must be 1-32 chars of [a-z0-9._-]`,
+          { command: cmd, name },
+        );
+      }
       if (!hasPrefix(name)) {
         throw new HcBoundaryError(
           "prefix_violation",
           `hc run --name ${JSON.stringify(name)} lacks required prefix ${JSON.stringify(namespace)}`,
           { command: cmd, name, namespace },
-        );
-      }
-      if (!TERMINAL_NAME_RE.test(name)) {
-        throw new HcBoundaryError(
-          "invalid_name",
-          `hc run --name ${JSON.stringify(name)} must be 1-32 chars of [a-z0-9._-]`,
-          { command: cmd, name },
         );
       }
       if ((!childArgs || childArgs.length === 0) && !sawPositionals) {
@@ -429,33 +645,32 @@ export function createHcClient({
         const linesOpt = extractFlagValue(hcArgs, i, "--lines");
         if (linesOpt) {
           if (!/^\d+$/.test(linesOpt.value)) {
-            throw new HcBoundaryError("invalid_args", `hc read --lines must be a non-negative integer (got ${JSON.stringify(linesOpt.value)})`);
+            throw new HcBoundaryError(
+              "invalid_args",
+              `hc read --lines must be a non-negative integer (got ${JSON.stringify(linesOpt.value)})`,
+            );
           }
           i = linesOpt.nextIndex;
           continue;
         }
       }
       if (cmd === "wait") {
+        if (token === "--children" || token.startsWith("--children=")) {
+          throw new HcBoundaryError("forbidden_flag", `Flag ${JSON.stringify(token)} is forbidden on hc wait`, {
+            command: cmd,
+            flag: token,
+          });
+        }
         const timeoutOpt = extractFlagValue(hcArgs, i, "--timeout");
         if (timeoutOpt) {
           const secs = Number(timeoutOpt.value);
           if (!Number.isFinite(secs) || secs <= 0) {
-            throw new HcBoundaryError("invalid_args", `hc wait --timeout must be positive (got ${JSON.stringify(timeoutOpt.value)})`);
+            throw new HcBoundaryError(
+              "invalid_args",
+              `hc wait --timeout must be positive (got ${JSON.stringify(timeoutOpt.value)})`,
+            );
           }
           i = timeoutOpt.nextIndex;
-          continue;
-        }
-        const childrenOpt = extractFlagValue(hcArgs, i, "--children");
-        if (childrenOpt) {
-          if (childrenOpt.value !== "all" && childrenOpt.value !== "any") {
-            throw new HcBoundaryError("invalid_args", `hc wait --children must be all or any`);
-          }
-          i = childrenOpt.nextIndex;
-          continue;
-        }
-        const outputOpt = extractFlagValue(hcArgs, i, "--output");
-        if (outputOpt) {
-          i = outputOpt.nextIndex;
           continue;
         }
       }
@@ -575,7 +790,7 @@ export function createHcClient({
             new HcBoundaryError(
               "hc_killed",
               `hc ${cmd} terminated by signal ${signal}`,
-              { command: cmd, args, signal, stderr: stderr.trim() },
+              { command: cmd, args, signal },
             ),
           );
           return;
@@ -597,8 +812,6 @@ export function createHcClient({
     if (res.exitCode !== 0) {
       throw new HcBoundaryError("hc_failed", `hc --version exited ${res.exitCode}`, {
         exitCode: res.exitCode,
-        stdout: res.stdout,
-        stderr: res.stderr,
       });
     }
     return { exitCode: res.exitCode, version: res.stdout.trim() };
@@ -609,86 +822,124 @@ export function createHcClient({
     if (res.exitCode !== 0) {
       throw new HcBoundaryError("hc_failed", `hc schema exited ${res.exitCode}`, {
         exitCode: res.exitCode,
-        stdout: res.stdout,
-        stderr: res.stderr,
       });
     }
-    return { exitCode: res.exitCode, schema: parseJsonStrict(res.stdout, "schema") };
+    const parsed = tryParseJson(res.stdout);
+    if (!isPlainObject(parsed) || typeof parsed.openrpc !== "string" || !Array.isArray(parsed.methods)) {
+      throw new HcBoundaryError("invalid_json", "hc schema returned unexpected JSON shape");
+    }
+    return { exitCode: res.exitCode, schema: parsed };
   }
 
-  async function run({
-    name,
-    cwd,
-    argv,
-    outliveParent = true,
-    noParent = true,
-    noNotify = true,
-    timeoutMs = defaultTimeoutMs,
-  }) {
+  async function run({ name, cwd, argv, timeoutMs = defaultTimeoutMs }) {
     if (!Array.isArray(argv) || argv.length === 0) {
       throw new HcBoundaryError("invalid_args", "run requires a non-empty argv array");
     }
-    const args = ["run", "--bg", "--json"];
-    if (noParent) {
-      args.push("--no-parent");
-    }
-    if (noNotify) {
-      args.push("--no-notify");
-    }
-    if (outliveParent) {
-      args.push("--outlive-parent");
-    }
-    args.push("--name", name);
+    // Always enforce --bg, --no-parent, --no-notify, and --outlive-parent with no switch to disable them.
+    const args = ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", name];
     if (typeof cwd === "string" && cwd.length > 0) {
       args.push("--cwd", cwd);
     }
     args.push("--", ...argv);
 
-    const res = await execHc(args, { timeoutMs });
-    const parsed = tryParseJson(res.stdout);
+    let res;
+    try {
+      res = await execHc(args, { timeoutMs });
+    } catch (err) {
+      if (err instanceof HcBoundaryError && (err.code === "hc_timeout" || err.code === "hc_killed")) {
+        return {
+          ok: false,
+          disposition: "ambiguous",
+          reason: err.code,
+          exitCode: null,
+          errorKind: null,
+        };
+      }
+      throw err;
+    }
+
+    const parsedStdout = tryParseJson(res.stdout);
     if (res.exitCode !== 0) {
+      const envParsed = parseHcErrorEnvelope(res.stderr, { requireHint: true });
+      const hasAddress = outputContainsTerminalAddress(res.stdout, parsedStdout, envParsed.rawParsed);
+
+      // Settle not_delivered only when all four conditions hold:
+      // 1. hc exited non-zero.
+      // 2. stderr parses as {error: {kind, message, hint}}.
+      // 3. kind is listed by hc schema --json for terminal.run and is not unavailable.
+      // 4. No terminal address appears in the output.
+      if (
+        envParsed.ok &&
+        TERMINAL_RUN_DEFINITE_ERROR_KINDS.has(envParsed.kind) &&
+        !hasAddress
+      ) {
+        return {
+          ok: false,
+          disposition: "not_delivered",
+          reason: "definite_run_error",
+          exitCode: res.exitCode,
+          errorKind: envParsed.kind,
+        };
+      }
+
+      let reason;
+      if (hasAddress) {
+        reason = "address_in_output";
+      } else if (!envParsed.ok) {
+        reason = "unparseable_stderr";
+      } else if (envParsed.kind === "unavailable") {
+        reason = "error_unavailable";
+      } else {
+        reason = "unlisted_error_kind";
+      }
       return {
         ok: false,
+        disposition: "ambiguous",
+        reason,
         exitCode: res.exitCode,
-        error: parsed?.error ?? {
-          kind: "unknown_error",
-          message: (res.stderr || res.stdout).trim() || `hc run exited ${res.exitCode}`,
-          hint: null,
-        },
-        rawStdout: res.stdout,
-        rawStderr: res.stderr,
+        errorKind: envParsed.ok ? envParsed.kind : null,
       };
     }
-    if (!parsed || typeof parsed !== "object" || typeof parsed.address !== "string") {
-      throw new HcBoundaryError("invalid_json", "hc run returned JSON without a terminal address", {
-        stdout: res.stdout.slice(0, 500),
-      });
+
+    if (!isRunResultValid(parsedStdout)) {
+      return {
+        ok: false,
+        disposition: "ambiguous",
+        reason: "invalid_response_schema",
+        exitCode: 0,
+        errorKind: null,
+      };
     }
-    recordAuthorizedTerminal(parsed);
+    recordAuthorizedTerminal(parsedStdout);
     return {
       ok: true,
       exitCode: 0,
-      result: parsed,
+      result: parsedStdout,
     };
   }
 
   async function get(target, { timeoutMs = defaultTimeoutMs } = {}) {
     const res = await execHc(["get", target, "--json"], { timeoutMs });
-    const parsed = tryParseJson(res.stdout);
     if (res.exitCode !== 0) {
+      const envParsed = parseHcErrorEnvelope(res.stderr);
+      const notFound = envParsed.ok && envParsed.kind === "not_found" && res.exitCode === 3;
       return {
         ok: false,
         exitCode: res.exitCode,
-        notFound: res.exitCode === 3 || parsed?.error?.kind === "not_found",
-        error: parsed?.error ?? {
-          kind: res.exitCode === 3 ? "not_found" : "unknown_error",
-          message: (res.stderr || res.stdout).trim() || `hc get exited ${res.exitCode}`,
-          hint: null,
-        },
+        notFound,
+        schemaInvalid: !envParsed.ok,
+        errorKind: envParsed.ok ? envParsed.kind : null,
       };
     }
-    if (!parsed || typeof parsed !== "object") {
-      throw new HcBoundaryError("invalid_json", "hc get returned invalid JSON", { stdout: res.stdout.slice(0, 500) });
+    const parsed = tryParseJson(res.stdout);
+    if (!isTerminalValid(parsed)) {
+      return {
+        ok: false,
+        exitCode: 0,
+        notFound: false,
+        schemaInvalid: true,
+        errorKind: null,
+      };
     }
     if (!hasPrefix(parsed.name)) {
       throw new HcBoundaryError(
@@ -702,6 +953,7 @@ export function createHcClient({
       ok: true,
       exitCode: 0,
       notFound: false,
+      schemaInvalid: false,
       terminal: parsed,
     };
   }
@@ -714,23 +966,23 @@ export function createHcClient({
     args.push("--json");
     const res = await execHc(args, { timeoutMs });
     if (res.exitCode !== 0) {
+      const envParsed = parseHcErrorEnvelope(res.stderr);
       throw new HcBoundaryError("hc_failed", `hc ls exited ${res.exitCode}`, {
         exitCode: res.exitCode,
-        stdout: res.stdout,
-        stderr: res.stderr,
+        errorKind: envParsed.ok ? envParsed.kind : null,
       });
     }
-    const parsed = parseJsonStrict(res.stdout, "ls");
-    if (!parsed || !Array.isArray(parsed.terminals)) {
-      throw new HcBoundaryError("invalid_json", "hc ls did not return a terminals array");
+    const parsed = tryParseJson(res.stdout);
+    if (!isListResultValid(parsed)) {
+      throw new HcBoundaryError("invalid_json", "hc ls returned unexpected JSON shape");
     }
     for (const term of parsed.terminals) {
       recordAuthorizedTerminal(term);
     }
     return {
       exitCode: 0,
-      hiddenFinished: typeof parsed.hidden_finished === "number" ? parsed.hidden_finished : 0,
-      machines: Array.isArray(parsed.machines) ? parsed.machines : [],
+      hiddenFinished: parsed.hidden_finished,
+      machines: parsed.machines ?? [],
       terminals: parsed.terminals,
     };
   }
@@ -740,32 +992,30 @@ export function createHcClient({
       throw new HcBoundaryError("invalid_args", `read lines must be a non-negative integer (got ${lines})`);
     }
     const res = await execHc(["read", target, "--lines", String(lines), "--json"], { timeoutMs });
-    const parsed = tryParseJson(res.stdout);
     if (res.exitCode !== 0) {
+      const envParsed = parseHcErrorEnvelope(res.stderr);
       return {
         ok: false,
         exitCode: res.exitCode,
-        error: parsed?.error ?? {
-          kind: "unknown_error",
-          message: (res.stderr || res.stdout).trim() || `hc read exited ${res.exitCode}`,
-          hint: null,
-        },
+        notFound: envParsed.ok && envParsed.kind === "not_found" && res.exitCode === 3,
+        schemaInvalid: !envParsed.ok,
+        errorKind: envParsed.ok ? envParsed.kind : null,
       };
     }
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      typeof parsed.text !== "string" ||
-      typeof parsed.complete !== "boolean" ||
-      typeof parsed.how !== "string"
-    ) {
-      throw new HcBoundaryError("invalid_json", "hc read returned unexpected JSON shape", {
-        stdout: res.stdout.slice(0, 500),
-      });
+    const parsed = tryParseJson(res.stdout);
+    if (!isReadResultValid(parsed)) {
+      return {
+        ok: false,
+        exitCode: 0,
+        notFound: false,
+        schemaInvalid: true,
+        errorKind: null,
+      };
     }
     return {
       ok: true,
       exitCode: 0,
+      schemaInvalid: false,
       result: parsed,
     };
   }
@@ -778,77 +1028,91 @@ export function createHcClient({
     const res = await execHc(["wait", target, "--timeout", String(timeoutSecs), "--json"], {
       timeoutMs: processTimeoutMs,
     });
-    const parsed = tryParseJson(res.stdout);
     if (res.exitCode !== 0) {
+      const envParsed = parseHcErrorEnvelope(res.stderr);
       return {
         ok: false,
         exitCode: res.exitCode,
-        notFound: res.exitCode === 3 || parsed?.error?.kind === "not_found",
-        error: parsed?.error ?? {
-          kind: res.exitCode === 3 ? "not_found" : "unknown_error",
-          message: (res.stderr || res.stdout).trim() || `hc wait exited ${res.exitCode}`,
-          hint: null,
-        },
+        notFound: envParsed.ok && envParsed.kind === "not_found" && res.exitCode === 3,
+        schemaInvalid: !envParsed.ok,
+        errorKind: envParsed.ok ? envParsed.kind : null,
       };
     }
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      typeof parsed.ended !== "boolean" ||
-      typeof parsed.reason !== "string"
-    ) {
-      throw new HcBoundaryError("invalid_json", "hc wait returned unexpected JSON shape", {
-        stdout: res.stdout.slice(0, 500),
-      });
+    const parsed = tryParseJson(res.stdout);
+    if (!isWaitResultValid(parsed)) {
+      return {
+        ok: false,
+        exitCode: 0,
+        notFound: false,
+        schemaInvalid: true,
+        errorKind: null,
+      };
     }
     return {
       ok: true,
       exitCode: 0,
+      schemaInvalid: false,
       result: parsed,
     };
   }
 
   async function kill(target, { timeoutMs = defaultTimeoutMs } = {}) {
     const res = await execHc(["kill", target, "--json"], { timeoutMs });
-    const parsed = tryParseJson(res.stdout);
     if (res.exitCode !== 0) {
+      const envParsed = parseHcErrorEnvelope(res.stderr);
       return {
         ok: false,
         exitCode: res.exitCode,
-        notFound: res.exitCode === 3 || parsed?.error?.kind === "not_found",
-        error: parsed?.error ?? {
-          kind: res.exitCode === 3 ? "not_found" : "unknown_error",
-          message: (res.stderr || res.stdout).trim() || `hc kill exited ${res.exitCode}`,
-          hint: null,
-        },
+        notFound: envParsed.ok && envParsed.kind === "not_found" && res.exitCode === 3,
+        schemaInvalid: !envParsed.ok,
+        errorKind: envParsed.ok ? envParsed.kind : null,
+      };
+    }
+    const parsed = tryParseJson(res.stdout);
+    if (!isCompactTerminalValid(parsed)) {
+      return {
+        ok: false,
+        exitCode: 0,
+        notFound: false,
+        schemaInvalid: true,
+        errorKind: null,
       };
     }
     return {
       ok: true,
       exitCode: 0,
+      schemaInvalid: false,
       terminal: parsed,
     };
   }
 
   async function rm(target, { timeoutMs = defaultTimeoutMs } = {}) {
     const res = await execHc(["rm", target, "--json"], { timeoutMs });
-    const parsed = tryParseJson(res.stdout);
     if (res.exitCode !== 0) {
+      const envParsed = parseHcErrorEnvelope(res.stderr);
       return {
         ok: false,
         exitCode: res.exitCode,
-        notFound: res.exitCode === 3 || parsed?.error?.kind === "not_found",
-        error: parsed?.error ?? {
-          kind: res.exitCode === 3 ? "not_found" : "unknown_error",
-          message: (res.stderr || res.stdout).trim() || `hc rm exited ${res.exitCode}`,
-          hint: null,
-        },
+        notFound: envParsed.ok && envParsed.kind === "not_found" && res.exitCode === 3,
+        schemaInvalid: !envParsed.ok,
+        errorKind: envParsed.ok ? envParsed.kind : null,
+      };
+    }
+    const parsed = tryParseJson(res.stdout);
+    if (!isRemoveResultValid(parsed)) {
+      return {
+        ok: false,
+        exitCode: 0,
+        notFound: false,
+        schemaInvalid: true,
+        errorKind: null,
       };
     }
     return {
       ok: true,
       exitCode: 0,
-      removed: parsed?.removed ?? target,
+      schemaInvalid: false,
+      removed: parsed.removed,
     };
   }
 

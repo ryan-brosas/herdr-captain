@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const GENESIS_SHA256 = "0".repeat(64);
-export const MAX_COMMIT_RECORD_BYTES = 8192;
+const MAX_COMMIT_RECORD_BYTES = 8192;
 const SEQ_FILE_RE = /^(\d{6})\.json$/;
 
 export class LedgerError extends Error {
@@ -19,7 +19,7 @@ export function sha256Hex(data) {
   return crypto.createHash("sha256").update(data).digest("hex");
 }
 
-export function formatSeq6(seq) {
+function formatSeq6(seq) {
   if (!Number.isInteger(seq) || seq < 1 || seq > 999999) {
     throw new LedgerError("invalid_seq", `Sequence number out of range: ${seq}`);
   }

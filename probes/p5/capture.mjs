@@ -1,15 +1,15 @@
 import fs from "node:fs";
 import { sha256Hex } from "./ledger.mjs";
 
-export function formatBeginSentinel(attemptId, expectedLines) {
+function formatBeginSentinel(attemptId, expectedLines) {
   return `P5-BEGIN attempt=${attemptId} lines=${expectedLines}`;
 }
 
-export function formatEndSentinel(attemptId, expectedLines) {
+function formatEndSentinel(attemptId, expectedLines) {
   return `P5-END attempt=${attemptId} lines=${expectedLines}`;
 }
 
-export function formatBodyLine(index, expectedLines) {
+function formatBodyLine(index, expectedLines) {
   return `p5 line ${index} of ${expectedLines}`;
 }
 
@@ -105,7 +105,7 @@ export function verifyCapturedOutput({
   if (terminal.state !== "finished") {
     return { ok: false, reason: `worker_not_finished:${terminal.state}` };
   }
-  if (terminal.exit_code !== 0 || terminal.signal !== null) {
+  if (terminal.exit_code !== 0 || (terminal.signal ?? null) !== null) {
     return {
       ok: false,
       reason: `worker_failed:exit=${terminal.exit_code},signal=${terminal.signal}`,

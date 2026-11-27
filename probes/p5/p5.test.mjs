@@ -11,7 +11,7 @@ import {
   readProcessStat,
   stopProcessesByEnvToken,
 } from "../p2/lease.mjs";
-import { buildExpectedPayload } from "./capture.mjs";
+import { buildExpectedPayload, buildStandInWorkerArgv } from "./capture.mjs";
 import {
   buildDeterministicName,
   createHcClient,
@@ -43,7 +43,7 @@ function buildTripwireEnv(extraEnv = {}) {
 }
 
 function assertTripwireNeverRan() {
-  expect(fs.existsSync(tripwireMarker)).toBe(false);
+  expect(fs.existsSync(tripwireMarker), "PATH hc tripwire must never execute").toBe(false);
 }
 
 function createSandbox(label) {
@@ -85,7 +85,6 @@ function makeGateFifo(dirPath, name = "gate.fifo") {
 }
 
 function releaseGateFifo(fifoPath) {
-  // Open write-only, write one line, close: unblocks `read < fifo` immediately with zero sleep.
   fs.writeFileSync(fifoPath, "go\n", "utf8");
 }
 
@@ -152,12 +151,31 @@ function runFakeHcDirect(args, env) {
 
 function waitForKernelLockRelease(stateRoot) {
   const lockPath = path.join(stateRoot, "owner.lock");
-  // Blocking flock wait with timeout proves the kernel released owner.lock after SIGKILL (zero sleep polling).
   const res = spawnSync("flock", ["--exclusive", "--timeout", "5", lockPath, "true"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
   expect(res.status).toBe(0);
+}
+
+async function waitForRecordedCall(fakeHcStateDir, startIdx, predicate, timeoutMs = 5000) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    const calls = readFakeHcCalls(fakeHcStateDir).slice(startIdx);
+    const match = calls.find(predicate);
+    if (match) {
+      return match;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for fake-hc call");
+}
+
+function listDirSorted(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    return [];
+  }
+  return fs.readdirSync(dirPath).sort();
 }
 
 beforeAll(() => {
@@ -173,7 +191,6 @@ beforeAll(() => {
     { mode: 0o755 },
   );
 
-  // Confirm the tripwire is genuinely first on PATH for every test environment.
   const resolved = execFileSync("sh", ["-c", "command -v hc"], {
     encoding: "utf8",
     env: buildTripwireEnv(),
@@ -240,8 +257,10 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
 
     expect(startRes.signal).toBeNull();
     expect(startRes.exitCode).toBe(0);
+    expect(startRes.stderr).toContain(`prefix=${sb.prefix}\n`);
     const summary = JSON.parse(startRes.stdout);
     expect(summary.outcome).toBe("launched");
+    expect(summary.prefix).toBe(sb.prefix);
     expect(summary.terminalName).toBe(expectedName);
     expect(summary.address).toBe("t1");
     expect(summary.epoch).toBe(1);
@@ -275,7 +294,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(hcFlags).toContain("--json");
     expect(hcFlags).toContain("--no-parent");
     expect(hcFlags).toContain("--no-notify");
-    expect(hcFlags).toContain("--outlive-parent");
+    expect(hcFlags, "hc run argv must include --outlive-parent").toContain("--outlive-parent");
     expect(hcFlags).not.toContain("--keep");
     expect(hcFlags).not.toContain("--rm");
     expect(hcFlags).not.toContain("--force");
@@ -304,8 +323,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(r2.intent.terminalName).toBe(expectedName);
     expect(r3.receipt.address).toBe("t1");
     expect(r2.time <= r3.time).toBe(true);
-
-    // Prove launch_intent was committed strictly before hc run executed (recorded timestamps).
     expect(r2.time <= runCalls[0].ts).toBe(true);
 
     const folded = foldCommitLog(ticketDir);
@@ -314,7 +331,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(folded.openAttempt?.state).toBe("delivered");
     expect(folded.openAttempt?.terminalName).toBe(expectedName);
 
-    // Let the surviving worker finish cleanly.
     releaseGateFifo(gateFifo);
     const waitDone = runFakeHcDirect(["wait", expectedName, "--timeout", "10", "--json"], sb.env);
     expect(waitDone.exitCode).toBe(0);
@@ -342,8 +358,9 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       ],
       sb.env,
     );
+    assertTripwireNeverRan();
     expect(missingStart.exitCode).not.toBe(0);
-    expect(missingStart.stderr).toContain("missing_hc_bin");
+    expect(missingStart.stderr, "missing --hc-bin must report missing_hc_bin").toContain("missing_hc_bin");
 
     // 2. Bare "hc" (would look up on PATH if allowed) on start
     const bareStart = await runTracerProcess(
@@ -387,7 +404,17 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
 
     // 4. Bare "hc" on cleanup
     const bareCleanup = await runTracerProcess(
-      ["cleanup", "--hc-bin", "hc", "--prefix", sb.prefix],
+      [
+        "cleanup",
+        "--hc-bin",
+        "hc",
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--prefix",
+        sb.prefix,
+      ],
       sb.env,
     );
     expect(bareCleanup.exitCode).not.toBe(0);
@@ -395,13 +422,22 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
 
     // 5. Nonexistent explicit path refused
     const badPath = await runTracerProcess(
-      ["cleanup", "--hc-bin", path.join(sb.root, "no-such-hc"), "--prefix", sb.prefix],
+      [
+        "cleanup",
+        "--hc-bin",
+        path.join(sb.root, "no-such-hc"),
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--prefix",
+        sb.prefix,
+      ],
       sb.env,
     );
     expect(badPath.exitCode).not.toBe(0);
     expect(badPath.stderr).toContain("hc_bin_not_found");
 
-    // Prove no lease was acquired and PATH tripwire never ran.
     expect(readOwnerRecord(sb.stateRoot)).toBeNull();
     assertTripwireNeverRan();
   });
@@ -411,10 +447,9 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     const gateFifo = makeGateFifo(sb.workDir);
     const reportFile = path.join(sb.workDir, "worker-report.txt");
     const issue = "7";
-    const expectedLines = 250; // > 120 screen rows + 50 history lines (170), so --lines 50 crops the top!
+    const expectedLines = 250;
     const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
 
-    // Controller 1 crashes with real OS SIGKILL right after launch_receipt is durable.
     const crashRes = await runTracerProcess(
       [
         "start",
@@ -442,29 +477,23 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       sb.env,
     );
 
-    // Must be genuine OS SIGKILL, not a clean exit or thrown error.
     expect(crashRes.signal).toBe("SIGKILL");
     expect(crashRes.exitCode).toBeNull();
     expect(crashRes.stdout).toBe("");
 
-    // Lease holder exits on EOF and kernel releases owner.lock.
     waitForKernelLockRelease(sb.stateRoot);
-    const ownerAfterCrash = readOwnerRecord(sb.stateRoot);
-    expect(ownerAfterCrash?.epoch).toBe(1);
+    expect(readOwnerRecord(sb.stateRoot)?.epoch).toBe(1);
 
-    // Worker survived the controller's SIGKILL.
     const liveCheck = runFakeHcDirect(["get", expectedName, "--json"], sb.env);
     expect(liveCheck.exitCode).toBe(0);
     expect(JSON.parse(liveCheck.stdout).state).toBe("live");
 
-    // Unblock worker so it finishes while controller is absent.
     releaseGateFifo(gateFifo);
     const waitWorker = runFakeHcDirect(["wait", expectedName, "--timeout", "10", "--json"], sb.env);
     expect(waitWorker.exitCode).toBe(0);
     expect(JSON.parse(waitWorker.stdout).ended).toBe(true);
 
-    // First verify P3's cropped-read trap on a separate state copy:
-    // --lines 50 returns 170 lines with complete: true, and the verifier MUST reject it!
+    // P3 cropped-read trap: --lines 50 returns 170 lines with complete: true, and MUST be rejected.
     const croppedStateRoot = path.join(sb.root, "state-cropped");
     fs.cpSync(sb.stateRoot, croppedStateRoot, { recursive: true });
     const callsBeforeCropped = readFakeHcCalls(sb.fakeHcStateDir).length;
@@ -488,19 +517,18 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       sb.env,
     );
     expect(croppedRecover.signal).toBeNull();
-    expect(croppedRecover.exitCode).toBe(3);
+    expect(croppedRecover.exitCode, "cropped complete:true read must fail capture verification").toBe(3);
     const croppedPayload = JSON.parse(croppedRecover.stdout);
     expect(croppedPayload.outcome).toBe("capture_unusable");
     expect(croppedPayload.reason).toBe("missing_begin_sentinel");
     expect(croppedPayload.readCompleteClaimed).toBe(true);
     expect(croppedPayload.terminalKept).toBe(true);
 
-    // Prove the cropped read really used --lines 50 and still kept the terminal in fake hc.
     const croppedCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBeforeCropped);
     expect(croppedCalls.some((c) => c.argv[0] === "read" && c.argv.includes("50"))).toBe(true);
     expect(croppedCalls.some((c) => c.argv[0] === "rm" || c.argv[0] === "kill")).toBe(false);
 
-    // Now run full recovery on the real stateRoot as a brand-new controller process (zero shared memory).
+    // Full recovery in a fresh controller process: first lookup by deterministic name, then read by verified address.
     const callsBeforeRecover = readFakeHcCalls(sb.fakeHcStateDir).length;
     const recoverRes = await runTracerProcess(
       [
@@ -532,17 +560,15 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(recovered.reportFileVerified).toBe(true);
     expect(recovered.recordSeq).toBe(4);
 
-    // Prove the new controller looked up and read the worker by its deterministic name, not an address.
+    // First lookup used deterministic name; post-verification read used verified address "t1" (R4).
     const recoverCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBeforeRecover);
     const getCall = recoverCalls.find((c) => c.argv[0] === "get");
     const readCall = recoverCalls.find((c) => c.argv[0] === "read");
     expect(getCall?.argv).toEqual(["get", expectedName, "--json"]);
-    expect(readCall?.argv).toEqual(["read", expectedName, "--lines", "1000", "--json"]);
+    expect(readCall?.argv).toEqual(["read", "t1", "--lines", "1000", "--json"]);
 
-    // Prove fake hc counted exactly ONE run call total.
     expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
 
-    // Verify persisted artifact contains the complete 250-line output and folded log is clean.
     const ticketDir = getTicketDir(sb.stateRoot, issue);
     const artifactText = readArtifactVerified(ticketDir, recovered.artifactSha256);
     expect(artifactText).toBe(buildExpectedPayload("a1", expectedLines));
@@ -593,7 +619,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(crashBeforeLaunch.exitCode).toBeNull();
       waitForKernelLockRelease(sb.stateRoot);
 
-      // Zero run calls before recovery, log ends at launch_intent.
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(0);
       const ticketDir = getTicketDir(sb.stateRoot, issue);
       const foldedBefore = foldCommitLog(ticketDir);
@@ -602,7 +627,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(foldedBefore.openAttempt?.state).toBe("intent");
       expect(foldedBefore.recoveryAction).toBe("reconcile_uncertain_launch");
 
-      // New controller acquires lease, folds log, checks hc get <name> (exit 3 not_found), stays uncertain and escalates.
       const recoverA = await runTracerProcess(
         [
           "recover",
@@ -623,7 +647,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(recoverA.signal).toBeNull();
       expect(recoverA.exitCode).toBe(0);
       const payloadA = JSON.parse(recoverA.stdout);
-      expect(payloadA.outcome).toBe("uncertain");
+      expect(payloadA.outcome, "launch_intent without receipt must settle uncertain, not relaunch").toBe("uncertain");
       expect(payloadA.escalated).toBe(true);
       expect(payloadA.found).toBe(false);
       expect(payloadA.boundAddress).toBeNull();
@@ -631,7 +655,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(payloadA.foldedFromSeq).toBe(2);
       expect(payloadA.foldedAttemptStateBefore).toBe("intent");
 
-      // Fake hc counted 0 run calls and 0 send calls; only readback get ran.
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(0);
       const callsA = readFakeHcCalls(sb.fakeHcStateDir);
       expect(callsA.map((c) => c.argv)).toEqual([["get", expectedName, "--json"]]);
@@ -682,7 +705,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(crashAfterLaunch.exitCode).toBeNull();
       waitForKernelLockRelease(sb.stateRoot);
 
-      // Fake counted 1 run call, and log ends at launch_intent (no receipt).
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
       const ticketDir = getTicketDir(sb.stateRoot, issue);
       const foldedBefore = foldCommitLog(ticketDir);
@@ -691,8 +713,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(foldedBefore.openAttempt?.state).toBe("intent");
       expect(foldedBefore.recoveryAction).toBe("reconcile_uncertain_launch");
 
-      // New controller acquires lease, folds log, finds terminal via hc get <name>, reads --lines 0 once,
-      // binds address for the record, stays uncertain and escalates without relaunching or resending.
       const callsBeforeRecover = readFakeHcCalls(sb.fakeHcStateDir).length;
       const recoverB = await runTracerProcess(
         [
@@ -722,12 +742,12 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(payloadB.foldedFromSeq).toBe(2);
       expect(payloadB.foldedAttemptStateBefore).toBe("intent");
 
-      // Fake hc still counted exactly 1 run call and 0 sends; readback used get + read --lines 0 only.
+      // First lookup by deterministic name, then screen-only read by verified address "t1" (R4).
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
       const recoverCallsB = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBeforeRecover);
       expect(recoverCallsB.map((c) => c.argv)).toEqual([
         ["get", expectedName, "--json"],
-        ["read", expectedName, "--lines", "0", "--json"],
+        ["read", "t1", "--lines", "0", "--json"],
       ]);
 
       const foldedAfterB = foldCommitLog(ticketDir);
@@ -745,7 +765,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     assertTripwireNeverRan();
   });
 
-  test("check-6: hc boundary refuses every forbidden command and flag, and cuts a hung hc call at its time limit", async () => {
+  test("check-6: hc boundary refuses every forbidden command and flag, including --children, and cuts a hung hc call at its time limit", async () => {
     const sb = createSandbox("check6");
     const hc = createHcClient({
       hcBin: FAKE_HC_PATH,
@@ -754,7 +774,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       env: sb.env,
     });
 
-    // Allowed non-mutating commands work through the boundary against fake hc.
     const ver = await hc.version();
     expect(ver.version).toBe("hc 0.1.22");
     const sch = await hc.schema();
@@ -771,17 +790,26 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       { label: "-f on rm", args: ["rm", "-f", `${sb.prefix}-w1`], code: "forbidden_flag" },
       { label: "--keep on run", args: ["run", "--bg", "--keep", "--name", `${sb.prefix}-w1`, "--", "true"], code: "forbidden_flag" },
       { label: "--rm on run", args: ["run", "--bg", "--rm", "--name", `${sb.prefix}-w1`, "--", "true"], code: "forbidden_flag" },
+      { label: "--label on run (removed R7)", args: ["run", "--bg", "--label", "a=b", "--name", `${sb.prefix}-w1`, "--", "true"], code: "forbidden_flag" },
+      { label: "--parent on run (removed R7)", args: ["run", "--bg", "--parent", `${sb.prefix}-p1`, "--name", `${sb.prefix}-w1`, "--", "true"], code: "forbidden_flag" },
+      { label: "--label on ls (removed R7)", args: ["ls", "--label", "a=b", "--json"], code: "forbidden_flag" },
+      { label: "--output on wait (removed R7)", args: ["wait", `${sb.prefix}-w1`, "--output", "ready", "--json"], code: "forbidden_flag" },
+      { label: "--children all with named terminal (R2)", args: ["wait", `${sb.prefix}-w1`, "--children", "all", "--json"], code: "forbidden_flag" },
+      { label: "--children=any with named terminal (R2)", args: ["wait", `${sb.prefix}-w1`, "--children=any", "--json"], code: "forbidden_flag" },
+      { label: "--children without terminal (R2)", args: ["wait", "--children", "all", "--json"], code: "forbidden_flag" },
       { label: "remote --on", args: ["run", "--bg", "--on", "box", "--name", `${sb.prefix}-w1`, "--", "true"], code: "remote_target_forbidden" },
       { label: "remote --on=", args: ["run", "--bg", "--on=box", "--name", `${sb.prefix}-w1`, "--", "true"], code: "remote_target_forbidden" },
       { label: "remote target slash on get", args: ["get", `box/${sb.prefix}-w1`, "--json"], code: "remote_target_forbidden" },
       { label: "remote target slash on address", args: ["kill", "box/t1", "--json"], code: "remote_target_forbidden" },
-      { label: "remote +machine", args: ["get", "+box", "--json"], code: "remote_target_forbidden" },
+      { label: "remote +machine on get", args: ["get", "+box", "--json"], code: "remote_target_forbidden" },
       { label: "remote +machine on ls", args: ["ls", "+box", "--json"], code: "remote_target_forbidden" },
       { label: "wait with no terminal", args: ["wait", "--timeout", "5", "--json"], code: "missing_terminal_target" },
-      { label: "wait --children with no terminal", args: ["wait", "--children", "all", "--json"], code: "missing_terminal_target" },
       { label: "run without prefix", args: ["run", "--bg", "--name", "other-worker", "--", "true"], code: "prefix_violation" },
       { label: "run without --name", args: ["run", "--bg", "--", "true"], code: "prefix_violation" },
+      { label: "run near-miss prefix without separator", args: ["run", "--bg", "--name", `${sb.prefix}extra`, "--", "true"], code: "prefix_violation" },
       { label: "get without prefix", args: ["get", "other-worker", "--json"], code: "prefix_violation" },
+      { label: "get near-miss prefix without separator", args: ["get", `${sb.prefix}extra`, "--json"], code: "prefix_violation" },
+      { label: "get bare prefix plus hyphen", args: ["get", `${sb.prefix}-`, "--json"], code: "prefix_violation" },
       { label: "read without prefix", args: ["read", "other-worker", "--lines", "0", "--json"], code: "prefix_violation" },
       { label: "wait without prefix", args: ["wait", "other-worker", "--timeout", "1", "--json"], code: "prefix_violation" },
       { label: "kill without prefix", args: ["kill", "other-worker", "--json"], code: "prefix_violation" },
@@ -801,7 +829,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(caught, `expected refusal for ${tc.label}`).toBeInstanceOf(HcBoundaryError);
       expect(caught.code, `expected code ${tc.code} for ${tc.label}, got ${caught?.code}`).toBe(tc.code);
     }
-    // Refused calls must NEVER spawn the hc program.
     expect(readFakeHcCalls(sb.fakeHcStateDir).length).toBe(callsBeforeRefusals);
 
     // Hung hc call is cut at its time limit and reported.
@@ -825,7 +852,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     }
     const elapsedMs = performance.now() - t0;
 
-    expect(timeoutErr).toBeInstanceOf(HcBoundaryError);
+    expect(timeoutErr, "hung hc call must be killed at timeout with HcBoundaryError").toBeInstanceOf(HcBoundaryError);
     expect(timeoutErr.code).toBe("hc_timeout");
     expect(timeoutErr.details.killed).toBe(true);
     expect(timeoutErr.details.timeoutMs).toBe(150);
@@ -833,17 +860,20 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     assertTripwireNeverRan();
   });
 
-  test("check-7: cleanup removes every terminal with the prefix, leaves unprefixed terminal in place, and reads each removed one back by address", async () => {
+  test("check-7: cleanup removes every terminal with the prefix, leaves unprefixed and near-miss terminals in place, and reads each removed one back by address", async () => {
     const sb = createSandbox("check7");
     const gateLive = makeGateFifo(sb.workDir, "live.fifo");
     const gateOther = makeGateFifo(sb.workDir, "other.fifo");
+    const gateNear1 = makeGateFifo(sb.workDir, "near1.fifo");
+    const gateNear2 = makeGateFifo(sb.workDir, "near2.fifo");
 
     const prefixedLiveName = `${sb.prefix}-live`;
     const prefixedDoneName = `${sb.prefix}-done`;
     const unprefixedName = "other-keep-term";
+    const nearMissNoSep = `${sb.prefix}extra`;
+    const nearMissSharedHead = `${sb.prefix.slice(0, -1)}-same`;
 
-    // Seed three terminals directly via fake-hc:
-    // 1. Live terminal WITH prefix
+    // 1. Live terminal WITH full prefix + '-'
     const r1 = runFakeHcDirect(
       ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", prefixedLiveName, "--cwd", sb.workDir, "--", "sh", "-c", `IFS= read -r _ < '${gateLive}' || true`],
       sb.env,
@@ -851,18 +881,16 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(r1.exitCode).toBe(0);
     const addrLive = JSON.parse(r1.stdout).address;
 
-    // 2. Finished terminal WITH prefix
+    // 2. Finished terminal WITH full prefix + '-'
     const r2 = runFakeHcDirect(
       ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", prefixedDoneName, "--cwd", sb.workDir, "--", "sh", "-c", "echo done"],
       sb.env,
     );
     expect(r2.exitCode).toBe(0);
     const addrDone = JSON.parse(r2.stdout).address;
-    const waitDone = runFakeHcDirect(["wait", addrDone, "--timeout", "5", "--json"], sb.env);
-    expect(waitDone.exitCode).toBe(0);
-    expect(JSON.parse(waitDone.stdout).ended).toBe(true);
+    expect(JSON.parse(runFakeHcDirect(["wait", addrDone, "--timeout", "5", "--json"], sb.env).stdout).ended).toBe(true);
 
-    // 3. Live terminal WITHOUT prefix (must stay untouched!)
+    // 3. Unprefixed live terminal (must stay untouched)
     const r3 = runFakeHcDirect(
       ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", unprefixedName, "--cwd", sb.workDir, "--", "sh", "-c", `IFS= read -r _ < '${gateOther}' || true`],
       sb.env,
@@ -870,9 +898,35 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(r3.exitCode).toBe(0);
     const addrOther = JSON.parse(r3.stdout).address;
 
+    // 4. Near-miss live terminal sharing entire prefix without '-' separator (must stay untouched, R1)
+    const r4 = runFakeHcDirect(
+      ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", nearMissNoSep, "--cwd", sb.workDir, "--", "sh", "-c", `IFS= read -r _ < '${gateNear1}' || true`],
+      sb.env,
+    );
+    expect(r4.exitCode).toBe(0);
+    const addrNear1 = JSON.parse(r4.stdout).address;
+
+    // 5. Near-miss live terminal sharing leading characters of prefix (must stay untouched, R1)
+    const r5 = runFakeHcDirect(
+      ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", nearMissSharedHead, "--cwd", sb.workDir, "--", "sh", "-c", `IFS= read -r _ < '${gateNear2}' || true`],
+      sb.env,
+    );
+    expect(r5.exitCode).toBe(0);
+    const addrNear2 = JSON.parse(r5.stdout).address;
+
     const callsBeforeCleanup = readFakeHcCalls(sb.fakeHcStateDir).length;
     const cleanupRes = await runTracerProcess(
-      ["cleanup", "--hc-bin", FAKE_HC_PATH, "--prefix", sb.prefix],
+      [
+        "cleanup",
+        "--hc-bin",
+        FAKE_HC_PATH,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--prefix",
+        sb.prefix,
+      ],
       sb.env,
     );
 
@@ -881,15 +935,13 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     const summary = JSON.parse(cleanupRes.stdout);
     expect(summary.outcome).toBe("cleaned");
     expect(summary.remainingPrefixedCount).toBe(0);
-    expect(summary.skippedCount).toBe(1);
+    expect(summary.skippedCount, "cleanup must skip unprefixed and near-miss terminals").toBe(3);
     expect(summary.removed.map((x) => x.address).sort()).toEqual([addrLive, addrDone].sort());
     for (const item of summary.removed) {
       expect(item.readbackExitCode).toBe(3);
       expect(item.readbackKind).toBe("not_found");
     }
 
-    // Verify exact calls made by cleanup: rm + post-rm get BY ADDRESS for each prefixed terminal,
-    // and ZERO kill/rm calls for the unprefixed terminal!
     const cleanupCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBeforeCleanup);
     for (const addr of [addrLive, addrDone]) {
       const rmIdx = cleanupCalls.findIndex((c) => c.argv[0] === "rm" && c.argv[1] === addr);
@@ -897,29 +949,549 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
         (c, idx) => idx > rmIdx && c.argv[0] === "get" && c.argv[1] === addr && c.exitCode === 3,
       );
       expect(rmIdx).toBeGreaterThan(-1);
-      expect(getAfterRmIdx).toBeGreaterThan(rmIdx);
+      expect(getAfterRmIdx, "cleanup must run hc get by address after hc rm").toBeGreaterThan(rmIdx);
     }
-    expect(cleanupCalls.some((c) => (c.argv[0] === "kill" || c.argv[0] === "rm") && (c.argv[1] === addrOther || c.argv[1] === unprefixedName))).toBe(false);
 
-    // Verify unprefixed terminal is STILL live and untouched in fake hc.
-    const otherAfter = runFakeHcDirect(["get", addrOther, "--json"], sb.env);
-    expect(otherAfter.exitCode).toBe(0);
-    const otherTerm = JSON.parse(otherAfter.stdout);
-    expect(otherTerm.name).toBe(unprefixedName);
-    expect(otherTerm.state).toBe("live");
+    const protectedTargets = new Set([addrOther, unprefixedName, addrNear1, nearMissNoSep, addrNear2, nearMissSharedHead]);
+    expect(
+      cleanupCalls.some((c) => (c.argv[0] === "kill" || c.argv[0] === "rm") && protectedTargets.has(c.argv[1])),
+    ).toBe(false);
 
-    // Verify both prefixed terminals are gone by address.
+    // Confirm all three non-matching terminals remain live and untouched.
+    for (const [addr, name] of [
+      [addrOther, unprefixedName],
+      [addrNear1, nearMissNoSep],
+      [addrNear2, nearMissSharedHead],
+    ]) {
+      const check = runFakeHcDirect(["get", addr, "--json"], sb.env);
+      expect(check.exitCode).toBe(0);
+      const parsed = JSON.parse(check.stdout);
+      expect(parsed.name).toBe(name);
+      expect(parsed.state).toBe("live");
+    }
+
     expect(runFakeHcDirect(["get", addrLive, "--json"], sb.env).exitCode).toBe(3);
     expect(runFakeHcDirect(["get", addrDone, "--json"], sb.env).exitCode).toBe(3);
 
-    // Release unprefixed fixture worker cleanly.
     releaseGateFifo(gateOther);
-    const waitOther = runFakeHcDirect(["wait", addrOther, "--timeout", "5", "--json"], sb.env);
-    expect(waitOther.exitCode).toBe(0);
+    releaseGateFifo(gateNear1);
+    releaseGateFifo(gateNear2);
     assertTripwireNeverRan();
   });
 
-  test("edge-cases: wait exit-0 timeout keeps delivered, unsent first_message escalates, tampered log quarantines, fake counts every run", async () => {
+  test("r1-prefix: start, recover, and cleanup refuse short or malformed prefixes before any hc call; start generates cryptographic prefix when omitted", async () => {
+    const badPrefixes = ["a", "p5", "p5-", "p5-1234567", "foo-12345678", "p5-UPPER123", "p5-12345678-"];
+
+    for (const bad of badPrefixes) {
+      const sb = createSandbox("r1-bad");
+      const startRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          "7",
+          "--prefix",
+          bad,
+          "--cwd",
+          sb.workDir,
+        ],
+        sb.env,
+      );
+      expect(startRes.exitCode).not.toBe(0);
+      expect(JSON.parse(startRes.stderr).error.code).toBe("invalid_prefix");
+
+      const recoverRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          "7",
+          "--prefix",
+          bad,
+        ],
+        sb.env,
+      );
+      expect(recoverRes.exitCode).not.toBe(0);
+      expect(JSON.parse(recoverRes.stderr).error.code).toBe("invalid_prefix");
+
+      const cleanupRes = await runTracerProcess(
+        [
+          "cleanup",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--prefix",
+          bad,
+        ],
+        sb.env,
+      );
+      expect(cleanupRes.exitCode).not.toBe(0);
+      expect(JSON.parse(cleanupRes.stderr).error.code).toBe("invalid_prefix");
+
+      // Zero hc calls and zero lease acquisition when prefix is invalid.
+      expect(readFakeHcCalls(sb.fakeHcStateDir).length).toBe(0);
+      expect(readOwnerRecord(sb.stateRoot)).toBeNull();
+    }
+
+    // Start without --prefix generates cryptographic p5-<hex> prefixes and prints them.
+    const sb1 = createSandbox("r1-gen1");
+    const sb2 = createSandbox("r1-gen2");
+    const res1 = await runTracerProcess(
+      [
+        "start",
+        "--hc-bin",
+        FAKE_HC_PATH,
+        "--state-root",
+        sb1.stateRoot,
+        "--project-key",
+        sb1.projectKey,
+        "--issue",
+        "7",
+        "--cwd",
+        sb1.workDir,
+        "--expected-lines",
+        "5",
+      ],
+      sb1.env,
+    );
+    const res2 = await runTracerProcess(
+      [
+        "start",
+        "--hc-bin",
+        FAKE_HC_PATH,
+        "--state-root",
+        sb2.stateRoot,
+        "--project-key",
+        sb2.projectKey,
+        "--issue",
+        "7",
+        "--cwd",
+        sb2.workDir,
+        "--expected-lines",
+        "5",
+      ],
+      sb2.env,
+    );
+    expect(res1.exitCode).toBe(0);
+    expect(res2.exitCode).toBe(0);
+    const p1 = JSON.parse(res1.stdout).prefix;
+    const p2 = JSON.parse(res2.stdout).prefix;
+    expect(p1).toMatch(/^p5-[a-z0-9]{8,16}$/);
+    expect(p2).toMatch(/^p5-[a-z0-9]{8,16}$/);
+    expect(p1).not.toBe(p2);
+    expect(res1.stderr).toContain(`prefix=${p1}\n`);
+    expect(res2.stderr).toContain(`prefix=${p2}\n`);
+    assertTripwireNeverRan();
+  });
+
+  test("r3-holder-loss: lease holder death after screen read and before artifact write writes nothing and exits non-zero with lease_revoked", async () => {
+    const sb = createSandbox("r3");
+    const gateFifo = makeGateFifo(sb.workDir);
+    const issue = "7";
+
+    const crashRes = await runTracerProcess(
+      [
+        "start",
+        "--hc-bin",
+        FAKE_HC_PATH,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+        "--cwd",
+        sb.workDir,
+        "--gate-fifo",
+        gateFifo,
+        "--crash-at",
+        "after_launch_before_receipt",
+      ],
+      sb.env,
+    );
+    expect(crashRes.signal).toBe("SIGKILL");
+    waitForKernelLockRelease(sb.stateRoot);
+
+    const ticketDir = getTicketDir(sb.stateRoot, issue);
+    const artifactsBefore = listDirSorted(path.join(ticketDir, "artifacts"));
+    const logBefore = listDirSorted(path.join(ticketDir, "log"));
+    expect(artifactsBefore.length).toBe(1); // brief only
+    expect(logBefore).toEqual(["000001.json", "000002.json"]);
+
+    const callsBefore = readFakeHcCalls(sb.fakeHcStateDir).length;
+    const killHolderEnv = {
+      ...sb.env,
+      FAKE_HC_KILL_HOLDER_ON_CMD: "read",
+      FAKE_HC_OWNER_JSON: path.join(sb.stateRoot, "owner.json"),
+    };
+
+    const recRes = await runTracerProcess(
+      [
+        "recover",
+        "--hc-bin",
+        FAKE_HC_PATH,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+      ],
+      killHolderEnv,
+    );
+
+    expect(recRes.exitCode).not.toBe(0);
+    expect(recRes.stdout).toBe("");
+    expect(JSON.parse(recRes.stderr).error.code).toBe("lease_revoked");
+
+    // Confirm the screen read ran before holder loss.
+    const recCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBefore);
+    expect(recCalls.some((c) => c.argv[0] === "read")).toBe(true);
+
+    // Zero new artifacts and zero new commit records written after holder loss.
+    const artifactsAfter = listDirSorted(path.join(ticketDir, "artifacts"));
+    const logAfter = listDirSorted(path.join(ticketDir, "log"));
+    expect(artifactsAfter, "holder loss before enqueue must write zero new artifacts").toEqual(artifactsBefore);
+    expect(logAfter).toEqual(logBefore);
+
+    releaseGateFifo(gateFifo);
+    assertTripwireNeverRan();
+  });
+
+  test("r4-replacement: terminal replaced under same name before lookup or during wait stays uncertain and captures nothing from replacement", async () => {
+    // Subcase A: replaced under the same name BEFORE first lookup.
+    {
+      const sb = createSandbox("r4a");
+      const issue = "7";
+      const expectedLines = 10;
+      const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
+
+      const crashRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+          "--expected-lines",
+          String(expectedLines),
+          "--crash-at",
+          "after_receipt",
+        ],
+        sb.env,
+      );
+      expect(crashRes.signal).toBe("SIGKILL");
+      waitForKernelLockRelease(sb.stateRoot);
+
+      // Wait for t1 to finish, remove t1, and start replacement t2 under the exact same name.
+      expect(runFakeHcDirect(["wait", "t1", "--timeout", "5", "--json"], sb.env).exitCode).toBe(0);
+      expect(runFakeHcDirect(["rm", "t1", "--json"], sb.env).exitCode).toBe(0);
+      const replArgv = buildStandInWorkerArgv({ attemptId: "a1", expectedLines });
+      const replRun = runFakeHcDirect(
+        ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", expectedName, "--cwd", sb.workDir, "--", ...replArgv],
+        sb.env,
+      );
+      expect(replRun.exitCode).toBe(0);
+      expect(JSON.parse(replRun.stdout).address).toBe("t2");
+      expect(runFakeHcDirect(["wait", "t2", "--timeout", "5", "--json"], sb.env).exitCode).toBe(0);
+
+      const ticketDir = getTicketDir(sb.stateRoot, issue);
+      const artifactsBefore = listDirSorted(path.join(ticketDir, "artifacts"));
+
+      const recRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+        ],
+        sb.env,
+      );
+      expect(recRes.exitCode).toBe(3);
+      const payload = JSON.parse(recRes.stdout);
+      expect(payload.outcome).toBe("uncertain");
+      expect(payload.escalated).toBe(true);
+      expect(payload.reason).toBe("terminal_address_mismatch");
+      expect(listDirSorted(path.join(ticketDir, "artifacts"))).toEqual(artifactsBefore);
+    }
+
+    // Subcase B: replaced under the same name DURING wait (after first verified lookup of t1).
+    {
+      const sb = createSandbox("r4b");
+      const gateFifo = makeGateFifo(sb.workDir);
+      const issue = "7";
+      const expectedLines = 10;
+      const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
+
+      const crashRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+          "--expected-lines",
+          String(expectedLines),
+          "--gate-fifo",
+          gateFifo,
+          "--crash-at",
+          "after_receipt",
+        ],
+        sb.env,
+      );
+      expect(crashRes.signal).toBe("SIGKILL");
+      waitForKernelLockRelease(sb.stateRoot);
+
+      const ticketDir = getTicketDir(sb.stateRoot, issue);
+      const artifactsBefore = listDirSorted(path.join(ticketDir, "artifacts"));
+      const callsBefore = readFakeHcCalls(sb.fakeHcStateDir).length;
+
+      // Replacement worker produces valid framed output so only address pinning prevents capture.
+      const replacementSpec = JSON.stringify({
+        name: expectedName,
+        argv: buildStandInWorkerArgv({ attemptId: "a1", expectedLines }),
+      });
+
+      const recoverPromise = runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+        ],
+        {
+          ...sb.env,
+          FAKE_HC_REPLACE_AFTER_WAIT: replacementSpec,
+        },
+      );
+
+      // Once recover completes its first get(expectedName) while t1 is live, unblock t1.
+      await waitForRecordedCall(sb.fakeHcStateDir, callsBefore, (c) => c.argv[0] === "get" && c.argv[1] === expectedName);
+      releaseGateFifo(gateFifo);
+
+      const recRes = await recoverPromise;
+      expect(recRes.signal).toBeNull();
+      const payload = JSON.parse(recRes.stdout);
+      expect(payload.outcome, "replaced terminal under same name during wait must stay uncertain").toBe("uncertain");
+      expect(recRes.exitCode).toBe(3);
+      expect(payload.escalated).toBe(true);
+      expect(payload.reason).toBe("terminal_missing_after_wait");
+
+      // Post-wait lookup targeted verified address t1; zero reads occurred; zero new artifacts saved.
+      const recCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBefore);
+      expect(recCalls.map((c) => c.argv)).toEqual([
+        ["get", expectedName, "--json"],
+        ["wait", "t1", "--timeout", "10", "--json"],
+        ["get", "t1", "--json"],
+      ]);
+      expect(listDirSorted(path.join(ticketDir, "artifacts"))).toEqual(artifactsBefore);
+
+      const folded = foldCommitLog(ticketDir);
+      expect(folded.phase).toBe("escalated");
+      expect(folded.openAttempt?.state).toBe("uncertain");
+    }
+
+    assertTripwireNeverRan();
+  });
+
+  test("r5-run-failures: definite name_taken settles not_delivered; ambiguous failures end uncertain and never launch again", async () => {
+    // 1. Definite failure: name_taken (all four conditions hold -> settles not_delivered).
+    {
+      const sb = createSandbox("r5-def");
+      const gateFifo = makeGateFifo(sb.workDir);
+      const issue = "7";
+      const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
+
+      const holder = runFakeHcDirect(
+        ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", expectedName, "--cwd", sb.workDir, "--", "sh", "-c", `IFS= read -r _ < '${gateFifo}' || true`],
+        sb.env,
+      );
+      expect(holder.exitCode).toBe(0);
+      expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
+
+      const startRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+        ],
+        sb.env,
+      );
+      expect(startRes.exitCode).toBe(1);
+      const payload = JSON.parse(startRes.stdout);
+      expect(payload.outcome).toBe("not_delivered");
+      expect(payload.errorKind).toBe("name_taken");
+
+      const folded = foldCommitLog(getTicketDir(sb.stateRoot, issue));
+      expect(folded.status).toBe("ok");
+      expect(folded.phase).toBe("ready");
+      expect(folded.openAttempt).toBeNull();
+      expect(folded.records.map((r) => r.event)).toEqual([
+        "brief_committed",
+        "launch_intent",
+        "launch_failed_authoritative",
+      ]);
+      expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(2);
+      releaseGateFifo(gateFifo);
+    }
+
+    // 2. Ambiguous cases: time limit, unparseable stderr, unavailable, address in output, unlisted error kind.
+    const ambiguousCases = [
+      {
+        label: "timeout",
+        extraEnv: { FAKE_HC_HANG_CMD: "run", FAKE_HC_HANG_MS: "2500" },
+        extraArgs: ["--hc-timeout-ms", "150"],
+        expectedReason: "hc_timeout",
+      },
+      {
+        label: "unparseable",
+        extraEnv: { FAKE_HC_FAIL_RUN_MODE: "unparseable" },
+        extraArgs: [],
+        expectedReason: "unparseable_stderr",
+      },
+      {
+        label: "unavailable",
+        extraEnv: { FAKE_HC_FAIL_RUN_MODE: "unavailable" },
+        extraArgs: [],
+        expectedReason: "error_unavailable",
+      },
+      {
+        label: "address-in-output",
+        extraEnv: { FAKE_HC_FAIL_RUN_MODE: "error_with_address" },
+        extraArgs: [],
+        expectedReason: "address_in_output",
+      },
+      {
+        label: "unlisted-kind",
+        extraEnv: { FAKE_HC_FAIL_RUN_MODE: "unknown_kind" },
+        extraArgs: [],
+        expectedReason: "unlisted_error_kind",
+      },
+    ];
+
+    for (const tc of ambiguousCases) {
+      const sb = createSandbox(`r5-${tc.label}`);
+      const issue = "7";
+      const startRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+          ...tc.extraArgs,
+        ],
+        { ...sb.env, ...tc.extraEnv },
+      );
+
+      expect(startRes.exitCode, `ambiguous case ${tc.label} must exit 1`).toBe(1);
+      const payload = JSON.parse(startRes.stdout);
+      expect(payload.outcome, `ambiguous case ${tc.label} must settle uncertain`).toBe("uncertain");
+      expect(payload.escalated).toBe(true);
+      expect(payload.reason).toBe(tc.expectedReason);
+      expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
+
+      const folded = foldCommitLog(getTicketDir(sb.stateRoot, issue));
+      expect(folded.status).toBe("ok");
+      expect(folded.phase).toBe("escalated");
+      expect(folded.openAttempt?.state).toBe("uncertain");
+      expect(folded.records.map((r) => r.event)).toEqual([
+        "brief_committed",
+        "launch_intent",
+        "reconcile_unresolved",
+      ]);
+
+      // Subsequent recover stays escalated and never launches again.
+      const recRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+        ],
+        sb.env,
+      );
+      expect(recRes.exitCode).toBe(0);
+      expect(JSON.parse(recRes.stdout).alreadyEscalated).toBe(true);
+      expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
+    }
+
+    assertTripwireNeverRan();
+  });
+
+  test("edge-cases: wait exit-0 timeout keeps delivered, unsent first_message escalates, schema mismatch escalates, tampered log quarantines, fake counts every run", async () => {
     // 1. Live worker wait timeout (exit 0, ended: false, reason: timeout) does NOT settle as finished.
     {
       const sb = createSandbox("edge-wait-timeout");
@@ -950,7 +1522,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(startRes.signal).toBe("SIGKILL");
       waitForKernelLockRelease(sb.stateRoot);
 
-      // Worker is still blocked on gateFifo: recover waits briefly, sees ended:false, stays delivered.
       const waitTimeoutRecover = await runTracerProcess(
         [
           "recover",
@@ -984,7 +1555,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       const sb = createSandbox("edge-first-msg");
       const gateFifo = makeGateFifo(sb.workDir);
       const issue = "7";
-      const envBlocked = { ...sb.env, FAKE_HC_RUN_FIRST_MSG_UNSENT: "Trust this folder?" };
+      const envBlocked = { ...sb.env, FAKE_HC_RUN_FIRST_MSG_UNSENT: "permission_blocked" };
       const crashRes = await runTracerProcess(
         [
           "start",
@@ -1031,12 +1602,62 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(recPayload.outcome).toBe("uncertain");
       expect(recPayload.escalated).toBe(true);
       expect(recPayload.reason).toBe("launch_first_message_unsent");
-      expect(recPayload.firstMessage).toEqual({ sent: false, reason: "Trust this folder?" });
+      expect(recPayload.firstMessage.sent).toBe(false);
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
       releaseGateFifo(gateFifo);
     }
 
-    // 3. Corrupt hash chain moves ticket to quarantined and refuses to launch anything.
+    // 3. Schema-invalid response from hc get stays uncertain and escalates (R6).
+    {
+      const sb = createSandbox("edge-bad-schema");
+      const issue = "7";
+      const crashRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+          "--crash-at",
+          "after_intent_before_launch",
+        ],
+        sb.env,
+      );
+      expect(crashRes.signal).toBe("SIGKILL");
+      waitForKernelLockRelease(sb.stateRoot);
+
+      const recRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+        ],
+        { ...sb.env, FAKE_HC_INVALID_RESPONSE_CMD: "get" },
+      );
+      expect(recRes.exitCode).toBe(0);
+      const recPayload = JSON.parse(recRes.stdout);
+      expect(recPayload.outcome).toBe("uncertain");
+      expect(recPayload.escalated).toBe(true);
+      expect(recPayload.reason).toBe("invalid_response_schema");
+    }
+
+    // 4. Corrupt hash chain moves ticket to quarantined and refuses to launch anything.
     {
       const sb = createSandbox("edge-quarantine");
       const issue = "7";
@@ -1063,7 +1684,6 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(crashRes.signal).toBe("SIGKILL");
       waitForKernelLockRelease(sb.stateRoot);
 
-      // Tamper with 000001.json so 000002.json's prevRecordSha256 chain breaks.
       const rec1Path = path.join(getTicketDir(sb.stateRoot, issue), "log", "000001.json");
       const orig = fs.readFileSync(rec1Path, "utf8");
       fs.writeFileSync(rec1Path, `${orig} `, "utf8");
@@ -1089,7 +1709,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(0);
     }
 
-    // 4. Fake hc never hides a second launch behind the same address and counts every run call.
+    // 5. Fake hc errors go on stderr with schema error kinds and every run call is counted.
     {
       const sb = createSandbox("edge-run-count");
       const gateFifo = makeGateFifo(sb.workDir);
@@ -1102,15 +1722,22 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(r1.exitCode).toBe(0);
       expect(JSON.parse(r1.stdout).address).toBe("t1");
 
-      // Duplicate live name fails with exit 1 name_taken AND still increments runCount.
+      // Duplicate live name fails with exit 1 name_taken on stderr and still increments runCount.
       const dup = runFakeHcDirect(
         ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", name1, "--cwd", sb.workDir, "--", "true"],
         sb.env,
       );
       expect(dup.exitCode).toBe(1);
-      expect(JSON.parse(dup.stdout).error.kind).toBe("name_taken");
+      expect(dup.stdout).toBe("");
+      expect(JSON.parse(dup.stderr).error.kind).toBe("name_taken");
 
-      // Distinct second launch allocates distinct address t2 AND increments runCount to 3.
+      // rm on a live terminal returns schema-listed kind "live" on stderr.
+      const rmLive = runFakeHcDirect(["rm", "t1", "--json"], sb.env);
+      expect(rmLive.exitCode).toBe(1);
+      expect(rmLive.stdout).toBe("");
+      expect(JSON.parse(rmLive.stderr).error.kind).toBe("live");
+
+      // Distinct second launch allocates distinct address t2 and increments runCount to 3.
       const r2 = runFakeHcDirect(
         ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", name2, "--cwd", sb.workDir, "--", "true"],
         sb.env,
