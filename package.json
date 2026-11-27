@@ -4,6 +4,9 @@
   "description": "Deterministic single-Captain execution tracking over pi-fabric and herdr-core (hc)",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "bun test ./test"
+  },
   "keywords": [
     "pi-package"
   ],
