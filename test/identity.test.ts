@@ -9,11 +9,13 @@ import { afterAll, afterEach, describe, test } from "bun:test";
 import {
   IDENTITY_DECISIONS_DIR,
   IdentityError,
+  MAX_DECISION_RECORD_BYTES,
   MAX_PROJECT_RECORD_BYTES,
   PROJECT_RECORD_FILENAME,
   openProject,
   recordIdentityDecision,
   resolveProjectIdentity,
+  type IdentityDecision,
   type IdentityOperationOptions,
   type LiveProjectIdentity,
   type OpenProjectResult,
@@ -23,10 +25,7 @@ import {
 } from "../src/identity.ts";
 
 interface IdentityUnderTest {
-  readonly resolveProjectIdentity: (
-    cwd: string,
-    options?: IdentityOperationOptions,
-  ) => LiveProjectIdentity;
+  readonly resolveProjectIdentity: (cwd: string) => LiveProjectIdentity;
   readonly openProject: (
     cwd: string,
     stateBase: string,
@@ -34,7 +33,6 @@ interface IdentityUnderTest {
   ) => OpenProjectResult;
   readonly recordIdentityDecision: (
     input: RecordIdentityDecisionInput,
-    options?: IdentityOperationOptions,
   ) => RecordIdentityDecisionResult;
 }
 
@@ -837,8 +835,9 @@ function runCheck5TwoCandidatesAndNonCandidateRefusal(api: IdentityUnderTest, sc
   fs.cpSync(stateBase, nonCandState, { recursive: true });
   const craftedDecisionsDir = path.join(nonCandState, IDENTITY_DECISIONS_DIR);
   fs.mkdirSync(craftedDecisionsDir, { recursive: true });
+  const craftedDecisionPath = path.join(craftedDecisionsDir, `${movedIdentity.projectKey}.json`);
   fs.writeFileSync(
-    path.join(craftedDecisionsDir, `${movedIdentity.projectKey}.json`),
+    craftedDecisionPath,
     `${JSON.stringify(
       {
         schemaVersion: 1,
@@ -858,10 +857,14 @@ function runCheck5TwoCandidatesAndNonCandidateRefusal(api: IdentityUnderTest, sc
     )}\n`,
     "utf8",
   );
-  expectIdentityError(
+  const nonCandErr = expectIdentityError(
     () => api.openProject(cloneMoved, nonCandState),
-    "decision_candidate_not_found",
+    "decision_mismatch",
     "openProject must refuse an on-disk decision naming a non-candidate",
+  );
+  assert.ok(
+    nonCandErr.message.includes(craftedDecisionPath),
+    "decision_mismatch error must name the decision file",
   );
   assert.strictEqual(fs.existsSync(path.join(nonCandState, movedIdentity.projectKey)), false);
 
@@ -1289,34 +1292,13 @@ async function runCheck8RebindAndDestinationExists(
   }
 }
 
-async function runCheck9SigkillBetweenRenameAndRewrite(
-  recoverOpen: (cwd: string, stateBase: string) => OpenProjectResult,
-  scratch: string,
+async function interruptRebindWithSigkill(
+  cloneMoved: string,
+  stateBase: string,
+  oldStateRoot: string,
+  newStateRoot: string,
+  expectedOldCanonicalCommonDir: string,
 ): Promise<void> {
-  const originRepo = path.join(scratch, "origin");
-  const cloneOrig = path.join(scratch, "clone-orig");
-  const cloneMoved = path.join(scratch, "clone-moved");
-  const stateBase = path.join(scratch, "state");
-
-  initRepoWithCommit(originRepo);
-  runGit(["clone", originRepo, cloneOrig]);
-
-  const openedOrig = openProject(cloneOrig, stateBase);
-  seedStateFiles(openedOrig.stateRoot);
-  const nonProjectBefore = snapshotTree(openedOrig.stateRoot, new Set([PROJECT_RECORD_FILENAME]));
-
-  fs.renameSync(cloneOrig, cloneMoved);
-  const movedIdentity = resolveProjectIdentity(cloneMoved);
-  const newStateRoot = path.join(stateBase, movedIdentity.projectKey);
-
-  const recorded = recordIdentityDecision({
-    cwd: cloneMoved,
-    stateBase,
-    choice: "rebind",
-    oldProjectKey: openedOrig.projectKey,
-    decidedBy: "user-crash-test",
-  });
-
   // Child process executes the real rename step and pauses synchronously right before opening
   // the temp file for the project.json rewrite so the parent can kill it with real SIGKILL.
   const childScript = `
@@ -1400,17 +1382,16 @@ async function runCheck9SigkillBetweenRenameAndRewrite(
     assert.strictEqual(pausedEvent.pid, child.pid);
 
     // Verify exact mid-rebind on-disk state BEFORE killing child.
-    assert.strictEqual(fs.existsSync(openedOrig.stateRoot), false, "old folder must already be renamed");
+    assert.strictEqual(fs.existsSync(oldStateRoot), false, "old folder must already be renamed");
     assert.strictEqual(fs.existsSync(newStateRoot), true, "new folder must exist after rename");
     const midCrashRecord = JSON.parse(
       fs.readFileSync(path.join(newStateRoot, PROJECT_RECORD_FILENAME), "utf8"),
     ) as ProjectRecord;
     assert.strictEqual(
       midCrashRecord.canonicalCommonDir,
-      openedOrig.record.canonicalCommonDir,
+      expectedOldCanonicalCommonDir,
       "project.json must still hold the old path before rewrite",
     );
-    assert.strictEqual(midCrashRecord.reboundFrom, undefined);
 
     // Kill child with real SIGKILL and confirm death.
     process.kill(child.pid, "SIGKILL");
@@ -1420,6 +1401,47 @@ async function runCheck9SigkillBetweenRenameAndRewrite(
   } finally {
     await ensureProcessDead(childProc);
   }
+}
+
+async function runCheck9SigkillBetweenRenameAndRewrite(
+  recoverOpen: (cwd: string, stateBase: string) => OpenProjectResult,
+  scratch: string,
+): Promise<void> {
+  const originRepo = path.join(scratch, "origin");
+  const cloneOrig = path.join(scratch, "clone-orig");
+  const cloneMoved = path.join(scratch, "clone-moved");
+  const stateBase = path.join(scratch, "state");
+
+  initRepoWithCommit(originRepo);
+  runGit(["clone", originRepo, cloneOrig]);
+
+  const openedOrig = openProject(cloneOrig, stateBase);
+  seedStateFiles(openedOrig.stateRoot);
+  const nonProjectBefore = snapshotTree(openedOrig.stateRoot, new Set([PROJECT_RECORD_FILENAME]));
+
+  fs.renameSync(cloneOrig, cloneMoved);
+  const movedIdentity = resolveProjectIdentity(cloneMoved);
+  const newStateRoot = path.join(stateBase, movedIdentity.projectKey);
+
+  const recorded = recordIdentityDecision({
+    cwd: cloneMoved,
+    stateBase,
+    choice: "rebind",
+    oldProjectKey: openedOrig.projectKey,
+    decidedBy: "user-crash-test",
+  });
+
+  await interruptRebindWithSigkill(
+    cloneMoved,
+    stateBase,
+    openedOrig.stateRoot,
+    newStateRoot,
+    openedOrig.record.canonicalCommonDir,
+  );
+  const midCrashRecord = JSON.parse(
+    fs.readFileSync(path.join(newStateRoot, PROJECT_RECORD_FILENAME), "utf8"),
+  ) as ProjectRecord;
+  assert.strictEqual(midCrashRecord.reboundFrom, undefined);
 
   // Fresh process reads the mid-rebind state and completes the rewrite.
   const recovered = recoverOpen(cloneMoved, stateBase);
@@ -1564,6 +1586,848 @@ describe("project identity (S1b)", () => {
     const scratch = createScratchDir("check10");
     runCheck10OriginDrift(REAL_IDENTITY, scratch);
   });
+
+  test("fix-1 R1: round trip A -> B -> A -> B maintains reboundFrom per Build note 13 and reuses the existing decision", async () => {
+    const scratch = createScratchDir("fix1-r1");
+    const originRepo = path.join(scratch, "origin");
+    const locA = path.join(scratch, "loc-a");
+    const locB = path.join(scratch, "loc-b");
+    const stateBase = path.join(scratch, "state");
+
+    initRepoWithCommit(originRepo);
+    runGit(["clone", originRepo, locA]);
+
+    const openA = openProject(locA, stateBase);
+    seedStateFiles(openA.stateRoot);
+    const nonProjectBefore = snapshotTree(openA.stateRoot, new Set([PROJECT_RECORD_FILENAME]));
+
+    // A -> B
+    fs.renameSync(locA, locB);
+    const decAB = recordIdentityDecision({
+      cwd: locB,
+      stateBase,
+      choice: "rebind",
+      oldProjectKey: openA.projectKey,
+      decidedBy: "user-r1",
+    });
+    const decABSnapshot = snapshotFile(decAB.decisionPath);
+    const openB1 = openProject(locB, stateBase);
+    assert.strictEqual(openB1.rebound, true);
+    assert.strictEqual(openB1.appliedDecisionId, decAB.decision.decisionId);
+    assert.deepStrictEqual(openB1.record.reboundFrom, [openA.projectKey]);
+
+    // B -> A
+    fs.renameSync(locB, locA);
+    const decBA = recordIdentityDecision({
+      cwd: locA,
+      stateBase,
+      choice: "rebind",
+      oldProjectKey: openB1.projectKey,
+      decidedBy: "user-r1",
+    });
+    const openA2 = openProject(locA, stateBase);
+    assert.strictEqual(openA2.projectKey, openA.projectKey);
+    assert.strictEqual(openA2.rebound, true);
+    assert.strictEqual(openA2.appliedDecisionId, decBA.decision.decisionId);
+    assert.deepStrictEqual(openA2.record.reboundFrom, [openB1.projectKey]);
+
+    // Reopen at A must succeed (project.json must pass reader validation).
+    const reopenA = openProject(locA, stateBase);
+    assert.strictEqual(reopenA.projectKey, openA.projectKey);
+    assert.strictEqual(reopenA.created, false);
+    assert.strictEqual(reopenA.rebound, false);
+    assert.deepStrictEqual(reopenA.record.reboundFrom, [openB1.projectKey]);
+
+    // A -> B again: reuses first decision with no new decision file written.
+    const decisionsDir = path.join(stateBase, IDENTITY_DECISIONS_DIR);
+    const decisionsBeforeSecondMove = snapshotTree(decisionsDir);
+    fs.renameSync(locA, locB);
+    const openB2 = openProject(locB, stateBase);
+    assert.strictEqual(openB2.projectKey, openB1.projectKey);
+    assert.strictEqual(openB2.rebound, true);
+    assert.strictEqual(openB2.appliedDecisionId, decAB.decision.decisionId);
+    assert.deepStrictEqual(openB2.record.reboundFrom, [openA.projectKey]);
+    assert.deepStrictEqual(
+      snapshotTree(decisionsDir),
+      decisionsBeforeSecondMove,
+      "second move to B must reuse the existing decision without writing any decision file",
+    );
+    assert.deepStrictEqual(snapshotFile(decAB.decisionPath), decABSnapshot);
+    assert.deepStrictEqual(
+      snapshotTree(openB2.stateRoot, new Set([PROJECT_RECORD_FILENAME])),
+      nonProjectBefore,
+    );
+
+    // Reopen at B must succeed cleanly.
+    const reopenB = openProject(locB, stateBase);
+    assert.strictEqual(reopenB.projectKey, openB1.projectKey);
+    assert.strictEqual(reopenB.created, false);
+    assert.strictEqual(reopenB.rebound, false);
+    assert.deepStrictEqual(reopenB.record.reboundFrom, [openA.projectKey]);
+
+    // Three-location cycle A -> B -> C -> A preserves oldest-first order excluding current key.
+    const cycleState = path.join(scratch, "state-cycle");
+    const cycA = path.join(scratch, "cyc-a");
+    const cycB = path.join(scratch, "cyc-b");
+    const cycC = path.join(scratch, "cyc-c");
+    runGit(["clone", originRepo, cycA]);
+    const cOpenA = openProject(cycA, cycleState);
+
+    fs.renameSync(cycA, cycB);
+    recordIdentityDecision({
+      cwd: cycB,
+      stateBase: cycleState,
+      choice: "rebind",
+      oldProjectKey: cOpenA.projectKey,
+      decidedBy: "user-cycle",
+    });
+    const cOpenB = openProject(cycB, cycleState);
+    assert.deepStrictEqual(cOpenB.record.reboundFrom, [cOpenA.projectKey]);
+
+    fs.renameSync(cycB, cycC);
+    recordIdentityDecision({
+      cwd: cycC,
+      stateBase: cycleState,
+      choice: "rebind",
+      oldProjectKey: cOpenB.projectKey,
+      decidedBy: "user-cycle",
+    });
+    const cOpenC = openProject(cycC, cycleState);
+    assert.deepStrictEqual(cOpenC.record.reboundFrom, [cOpenA.projectKey, cOpenB.projectKey]);
+
+    fs.renameSync(cycC, cycA);
+    recordIdentityDecision({
+      cwd: cycA,
+      stateBase: cycleState,
+      choice: "rebind",
+      oldProjectKey: cOpenC.projectKey,
+      decidedBy: "user-cycle",
+    });
+    const cOpenA2 = openProject(cycA, cycleState);
+    assert.deepStrictEqual(cOpenA2.record.reboundFrom, [cOpenB.projectKey, cOpenC.projectKey]);
+    const cReopenA = openProject(cycA, cycleState);
+    assert.deepStrictEqual(cReopenA.record.reboundFrom, [cOpenB.projectKey, cOpenC.projectKey]);
+
+    // Interrupted move back B -> A must also exclude the current key via the shared helper.
+    const crashBackState = path.join(scratch, "state-crash-back");
+    const cbA = path.join(scratch, "cb-a");
+    const cbB = path.join(scratch, "cb-b");
+    runGit(["clone", originRepo, cbA]);
+    const cbOpenA = openProject(cbA, crashBackState);
+    fs.renameSync(cbA, cbB);
+    recordIdentityDecision({
+      cwd: cbB,
+      stateBase: crashBackState,
+      choice: "rebind",
+      oldProjectKey: cbOpenA.projectKey,
+      decidedBy: "user-cb",
+    });
+    const cbOpenB = openProject(cbB, crashBackState);
+    fs.renameSync(cbB, cbA);
+    recordIdentityDecision({
+      cwd: cbA,
+      stateBase: crashBackState,
+      choice: "rebind",
+      oldProjectKey: cbOpenB.projectKey,
+      decidedBy: "user-cb",
+    });
+    await interruptRebindWithSigkill(
+      cbA,
+      crashBackState,
+      cbOpenB.stateRoot,
+      cbOpenA.stateRoot,
+      cbOpenB.record.canonicalCommonDir,
+    );
+    const cbRecoveredA = runFreshOpenSubprocess(cbA, crashBackState);
+    assert.strictEqual(cbRecoveredA.rebound, true);
+    assert.deepStrictEqual(cbRecoveredA.record.reboundFrom, [cbOpenB.projectKey]);
+    const cbReopenA = runFreshOpenSubprocess(cbA, crashBackState);
+    assert.strictEqual(cbReopenA.rebound, false);
+    assert.deepStrictEqual(cbReopenA.record.reboundFrom, [cbOpenB.projectKey]);
+  });
+
+  test("fix-1 Build note 11: existing decision for another pair refuses openProject and recordIdentityDecision with decision_mismatch and leaves state unchanged", () => {
+    const scratch = createScratchDir("fix1-bn11");
+    const originRepo = path.join(scratch, "origin");
+    initRepoWithCommit(originRepo);
+
+    // Case 1: A -> B rebound, B -> A rebound (A is live), then C -> B with <B>.json still naming A -> B.
+    const stateLive = path.join(scratch, "state-live-a");
+    const cloneA = path.join(scratch, "clone-a");
+    const cloneB = path.join(scratch, "clone-b");
+    const cloneC = path.join(scratch, "clone-c");
+    runGit(["clone", originRepo, cloneA]);
+    runGit(["clone", originRepo, cloneC]);
+
+    const openA = openProject(cloneA, stateLive);
+    const openC = openProject(cloneC, stateLive);
+    seedStateFiles(openA.stateRoot);
+    seedStateFiles(openC.stateRoot);
+
+    fs.renameSync(cloneA, cloneB);
+    const decAB = recordIdentityDecision({
+      cwd: cloneB,
+      stateBase: stateLive,
+      choice: "rebind",
+      oldProjectKey: openA.projectKey,
+      decidedBy: "user-bn11",
+    });
+    const openB = openProject(cloneB, stateLive);
+
+    fs.renameSync(cloneB, cloneA);
+    recordIdentityDecision({
+      cwd: cloneA,
+      stateBase: stateLive,
+      choice: "rebind",
+      oldProjectKey: openB.projectKey,
+      decidedBy: "user-bn11",
+    });
+    openProject(cloneA, stateLive);
+
+    // Move C into B's path; <B>.json names A -> B, not C -> B.
+    fs.renameSync(cloneC, cloneB);
+    const beforeStateLive = snapshotTree(stateLive);
+
+    const openErr = expectIdentityError(
+      () => openProject(cloneB, stateLive),
+      "decision_mismatch",
+      "openProject must refuse when existing decision names another pair",
+    );
+    assert.ok(openErr.message.includes(decAB.decisionPath));
+    assert.strictEqual(openErr.details?.decisionPath, decAB.decisionPath);
+    assert.deepStrictEqual(
+      snapshotTree(stateLive),
+      beforeStateLive,
+      "decision_mismatch on openProject must leave state tree unchanged byte for byte",
+    );
+
+    const recRebindErr = expectIdentityError(
+      () =>
+        recordIdentityDecision({
+          cwd: cloneB,
+          stateBase: stateLive,
+          choice: "rebind",
+          oldProjectKey: openC.projectKey,
+          decidedBy: "user-bn11",
+        }),
+      "decision_mismatch",
+      "recordIdentityDecision(rebind) must refuse when existing decision names another pair",
+    );
+    assert.ok(recRebindErr.message.includes(decAB.decisionPath));
+    assert.strictEqual(recRebindErr.details?.decisionPath, decAB.decisionPath);
+    assert.deepStrictEqual(snapshotTree(stateLive), beforeStateLive);
+
+    const recNewErr = expectIdentityError(
+      () =>
+        recordIdentityDecision({
+          cwd: cloneB,
+          stateBase: stateLive,
+          choice: "new_project",
+          decidedBy: "user-bn11",
+        }),
+      "decision_mismatch",
+      "recordIdentityDecision(new_project) must refuse when existing decision names another pair",
+    );
+    assert.ok(recNewErr.message.includes(decAB.decisionPath));
+    assert.strictEqual(recNewErr.details?.decisionPath, decAB.decisionPath);
+    assert.deepStrictEqual(snapshotTree(stateLive), beforeStateLive);
+
+    // Case 2: A -> B -> D rebound (<A> no longer exists), then C -> B with <B>.json naming A -> B.
+    const stateGone = path.join(scratch, "state-gone-a");
+    const goneA = path.join(scratch, "gone-a");
+    const goneB = path.join(scratch, "gone-b");
+    const goneC = path.join(scratch, "gone-c");
+    const goneD = path.join(scratch, "gone-d");
+    runGit(["clone", originRepo, goneA]);
+    runGit(["clone", originRepo, goneC]);
+
+    const gOpenA = openProject(goneA, stateGone);
+    const gOpenC = openProject(goneC, stateGone);
+    fs.renameSync(goneA, goneB);
+    const gDecAB = recordIdentityDecision({
+      cwd: goneB,
+      stateBase: stateGone,
+      choice: "rebind",
+      oldProjectKey: gOpenA.projectKey,
+      decidedBy: "user-bn11",
+    });
+    const gOpenB = openProject(goneB, stateGone);
+    fs.renameSync(goneB, goneD);
+    recordIdentityDecision({
+      cwd: goneD,
+      stateBase: stateGone,
+      choice: "rebind",
+      oldProjectKey: gOpenB.projectKey,
+      decidedBy: "user-bn11",
+    });
+    openProject(goneD, stateGone);
+
+    fs.renameSync(goneC, goneB);
+    const beforeStateGone = snapshotTree(stateGone);
+
+    const gOpenErr = expectIdentityError(
+      () => openProject(goneB, stateGone),
+      "decision_mismatch",
+      "openProject must refuse when existing decision names a missing/other pair",
+    );
+    assert.ok(gOpenErr.message.includes(gDecAB.decisionPath));
+    assert.strictEqual(gOpenErr.details?.decisionPath, gDecAB.decisionPath);
+    assert.deepStrictEqual(snapshotTree(stateGone), beforeStateGone);
+
+    const gRecErr = expectIdentityError(
+      () =>
+        recordIdentityDecision({
+          cwd: goneB,
+          stateBase: stateGone,
+          choice: "rebind",
+          oldProjectKey: gOpenC.projectKey,
+          decidedBy: "user-bn11",
+        }),
+      "decision_mismatch",
+      "recordIdentityDecision must refuse when existing decision names a missing/other pair",
+    );
+    assert.ok(gRecErr.message.includes(gDecAB.decisionPath));
+    assert.strictEqual(gRecErr.details?.decisionPath, gDecAB.decisionPath);
+    assert.deepStrictEqual(snapshotTree(stateGone), beforeStateGone);
+
+    // Case 3: different rootCommitShas moves into path B when <B>.json holds a new_project decision for repo 1.
+    const stateRoots = path.join(scratch, "state-diff-roots");
+    const rootRepo1A = path.join(scratch, "root1-a");
+    const rootRepoB = path.join(scratch, "root-shared-b");
+    const rootRepo1D = path.join(scratch, "root1-d");
+    const rootRepo2 = path.join(scratch, "root2");
+    runGit(["clone", originRepo, rootRepo1A]);
+    initRepoWithCommit(rootRepo2, { content: "distinct root commit history\n" });
+
+    openProject(rootRepo1A, stateRoots);
+    fs.renameSync(rootRepo1A, rootRepoB);
+    const rootDecB = recordIdentityDecision({
+      cwd: rootRepoB,
+      stateBase: stateRoots,
+      choice: "new_project",
+      decidedBy: "user-bn11-roots",
+    });
+    const openedRootB = openProject(rootRepoB, stateRoots);
+    fs.renameSync(rootRepoB, rootRepo1D);
+    recordIdentityDecision({
+      cwd: rootRepo1D,
+      stateBase: stateRoots,
+      choice: "rebind",
+      oldProjectKey: openedRootB.projectKey,
+      decidedBy: "user-bn11-roots",
+    });
+    openProject(rootRepo1D, stateRoots);
+
+    fs.renameSync(rootRepo2, rootRepoB);
+    const beforeStateRoots = snapshotTree(stateRoots);
+
+    const rootOpenErr = expectIdentityError(
+      () => openProject(rootRepoB, stateRoots),
+      "decision_mismatch",
+      "openProject must refuse when existing decision has different rootCommitShas",
+    );
+    assert.ok(rootOpenErr.message.includes(rootDecB.decisionPath));
+    assert.strictEqual(rootOpenErr.details?.decisionPath, rootDecB.decisionPath);
+    assert.deepStrictEqual(snapshotTree(stateRoots), beforeStateRoots);
+
+    const rootRecErr = expectIdentityError(
+      () =>
+        recordIdentityDecision({
+          cwd: rootRepoB,
+          stateBase: stateRoots,
+          choice: "new_project",
+          decidedBy: "user-bn11-roots",
+        }),
+      "decision_mismatch",
+      "recordIdentityDecision must refuse when existing decision has different rootCommitShas",
+    );
+    assert.ok(rootRecErr.message.includes(rootDecB.decisionPath));
+    assert.strictEqual(rootRecErr.details?.decisionPath, rootDecB.decisionPath);
+    assert.deepStrictEqual(snapshotTree(stateRoots), beforeStateRoots);
+  });
+
+  test("fix-1 R2: changed origin before decision application or after SIGKILL finishes rebind and reports originDrift", async () => {
+    const scratch = createScratchDir("fix1-r2");
+    const urlOne = "https://example.invalid/org/origin-one.git";
+    const urlTwo = "https://example.invalid/org/origin-two.git";
+
+    // Subcase A: origin changes before a recorded rebind decision is applied.
+    const stateBefore = path.join(scratch, "state-before-apply");
+    const repoBeforeA = path.join(scratch, "before-a");
+    const repoBeforeB = path.join(scratch, "before-b");
+    initRepoWithCommit(repoBeforeA, { originUrl: urlOne });
+
+    const openedBeforeA = openProject(repoBeforeA, stateBefore);
+    seedStateFiles(openedBeforeA.stateRoot);
+    const beforeNonProject = snapshotTree(
+      openedBeforeA.stateRoot,
+      new Set([PROJECT_RECORD_FILENAME]),
+    );
+
+    fs.renameSync(repoBeforeA, repoBeforeB);
+    const decBefore = recordIdentityDecision({
+      cwd: repoBeforeB,
+      stateBase: stateBefore,
+      choice: "rebind",
+      oldProjectKey: openedBeforeA.projectKey,
+      decidedBy: "user-r2-before",
+    });
+
+    // Change origin URL before openProject applies the decision.
+    runGit(["remote", "set-url", "origin", urlTwo], repoBeforeB);
+    const reboundBefore = openProject(repoBeforeB, stateBefore);
+    assert.strictEqual(reboundBefore.rebound, true);
+    assert.strictEqual(reboundBefore.appliedDecisionId, decBefore.decision.decisionId);
+    assert.strictEqual(reboundBefore.record.originUrl, urlOne);
+    assert.deepStrictEqual(reboundBefore.originDrift, { stored: urlOne, live: urlTwo });
+    assert.deepStrictEqual(reboundBefore.record.reboundFrom, [openedBeforeA.projectKey]);
+    assert.deepStrictEqual(
+      snapshotTree(reboundBefore.stateRoot, new Set([PROJECT_RECORD_FILENAME])),
+      beforeNonProject,
+    );
+
+    const reopenBefore = openProject(repoBeforeB, stateBefore);
+    assert.strictEqual(reopenBefore.rebound, false);
+    assert.deepStrictEqual(reopenBefore.originDrift, { stored: urlOne, live: urlTwo });
+
+    // Subcase B: origin changes after SIGKILL between rename and rewrite.
+    const stateSigkill = path.join(scratch, "state-after-sigkill");
+    const repoCrashA = path.join(scratch, "crash-a");
+    const repoCrashB = path.join(scratch, "crash-b");
+    initRepoWithCommit(repoCrashA, { originUrl: urlOne });
+
+    const openedCrashA = openProject(repoCrashA, stateSigkill);
+    seedStateFiles(openedCrashA.stateRoot);
+    const crashNonProject = snapshotTree(
+      openedCrashA.stateRoot,
+      new Set([PROJECT_RECORD_FILENAME]),
+    );
+
+    fs.renameSync(repoCrashA, repoCrashB);
+    const crashBIdentity = resolveProjectIdentity(repoCrashB);
+    const crashBStateRoot = path.join(stateSigkill, crashBIdentity.projectKey);
+    const decCrash = recordIdentityDecision({
+      cwd: repoCrashB,
+      stateBase: stateSigkill,
+      choice: "rebind",
+      oldProjectKey: openedCrashA.projectKey,
+      decidedBy: "user-r2-crash",
+    });
+
+    await interruptRebindWithSigkill(
+      repoCrashB,
+      stateSigkill,
+      openedCrashA.stateRoot,
+      crashBStateRoot,
+      openedCrashA.record.canonicalCommonDir,
+    );
+
+    // Change origin URL after SIGKILL before recovery open runs.
+    runGit(["remote", "set-url", "origin", urlTwo], repoCrashB);
+    const recoveredCrash = runFreshOpenSubprocess(repoCrashB, stateSigkill);
+    assert.strictEqual(recoveredCrash.projectKey, crashBIdentity.projectKey);
+    assert.strictEqual(recoveredCrash.rebound, true);
+    assert.strictEqual(recoveredCrash.appliedDecisionId, decCrash.decision.decisionId);
+    assert.strictEqual(recoveredCrash.record.canonicalCommonDir, crashBIdentity.canonicalCommonDir);
+    assert.strictEqual(recoveredCrash.record.slug, openedCrashA.record.slug);
+    assert.strictEqual(recoveredCrash.record.originUrl, urlOne);
+    assert.deepStrictEqual(recoveredCrash.originDrift, { stored: urlOne, live: urlTwo });
+    assert.deepStrictEqual(recoveredCrash.record.reboundFrom, [openedCrashA.projectKey]);
+    assert.deepStrictEqual(
+      snapshotTree(crashBStateRoot, new Set([PROJECT_RECORD_FILENAME])),
+      crashNonProject,
+    );
+
+    const reopenCrash = runFreshOpenSubprocess(repoCrashB, stateSigkill);
+    assert.strictEqual(reopenCrash.rebound, false);
+    assert.deepStrictEqual(reopenCrash.originDrift, { stored: urlOne, live: urlTwo });
+  });
+
+  test("fix-1 R3: interrupted rebind followed by move to C finishes B first, and recordIdentityDecision validates with reader rules before publishing", async () => {
+    const scratch = createScratchDir("fix1-r3");
+    const originRepo = path.join(scratch, "origin");
+    initRepoWithCommit(originRepo);
+
+    // Subcase A: interrupt A -> B, move to C, open at C -> finishes B first, then record & apply B -> C.
+    const stateBase = path.join(scratch, "state-three-loc");
+    const locA = path.join(scratch, "clone-a");
+    const locB = path.join(scratch, "clone-b");
+    const locC = path.join(scratch, "clone-c");
+    runGit(["clone", originRepo, locA]);
+
+    const openA = openProject(locA, stateBase);
+    seedStateFiles(openA.stateRoot);
+    const nonProjectBefore = snapshotTree(openA.stateRoot, new Set([PROJECT_RECORD_FILENAME]));
+
+    fs.renameSync(locA, locB);
+    const idB = resolveProjectIdentity(locB);
+    const stateRootB = path.join(stateBase, idB.projectKey);
+    recordIdentityDecision({
+      cwd: locB,
+      stateBase,
+      choice: "rebind",
+      oldProjectKey: openA.projectKey,
+      decidedBy: "user-r3-ab",
+    });
+
+    await interruptRebindWithSigkill(
+      locB,
+      stateBase,
+      openA.stateRoot,
+      stateRootB,
+      openA.record.canonicalCommonDir,
+    );
+
+    // Move clone again from B -> C before B's rewrite ran.
+    fs.renameSync(locB, locC);
+    const idC = resolveProjectIdentity(locC);
+
+    const relErr = expectIdentityError(
+      () => openProject(locC, stateBase),
+      "identity_relocated",
+      "open at C after interrupted A -> B must refuse with identity_relocated",
+    );
+    assert.strictEqual(relErr.candidates?.length, 1);
+    assert.strictEqual(relErr.candidates?.[0].projectKey, idB.projectKey);
+    assert.strictEqual(
+      relErr.candidates?.[0].canonicalCommonDir,
+      idB.canonicalCommonDir,
+      "scan must finish interrupted rebind first and list B with path B",
+    );
+    assert.strictEqual(
+      relErr.candidates?.[0].slug,
+      openA.record.slug,
+      "finished interrupted rebind must keep stored slug per Build note 14",
+    );
+
+    // Verify B's project.json on disk is already finished with path B and stored slug.
+    const finishedBOnDisk = JSON.parse(
+      fs.readFileSync(path.join(stateRootB, PROJECT_RECORD_FILENAME), "utf8"),
+    ) as ProjectRecord;
+    assert.strictEqual(finishedBOnDisk.canonicalCommonDir, idB.canonicalCommonDir);
+    assert.strictEqual(finishedBOnDisk.commonDirSha256, idB.commonDirSha256);
+    assert.strictEqual(finishedBOnDisk.slug, openA.record.slug);
+    assert.deepStrictEqual(finishedBOnDisk.reboundFrom, [openA.projectKey]);
+
+    // Record B -> C, read it back, and apply it cleanly.
+    const decBC = recordIdentityDecision({
+      cwd: locC,
+      stateBase,
+      choice: "rebind",
+      oldProjectKey: idB.projectKey,
+      decidedBy: "user-r3-bc",
+    });
+    const readBackBC = JSON.parse(fs.readFileSync(decBC.decisionPath, "utf8")) as IdentityDecision;
+    assert.strictEqual(readBackBC.oldProjectKey, idB.projectKey);
+    assert.strictEqual(readBackBC.oldCanonicalCommonDir, idB.canonicalCommonDir);
+    assert.strictEqual(sha256Hex(readBackBC.oldCanonicalCommonDir as string).slice(0, 16), idB.projectKey);
+    assert.strictEqual(readBackBC.newProjectKey, idC.projectKey);
+    assert.strictEqual(readBackBC.newCanonicalCommonDir, idC.canonicalCommonDir);
+
+    const openC = openProject(locC, stateBase);
+    assert.strictEqual(openC.projectKey, idC.projectKey);
+    assert.strictEqual(openC.rebound, true);
+    assert.strictEqual(openC.appliedDecisionId, decBC.decision.decisionId);
+    assert.strictEqual(openC.record.canonicalCommonDir, idC.canonicalCommonDir);
+    assert.deepStrictEqual(openC.record.reboundFrom, [openA.projectKey, idB.projectKey]);
+    assert.deepStrictEqual(
+      snapshotTree(openC.stateRoot, new Set([PROJECT_RECORD_FILENAME])),
+      nonProjectBefore,
+    );
+    assert.strictEqual(openProject(locC, stateBase).rebound, false);
+
+    // Subcase B: calling recordIdentityDecision directly at C (without opening C first) also finishes B first.
+    const directState = path.join(scratch, "state-direct-record");
+    const dA = path.join(scratch, "direct-a");
+    const dB = path.join(scratch, "direct-b");
+    const dC = path.join(scratch, "direct-c");
+    runGit(["clone", originRepo, dA]);
+    const dOpenA = openProject(dA, directState);
+    fs.renameSync(dA, dB);
+    const dIdB = resolveProjectIdentity(dB);
+    const dStateRootB = path.join(directState, dIdB.projectKey);
+    recordIdentityDecision({
+      cwd: dB,
+      stateBase: directState,
+      choice: "rebind",
+      oldProjectKey: dOpenA.projectKey,
+      decidedBy: "user-r3-direct-ab",
+    });
+    await interruptRebindWithSigkill(
+      dB,
+      directState,
+      dOpenA.stateRoot,
+      dStateRootB,
+      dOpenA.record.canonicalCommonDir,
+    );
+    fs.renameSync(dB, dC);
+    const dDecBC = recordIdentityDecision({
+      cwd: dC,
+      stateBase: directState,
+      choice: "rebind",
+      oldProjectKey: dIdB.projectKey,
+      decidedBy: "user-r3-direct-bc",
+    });
+    assert.strictEqual(dDecBC.decision.oldCanonicalCommonDir, dIdB.canonicalCommonDir);
+    const dOpenC = openProject(dC, directState);
+    assert.strictEqual(dOpenC.rebound, true);
+    assert.deepStrictEqual(dOpenC.record.reboundFrom, [dOpenA.projectKey, dIdB.projectKey]);
+
+    // Subcase C: input producing a decision the reader refuses (>= 8192 UTF-8 bytes) writes NO file.
+    const sizeState = path.join(scratch, "state-decision-size");
+    const sizeOrig = path.join(scratch, "size-orig");
+    const sizeMoved = path.join(scratch, "size-moved");
+    runGit(["clone", originRepo, sizeOrig]);
+    const sizeOpenOrig = openProject(sizeOrig, sizeState);
+    fs.renameSync(sizeOrig, sizeMoved);
+    const sizeMovedId = resolveProjectIdentity(sizeMoved);
+
+    const sampleDecision: IdentityDecision = {
+      schemaVersion: 1,
+      decisionId: "00000000-0000-4000-8000-000000000000",
+      choice: "rebind",
+      oldProjectKey: sizeOpenOrig.projectKey,
+      newProjectKey: sizeMovedId.projectKey,
+      oldCanonicalCommonDir: sizeOpenOrig.record.canonicalCommonDir,
+      newCanonicalCommonDir: sizeMovedId.canonicalCommonDir,
+      rootCommitShas: [...sizeMovedId.rootCommitShas],
+      originUrl: sizeMovedId.originUrl,
+      decidedBy: "u",
+      time: "2026-11-27T00:00:00.000Z",
+    };
+    const baseBytes = Buffer.byteLength(`${JSON.stringify(sampleDecision, null, 2)}\n`, "utf8");
+    const exact8192Delta = MAX_DECISION_RECORD_BYTES - baseBytes;
+    assert.ok(exact8192Delta > 10);
+
+    const asciiTooLarge = "u" + "a".repeat(exact8192Delta);
+    const multibyteTooLarge =
+      "u" + "é".repeat(Math.floor(exact8192Delta / 2)) + "a".repeat(exact8192Delta % 2);
+    assert.ok(multibyteTooLarge.length < asciiTooLarge.length);
+
+    const decisionsDir = path.join(sizeState, IDENTITY_DECISIONS_DIR);
+    for (const [label, decidedBy] of [
+      ["8192-byte ASCII", asciiTooLarge],
+      ["8192-byte UTF-8 multibyte", multibyteTooLarge],
+    ] as const) {
+      expectIdentityError(
+        () =>
+          recordIdentityDecision({
+            cwd: sizeMoved,
+            stateBase: sizeState,
+            choice: "rebind",
+            oldProjectKey: sizeOpenOrig.projectKey,
+            decidedBy,
+          }),
+        "invalid_decision",
+        `decision at ${label} must refuse before publishing`,
+      );
+      assert.strictEqual(
+        fs.existsSync(decisionsDir),
+        false,
+        `${label} refusal must write no file and create no identity-decisions directory`,
+      );
+    }
+
+    // 8191 UTF-8 bytes succeeds and is read back cleanly by openProject.
+    const ascii8191 = "u" + "a".repeat(exact8192Delta - 1);
+    const valid8191 = recordIdentityDecision({
+      cwd: sizeMoved,
+      stateBase: sizeState,
+      choice: "rebind",
+      oldProjectKey: sizeOpenOrig.projectKey,
+      decidedBy: ascii8191,
+    });
+    assert.strictEqual(fs.statSync(valid8191.decisionPath).size, MAX_DECISION_RECORD_BYTES - 1);
+    const opened8191 = openProject(sizeMoved, sizeState);
+    assert.strictEqual(opened8191.rebound, true);
+    assert.strictEqual(opened8191.appliedDecisionId, valid8191.decision.decisionId);
+  });
+
+  test("fix-1 R4: rename races translate ENOTEMPTY/EEXIST to rebind_destination_exists, finish concurrent ENOENT moves, and replace empty dirs cleanly", () => {
+    const scratch = createScratchDir("fix1-r4");
+    const originRepo = path.join(scratch, "origin");
+    initRepoWithCommit(originRepo);
+
+    // Subcase A: non-empty destination folder appears between existence check and renameSync.
+    const statePopulated = path.join(scratch, "state-race-populated");
+    const popOrig = path.join(scratch, "pop-orig");
+    const popMoved = path.join(scratch, "pop-moved");
+    runGit(["clone", originRepo, popOrig]);
+    const popOpenOrig = openProject(popOrig, statePopulated);
+    seedStateFiles(popOpenOrig.stateRoot);
+    fs.renameSync(popOrig, popMoved);
+    const popMovedId = resolveProjectIdentity(popMoved);
+    const popDestRoot = path.join(statePopulated, popMovedId.projectKey);
+    recordIdentityDecision({
+      cwd: popMoved,
+      stateBase: statePopulated,
+      choice: "rebind",
+      oldProjectKey: popOpenOrig.projectKey,
+      decidedBy: "user-r4-pop",
+    });
+
+    const beforeOldPop = snapshotTree(popOpenOrig.stateRoot);
+    expectIdentityError(
+      () =>
+        openProject(popMoved, statePopulated, {
+          fs: {
+            renameSync(oldPath, newPath) {
+              fs.mkdirSync(String(newPath), { recursive: true });
+              fs.writeFileSync(path.join(String(newPath), "sentinel.txt"), "kept\n", "utf8");
+              fs.renameSync(oldPath, newPath);
+            },
+          },
+        }),
+      "rebind_destination_exists",
+      "populated destination appearing before rename must refuse with rebind_destination_exists",
+    );
+    assert.deepStrictEqual(
+      snapshotTree(popOpenOrig.stateRoot),
+      beforeOldPop,
+      "source folder must remain unchanged byte for byte and inode for inode",
+    );
+    assert.deepStrictEqual(fs.readdirSync(popDestRoot), ["sentinel.txt"]);
+    assert.strictEqual(fs.readFileSync(path.join(popDestRoot, "sentinel.txt"), "utf8"), "kept\n");
+
+    // Subcase B: another opener moves the folder right before renameSync (rewrite not done yet).
+    const stateConcurrentMove = path.join(scratch, "state-race-concurrent-move");
+    const cmOrig = path.join(scratch, "cm-orig");
+    const cmMoved = path.join(scratch, "cm-moved");
+    runGit(["clone", originRepo, cmOrig]);
+    const cmOpenOrig = openProject(cmOrig, stateConcurrentMove);
+    seedStateFiles(cmOpenOrig.stateRoot);
+    const cmNonProjectBefore = snapshotTree(
+      cmOpenOrig.stateRoot,
+      new Set([PROJECT_RECORD_FILENAME]),
+    );
+    fs.renameSync(cmOrig, cmMoved);
+    const cmMovedId = resolveProjectIdentity(cmMoved);
+    const cmDec = recordIdentityDecision({
+      cwd: cmMoved,
+      stateBase: stateConcurrentMove,
+      choice: "rebind",
+      oldProjectKey: cmOpenOrig.projectKey,
+      decidedBy: "user-r4-cm",
+    });
+
+    const cmResult = openProject(cmMoved, stateConcurrentMove, {
+      fs: {
+        renameSync(oldPath, newPath) {
+          // Simulate another opener moving oldPath -> newPath first, then hitting real ENOENT.
+          fs.renameSync(oldPath, newPath);
+          fs.renameSync(oldPath, newPath);
+        },
+      },
+    });
+    assert.strictEqual(cmResult.projectKey, cmMovedId.projectKey);
+    assert.strictEqual(cmResult.rebound, true);
+    assert.strictEqual(cmResult.appliedDecisionId, cmDec.decision.decisionId);
+    assert.strictEqual(cmResult.record.canonicalCommonDir, cmMovedId.canonicalCommonDir);
+    assert.strictEqual(cmResult.record.slug, cmOpenOrig.record.slug);
+    assert.deepStrictEqual(cmResult.record.reboundFrom, [cmOpenOrig.projectKey]);
+    assert.deepStrictEqual(
+      snapshotTree(cmResult.stateRoot, new Set([PROJECT_RECORD_FILENAME])),
+      cmNonProjectBefore,
+    );
+    assert.strictEqual(openProject(cmMoved, stateConcurrentMove).rebound, false);
+
+    // Subcase C: another opener completes BOTH rename and project.json rewrite right before renameSync.
+    const stateConcurrentDone = path.join(scratch, "state-race-concurrent-done");
+    const cdOrig = path.join(scratch, "cd-orig");
+    const cdMoved = path.join(scratch, "cd-moved");
+    runGit(["clone", originRepo, cdOrig]);
+    const cdOpenOrig = openProject(cdOrig, stateConcurrentDone);
+    fs.renameSync(cdOrig, cdMoved);
+    const cdMovedId = resolveProjectIdentity(cdMoved);
+    recordIdentityDecision({
+      cwd: cdMoved,
+      stateBase: stateConcurrentDone,
+      choice: "rebind",
+      oldProjectKey: cdOpenOrig.projectKey,
+      decidedBy: "user-r4-cd",
+    });
+
+    let winnerSnapshot: FileSnapshot | undefined;
+    const cdResult = openProject(cdMoved, stateConcurrentDone, {
+      fs: {
+        renameSync(oldPath, newPath) {
+          const winner = openProject(cdMoved, stateConcurrentDone);
+          winnerSnapshot = snapshotFile(path.join(winner.stateRoot, PROJECT_RECORD_FILENAME));
+          fs.renameSync(oldPath, newPath);
+        },
+      },
+    });
+    assert.strictEqual(cdResult.projectKey, cdMovedId.projectKey);
+    assert.strictEqual(cdResult.rebound, false);
+    assert.strictEqual(cdResult.created, false);
+    assert.deepStrictEqual(cdResult.record.reboundFrom, [cdOpenOrig.projectKey]);
+    assert.deepStrictEqual(
+      snapshotFile(path.join(cdResult.stateRoot, PROJECT_RECORD_FILENAME)),
+      winnerSnapshot,
+      "concurrent opener that sees an already-completed rebind must not rewrite project.json",
+    );
+
+    // Subcase D: source disappears with nothing at destination -> named IdentityError, never raw ENOENT.
+    const stateVanished = path.join(scratch, "state-race-vanished");
+    const vanOrig = path.join(scratch, "van-orig");
+    const vanMoved = path.join(scratch, "van-moved");
+    runGit(["clone", originRepo, vanOrig]);
+    const vanOpenOrig = openProject(vanOrig, stateVanished);
+    fs.renameSync(vanOrig, vanMoved);
+    recordIdentityDecision({
+      cwd: vanMoved,
+      stateBase: stateVanished,
+      choice: "rebind",
+      oldProjectKey: vanOpenOrig.projectKey,
+      decidedBy: "user-r4-van",
+    });
+    expectIdentityError(
+      () =>
+        openProject(vanMoved, stateVanished, {
+          fs: {
+            renameSync(oldPath, newPath) {
+              fs.rmSync(String(oldPath), { recursive: true, force: true });
+              fs.renameSync(oldPath, newPath);
+            },
+          },
+        }),
+      "decision_candidate_not_found",
+      "vanished source with no destination must throw named IdentityError, not raw ENOENT",
+    );
+
+    // Subcase E: empty folder appearing before renameSync is replaced cleanly with nothing lost (Build note 15).
+    const stateEmpty = path.join(scratch, "state-race-empty");
+    const empOrig = path.join(scratch, "emp-orig");
+    const empMoved = path.join(scratch, "emp-moved");
+    runGit(["clone", originRepo, empOrig]);
+    const empOpenOrig = openProject(empOrig, stateEmpty);
+    seedStateFiles(empOpenOrig.stateRoot);
+    const empNonProjectBefore = snapshotTree(
+      empOpenOrig.stateRoot,
+      new Set([PROJECT_RECORD_FILENAME]),
+    );
+    fs.renameSync(empOrig, empMoved);
+    recordIdentityDecision({
+      cwd: empMoved,
+      stateBase: stateEmpty,
+      choice: "rebind",
+      oldProjectKey: empOpenOrig.projectKey,
+      decidedBy: "user-r4-empty",
+    });
+    const empResult = openProject(empMoved, stateEmpty, {
+      fs: {
+        renameSync(oldPath, newPath) {
+          fs.mkdirSync(String(newPath));
+          fs.renameSync(oldPath, newPath);
+        },
+      },
+    });
+    assert.strictEqual(empResult.rebound, true);
+    assert.deepStrictEqual(
+      snapshotTree(empResult.stateRoot, new Set([PROJECT_RECORD_FILENAME])),
+      empNonProjectBefore,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1605,7 +2469,7 @@ describe("negative controls (broken adapters fail on intended assertions)", () =
           return openProject(cwd, stateBase, options);
         } catch (err) {
           if (err instanceof IdentityError && err.code === "project_record_too_large") {
-            const live = resolveProjectIdentity(cwd, options);
+            const live = resolveProjectIdentity(cwd);
             const stateRoot = path.join(path.resolve(stateBase), live.projectKey);
             const record: ProjectRecord = {
               schemaVersion: 1,
@@ -1651,7 +2515,7 @@ describe("negative controls (broken adapters fail on intended assertions)", () =
           return openProject(cwd, stateBase, options);
         } catch (err) {
           if (err instanceof IdentityError && err.code === "identity_mismatch") {
-            const live = resolveProjectIdentity(cwd, options);
+            const live = resolveProjectIdentity(cwd);
             const stateRoot = path.join(path.resolve(stateBase), live.projectKey);
             const record = JSON.parse(
               fs.readFileSync(path.join(stateRoot, PROJECT_RECORD_FILENAME), "utf8"),
@@ -1686,7 +2550,7 @@ describe("negative controls (broken adapters fail on intended assertions)", () =
           return openProject(cwd, stateBase, options);
         } catch (err) {
           if (err instanceof IdentityError && err.code === "identity_relocated") {
-            const live = resolveProjectIdentity(cwd, options);
+            const live = resolveProjectIdentity(cwd);
             const stateRoot = path.join(path.resolve(stateBase), live.projectKey);
             const record: ProjectRecord = {
               schemaVersion: 1,
@@ -1727,12 +2591,12 @@ describe("negative controls (broken adapters fail on intended assertions)", () =
     const scratch = createScratchDir("ctrl5");
     const brokenCandidateApi: IdentityUnderTest = {
       ...REAL_IDENTITY,
-      recordIdentityDecision(input, options) {
+      recordIdentityDecision(input) {
         try {
-          return recordIdentityDecision(input, options);
+          return recordIdentityDecision(input);
         } catch (err) {
           if (err instanceof IdentityError && err.code === "decision_candidate_not_found") {
-            const live = resolveProjectIdentity(input.cwd, options);
+            const live = resolveProjectIdentity(input.cwd);
             const decisionsDir = path.join(path.resolve(input.stateBase), IDENTITY_DECISIONS_DIR);
             fs.mkdirSync(decisionsDir, { recursive: true });
             const decisionPath = path.join(decisionsDir, `${live.projectKey}.json`);
@@ -1767,12 +2631,12 @@ describe("negative controls (broken adapters fail on intended assertions)", () =
     const scratch = createScratchDir("ctrl6");
     const brokenOverwriteDecisionApi: IdentityUnderTest = {
       ...REAL_IDENTITY,
-      recordIdentityDecision(input, options) {
+      recordIdentityDecision(input) {
         try {
-          return recordIdentityDecision(input, options);
+          return recordIdentityDecision(input);
         } catch (err) {
           if (err instanceof IdentityError && err.code === "decision_exists") {
-            const live = resolveProjectIdentity(input.cwd, options);
+            const live = resolveProjectIdentity(input.cwd);
             const decisionPath = path.join(
               path.resolve(input.stateBase),
               IDENTITY_DECISIONS_DIR,
