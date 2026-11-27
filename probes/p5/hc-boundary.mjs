@@ -15,15 +15,7 @@ const ALLOWED_HC_COMMANDS = Object.freeze([
   "--version",
 ]);
 
-const FORBIDDEN_HC_COMMANDS = Object.freeze([
-  "server",
-  "update",
-  "machine",
-  "keys",
-]);
-
 const ALLOWED_COMMAND_SET = new Set(ALLOWED_HC_COMMANDS);
-const FORBIDDEN_COMMAND_SET = new Set(FORBIDDEN_HC_COMMANDS);
 
 // Error kinds listed for terminal.run in hc schema --json, excluding unavailable.
 const TERMINAL_RUN_DEFINITE_ERROR_KINDS = new Set([
@@ -39,8 +31,7 @@ const TERMINAL_RUN_DEFINITE_ERROR_KINDS = new Set([
 const MAX_TERMINAL_NAME_LENGTH = 32;
 const TERMINAL_NAME_RE = /^[a-z0-9._-]{1,32}$/;
 const LOCAL_ADDRESS_RE = /^t\d+$/;
-const ANY_ADDRESS_EXACT_RE = /^(?:[a-z0-9._-]+\/)?t\d+$/;
-const ANY_ADDRESS_TOKEN_RE = /\b(?:[a-z0-9._-]+\/)?t\d+\b/;
+const ANY_ADDRESS_TOKEN_RE = /(?:^|[^a-z0-9._/-])(?:[a-z0-9._-]+\/)?t\d+(?=$|[^a-z0-9_/-])/;
 
 // Fixed prefix shape: tag "p5-" followed by 8 to 16 lowercase alphanumeric characters.
 const PREFIX_RE = /^p5-[a-z0-9]{8,16}$/;
@@ -218,39 +209,30 @@ function parseHcErrorEnvelope(stderr, { requireHint = false } = {}) {
   return { ok: true, kind: errObj.kind, rawParsed: parsed };
 }
 
-function objectContainsAddressField(value) {
+function valueContainsAddress(value) {
+  if (typeof value === "string") {
+    return ANY_ADDRESS_TOKEN_RE.test(value);
+  }
   if (Array.isArray(value)) {
-    return value.some(objectContainsAddressField);
+    return value.some(valueContainsAddress);
   }
-  if (!isPlainObject(value)) {
-    return false;
-  }
-  for (const [key, val] of Object.entries(value)) {
-    if ((key === "address" || key === "terminal") && typeof val === "string" && ANY_ADDRESS_EXACT_RE.test(val)) {
-      return true;
-    }
-    if (typeof val === "object" && val !== null && objectContainsAddressField(val)) {
-      return true;
-    }
+  if (isPlainObject(value)) {
+    return Object.values(value).some(valueContainsAddress);
   }
   return false;
 }
 
-function outputContainsTerminalAddress(stdout, parsedStdout, parsedStderr) {
-  if (objectContainsAddressField(parsedStdout) || objectContainsAddressField(parsedStderr)) {
-    return true;
-  }
-  if (typeof stdout === "string" && ANY_ADDRESS_TOKEN_RE.test(stdout)) {
-    return true;
-  }
-  return false;
+function outputContainsTerminalAddress(stdout, stderr, parsedStdout, parsedStderr) {
+  return (
+    (typeof stdout === "string" && ANY_ADDRESS_TOKEN_RE.test(stdout)) ||
+    (typeof stderr === "string" && ANY_ADDRESS_TOKEN_RE.test(stderr)) ||
+    valueContainsAddress(parsedStdout) ||
+    valueContainsAddress(parsedStderr)
+  );
 }
 
 function isFirstMessageValid(fm) {
-  if (!isPlainObject(fm)) {
-    return false;
-  }
-  if (typeof fm.sent !== "boolean") {
+  if (!isPlainObject(fm) || typeof fm.sent !== "boolean") {
     return false;
   }
   if (fm.reason !== undefined && fm.reason !== null && typeof fm.reason !== "string") {
@@ -270,10 +252,7 @@ function isStatusValid(st) {
 }
 
 function isRunResultValid(obj) {
-  if (!isPlainObject(obj)) {
-    return false;
-  }
-  if (typeof obj.address !== "string" || obj.address.length === 0) {
+  if (!isPlainObject(obj) || typeof obj.address !== "string" || obj.address.length === 0) {
     return false;
   }
   if (obj.state !== "live" && obj.state !== "finished") {
@@ -283,6 +262,9 @@ function isRunResultValid(obj) {
     return false;
   }
   if (obj.turn !== undefined && !isNonNegativeInt(obj.turn)) {
+    return false;
+  }
+  if (obj.cwd !== undefined && typeof obj.cwd !== "string") {
     return false;
   }
   if (obj.first_message !== undefined && obj.first_message !== null && !isFirstMessageValid(obj.first_message)) {
@@ -295,32 +277,25 @@ function isTerminalValid(obj) {
   if (!isPlainObject(obj)) {
     return false;
   }
-  // Required fields from hc schema --json Terminal:
+  // Full Terminal required fields (hc schema --json Terminal; confirmed on hc get --json).
   if (typeof obj.address !== "string" || obj.address.length === 0) {
     return false;
   }
-  if (!isPlainObject(obj.labels)) {
+  if (!isPlainObject(obj.labels) || !Object.values(obj.labels).every((v) => typeof v === "string")) {
     return false;
   }
   if (!Array.isArray(obj.argv) || !obj.argv.every((x) => typeof x === "string")) {
     return false;
   }
-  if (typeof obj.cwd !== "string") {
+  if (typeof obj.cwd !== "string" || (obj.state !== "live" && obj.state !== "finished")) {
     return false;
   }
-  if (obj.state !== "live" && obj.state !== "finished") {
+  if (!isNonNegativeInt(obj.created_ms) || typeof obj.screen !== "string") {
     return false;
   }
-  if (!isNonNegativeInt(obj.created_ms)) {
+  if (!isNonNegativeInt(obj.cols) || obj.cols > 65535 || !isNonNegativeInt(obj.rows) || obj.rows > 65535) {
     return false;
   }
-  if (typeof obj.screen !== "string") {
-    return false;
-  }
-  if (!isNonNegativeInt(obj.cols) || !isNonNegativeInt(obj.rows)) {
-    return false;
-  }
-  // Optional/defaulted fields read by the tracer and capture verifier:
   if (obj.name !== undefined && obj.name !== null && typeof obj.name !== "string") {
     return false;
   }
@@ -348,11 +323,8 @@ function isTerminalValid(obj) {
   return true;
 }
 
-function isCompactTerminalValid(obj) {
-  if (!isPlainObject(obj)) {
-    return false;
-  }
-  if (typeof obj.address !== "string" || obj.address.length === 0) {
+function isListEntryValid(obj) {
+  if (!isPlainObject(obj) || typeof obj.address !== "string" || obj.address.length === 0) {
     return false;
   }
   if (obj.state !== "live" && obj.state !== "finished") {
@@ -368,16 +340,10 @@ function isListResultValid(obj) {
   if (!isPlainObject(obj)) {
     return false;
   }
-  if (!Array.isArray(obj.terminals) || !obj.terminals.every(isCompactTerminalValid)) {
+  if (!Array.isArray(obj.terminals) || !obj.terminals.every(isListEntryValid)) {
     return false;
   }
-  if (!isNonNegativeInt(obj.hidden_finished)) {
-    return false;
-  }
-  if (obj.machines !== undefined && !Array.isArray(obj.machines)) {
-    return false;
-  }
-  return true;
+  return isNonNegativeInt(obj.hidden_finished) && Array.isArray(obj.machines);
 }
 
 function isReadResultValid(obj) {
@@ -387,10 +353,7 @@ function isReadResultValid(obj) {
   if (typeof obj.text !== "string" || typeof obj.complete !== "boolean" || typeof obj.how !== "string") {
     return false;
   }
-  if (obj.why !== undefined && obj.why !== null && typeof obj.why !== "string") {
-    return false;
-  }
-  return true;
+  return obj.why === undefined || obj.why === null || typeof obj.why === "string";
 }
 
 function isWaitResultValid(obj) {
@@ -403,7 +366,8 @@ function isWaitResultValid(obj) {
     typeof obj.ended !== "boolean" ||
     typeof obj.reason !== "string" ||
     !isNonNegativeInt(obj.turn) ||
-    !Array.isArray(obj.children)
+    !Array.isArray(obj.children) ||
+    !obj.children.every(isWaitResultValid)
   ) {
     return false;
   }
@@ -413,14 +377,7 @@ function isWaitResultValid(obj) {
   if (obj.signal !== undefined && obj.signal !== null && !Number.isInteger(obj.signal)) {
     return false;
   }
-  if (obj.status !== undefined && obj.status !== null && typeof obj.status !== "string") {
-    return false;
-  }
-  return true;
-}
-
-function isRemoveResultValid(obj) {
-  return isPlainObject(obj) && typeof obj.removed === "string" && obj.removed.length > 0;
+  return obj.status === undefined || obj.status === null || typeof obj.status === "string";
 }
 
 export function createHcClient({
@@ -430,7 +387,7 @@ export function createHcClient({
   env = undefined,
 }) {
   const resolvedHcBin = validateHcBin(hcBin);
-  const { prefix: normalizedPrefix, namespace } = normalizePrefix(prefix);
+  const { namespace } = normalizePrefix(prefix);
   if (!Number.isFinite(defaultTimeoutMs) || defaultTimeoutMs <= 0) {
     throw new HcBoundaryError(
       "invalid_timeout",
@@ -500,13 +457,6 @@ export function createHcClient({
     }
 
     const cmd = args[0];
-    if (FORBIDDEN_COMMAND_SET.has(cmd)) {
-      throw new HcBoundaryError(
-        "forbidden_command",
-        `hc subcommand ${JSON.stringify(cmd)} is forbidden`,
-        { command: cmd },
-      );
-    }
     if (!ALLOWED_COMMAND_SET.has(cmd)) {
       throw new HcBoundaryError(
         "forbidden_command",
@@ -861,7 +811,7 @@ export function createHcClient({
     const parsedStdout = tryParseJson(res.stdout);
     if (res.exitCode !== 0) {
       const envParsed = parseHcErrorEnvelope(res.stderr, { requireHint: true });
-      const hasAddress = outputContainsTerminalAddress(res.stdout, parsedStdout, envParsed.rawParsed);
+      const hasAddress = outputContainsTerminalAddress(res.stdout, res.stderr, parsedStdout, envParsed.rawParsed);
 
       // Settle not_delivered only when all four conditions hold:
       // 1. hc exited non-zero.
@@ -910,7 +860,7 @@ export function createHcClient({
         errorKind: null,
       };
     }
-    recordAuthorizedTerminal(parsedStdout);
+    recordAuthorizedTerminal({ address: parsedStdout.address, name: parsedStdout.name ?? name });
     return {
       ok: true,
       exitCode: 0,
@@ -982,7 +932,7 @@ export function createHcClient({
     return {
       exitCode: 0,
       hiddenFinished: parsed.hidden_finished,
-      machines: parsed.machines ?? [],
+      machines: parsed.machines,
       terminals: parsed.terminals,
     };
   }
@@ -1058,70 +1008,24 @@ export function createHcClient({
 
   async function kill(target, { timeoutMs = defaultTimeoutMs } = {}) {
     const res = await execHc(["kill", target, "--json"], { timeoutMs });
-    if (res.exitCode !== 0) {
-      const envParsed = parseHcErrorEnvelope(res.stderr);
-      return {
-        ok: false,
-        exitCode: res.exitCode,
-        notFound: envParsed.ok && envParsed.kind === "not_found" && res.exitCode === 3,
-        schemaInvalid: !envParsed.ok,
-        errorKind: envParsed.ok ? envParsed.kind : null,
-      };
-    }
-    const parsed = tryParseJson(res.stdout);
-    if (!isCompactTerminalValid(parsed)) {
-      return {
-        ok: false,
-        exitCode: 0,
-        notFound: false,
-        schemaInvalid: true,
-        errorKind: null,
-      };
-    }
     return {
-      ok: true,
-      exitCode: 0,
-      schemaInvalid: false,
-      terminal: parsed,
+      ok: res.exitCode === 0,
+      exitCode: res.exitCode,
+      notFound: res.exitCode === 3,
     };
   }
 
   async function rm(target, { timeoutMs = defaultTimeoutMs } = {}) {
     const res = await execHc(["rm", target, "--json"], { timeoutMs });
-    if (res.exitCode !== 0) {
-      const envParsed = parseHcErrorEnvelope(res.stderr);
-      return {
-        ok: false,
-        exitCode: res.exitCode,
-        notFound: envParsed.ok && envParsed.kind === "not_found" && res.exitCode === 3,
-        schemaInvalid: !envParsed.ok,
-        errorKind: envParsed.ok ? envParsed.kind : null,
-      };
-    }
-    const parsed = tryParseJson(res.stdout);
-    if (!isRemoveResultValid(parsed)) {
-      return {
-        ok: false,
-        exitCode: 0,
-        notFound: false,
-        schemaInvalid: true,
-        errorKind: null,
-      };
-    }
     return {
-      ok: true,
-      exitCode: 0,
-      schemaInvalid: false,
-      removed: parsed.removed,
+      ok: res.exitCode === 0,
+      exitCode: res.exitCode,
+      notFound: res.exitCode === 3,
     };
   }
 
   return {
-    hcBin: resolvedHcBin,
-    prefix: normalizedPrefix,
-    namespace,
     hasPrefix,
-    validateArgs,
     execHc,
     version,
     schema,

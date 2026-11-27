@@ -66,28 +66,27 @@ bun probes/p5/tracer.mjs cleanup \
 
 ## `hc` response fields and error kinds read by this probe
 
-Every response field and error kind read by `hc-boundary.mjs`, `tracer.mjs`, and `capture.mjs` comes from `hc schema --json` (`hc` `0.1.22`), `hc --skill`, or `docs/probes/p3.md`.
+Every field type and error kind read by `hc-boundary.mjs`, `tracer.mjs`, and `capture.mjs` comes from `hc schema --json` (`hc` `0.1.22`) or `hc --skill`. Field shapes come from live output in `docs/probes/p3.md` or the Captain's field-name reading of 2026-11-27, not from the schema's `required` list.
 
-| Surface | Field or error kind | Read by | Source |
+| Surface | Field or error kind | Read by | Source of shape and types |
 |---|---|---|---|
-| `hc schema --json` | `openrpc`, `methods` | `hc-boundary.mjs` | `hc schema --json` top-level OpenRPC document; P3 `e1-schema` |
-| `hc run --bg --json` (`RunResult`) | `address`, `state`, `name`, `turn`, `first_message` | `hc-boundary.mjs`, `tracer.mjs` | `hc schema --json` `RunResult` (`address`, `state`, `name`, `turn`, `first_message`); P3 `a1-run-named`, `b1-run-parent`, `c1-run-report` |
-| `hc get --json` (`Terminal`) | `address`, `name`, `state`, `labels`, `argv`, `cwd`, `created_ms`, `cols`, `rows`, `screen`, `keep`, `exit_code`, `signal`, `reason`, `turn`, `status`, `first_message` | `hc-boundary.mjs`, `tracer.mjs`, `capture.mjs` | `hc schema --json` `Terminal`; P3 `a2-get-by-name`, `b2-get-outlive-while-parent-alive`, `b6-get-plain-after`, `c3-get-finished-by-address`, `hc get` top-level keys |
-| `Status` (`Terminal.status`) | `state` | `hc-boundary.mjs`, `tracer.mjs` | `hc schema --json` `Status.properties.state`; P3 `e2-get-own-1` to `e2-get-own-6`, Behaviour 5 |
-| `FirstMessage` (`RunResult.first_message`, `Terminal.first_message`) | `sent`, `reason`, `started`, `turn` | `hc-boundary.mjs`, `tracer.mjs` | `hc schema --json` `FirstMessage`; `hc --skill` lines 51 to 53; P3 `e2-get-own-1`, `e2-get-own-2` |
-| `hc ls --all --json` (`ListResult`) | `terminals` (items: `address`, `name`, `state`), `hidden_finished`, `machines` | `hc-boundary.mjs`, `tracer.mjs` | `hc schema --json` `ListResult`, `Terminal`; P3 `c8-ls-all` |
-| `hc read --json` (`ReadResult`) | `text`, `complete`, `how`, `why` | `hc-boundary.mjs`, `tracer.mjs`, `capture.mjs` | `hc schema --json` `ReadResult`; `hc --skill` lines 74 to 76; P3 `c4-read-1000-json`, `c5-read-50-json` |
-| `hc wait --json` (`WaitResult`) | `terminal`, `ended`, `reason`, `turn`, `children`, `exit_code`, `signal`, `status` | `hc-boundary.mjs`, `tracer.mjs` | `hc schema --json` `WaitResult`; P3 `b3-wait-parent`, `b7`, `b8`, `c2-wait-report` |
-| `hc kill --json` (`Terminal`) | `address`, `name`, `state` | `hc-boundary.mjs`, `tracer.mjs` | `hc schema --json` `terminal.kill` result (`Terminal`) |
-| `hc rm --json` (`RemoveResult`) | `removed` | `hc-boundary.mjs` | `hc schema --json` `RemoveResult.properties.removed` |
-| `stderr` error envelope | `error.kind` (`error.message` and `error.hint` checked for JSON type only) | `hc-boundary.mjs` | `hc --skill` line 347 (`{error: {kind, message, hint}}` on stderr); P3 `a4-run-duplicate-name`, `d2-get-self-no-id` |
-| `terminal.run` definite non-delivery kinds | `invalid_params`, `name_taken`, `spawn_failed`, `invalid_template`, `not_found`, `machine_unknown`, `config` | `hc-boundary.mjs` | `hc schema --json` `terminal.run` errors (all listed kinds except `unavailable`); P3 `a4-run-duplicate-name` |
-| `terminal.run` ambiguous error kind | `unavailable` | `hc-boundary.mjs` | `hc schema --json` `terminal.run` errors (`unavailable` stays uncertain) |
-| Missing terminal exit and error kind | exit `3` with `error.kind === "not_found"` | `hc-boundary.mjs`, `tracer.mjs` | `hc --skill` line 348 (`3 not_found`); `hc schema --json` `terminal.get`, `terminal.read`, `terminal.wait`, `terminal.kill`, `terminal.rm` errors; P3 `N6` |
-| `terminal.rm` live-terminal error kind | `live` | `hc-boundary.mjs`, `tracer.mjs` (`fake-hc.mjs` emits it) | `hc schema --json` `terminal.rm` errors (`live`) |
-| `hc run` address-in-output guard | keys `address` and `terminal` in parsed output; address token `t<n>` in stdout | `hc-boundary.mjs` | `hc schema --json` `RunResult.properties.address`, `WaitResult.properties.terminal`; `docs/architecture.md` section 8 |
+| `hc schema --json` | `openrpc`, `methods` | `hc-boundary.mjs` | Shape: P3 `e1-schema`. Types: `hc schema --json` top-level OpenRPC document. |
+| `hc run --bg --json` (short launch form) | Required: `address`, `state`. Optional: `name`, `turn`, `cwd`, `first_message` | `hc-boundary.mjs`, `tracer.mjs` | Shape: P3 `a1-run-named`, `b1-run-parent`, `c1-run-report`, `d3-run-no-id`, and the Captain's field-name reading of 2026-11-27. Types: `hc schema --json` `RunResult`. |
+| `hc get --json` (`Terminal`, full object) | Required: `address`, `labels` (string values), `argv`, `cwd`, `state`, `created_ms`, `screen`, `cols`, `rows`. Optional: `name`, `keep`, `exit_code`, `signal`, `reason`, `turn`, `status`, `first_message` | `hc-boundary.mjs`, `tracer.mjs`, `capture.mjs` | Shape: P3 `a2-get-by-name`, `b2-get-outlive-while-parent-alive`, `b6-get-plain-after`, `c3-get-finished-by-address`, `hc get` top-level keys, and the Captain's field-name reading of 2026-11-27. Types: `hc schema --json` `Terminal`. |
+| `Status` (`Terminal.status`) | Required: `state` | `hc-boundary.mjs`, `tracer.mjs` | Shape: P3 `e2-get-own-1` to `e2-get-own-6`, Behaviour 5. Types: `hc schema --json` `Status.properties.state`. |
+| `FirstMessage` (`RunResult.first_message`, `Terminal.first_message`) | Required: `sent`. Optional: `reason`, `started`, `turn` | `hc-boundary.mjs`, `tracer.mjs` | Shape: `hc --skill` lines 51 to 53, P3 `e2-get-own-1`, `e2-get-own-2`, and the Captain's field-name reading of 2026-11-27. Types: `hc schema --json` `FirstMessage`. |
+| `hc ls --all --json` (`ListResult` and short list entry) | Required: `terminals` (items require `address`, `state`; optional `name`), `hidden_finished`, `machines` | `hc-boundary.mjs`, `tracer.mjs` | Shape: P3 `c8-ls-all` and the Captain's field-name reading of 2026-11-27. Types: `hc schema --json` `ListResult`, `Terminal`. |
+| `hc read --json` (`ReadResult`) | Required: `text`, `complete`, `how`. Optional: `why` | `hc-boundary.mjs`, `tracer.mjs`, `capture.mjs` | Shape: `hc --skill` lines 74 to 76 and P3 `c4-read-1000-json`, `c5-read-50-json`. Types: `hc schema --json` `ReadResult`. |
+| `hc wait --json` (`WaitResult`) | Required: `terminal`, `ended`, `reason`, `turn`, `children` (recursive `WaitResult`). Optional: `exit_code`, `signal`, `status` | `hc-boundary.mjs`, `tracer.mjs` | Shape: P3 `b3-wait-parent`, `b7`, `b8`, `c2-wait-report`. Types: `hc schema --json` `WaitResult`. |
+| `hc kill --json` | Exit code only (`0` ok, `3` `not_found`); reads no output field | `hc-boundary.mjs`, `tracer.mjs` | Output: `NOT OBSERVED`. Exit codes: `hc --skill` line 348. |
+| `hc rm --json` | Exit code only (`0` ok, `3` `not_found`); reads no output field | `hc-boundary.mjs`, `tracer.mjs` | Output: `NOT OBSERVED`. Exit codes: `hc --skill` line 348. |
+| `stderr` error envelope | `error.kind` (`error.message` and `error.hint` checked for JSON type only) | `hc-boundary.mjs` | Shape: `hc --skill` line 347 (`{error: {kind, message, hint}}` on stderr) and P3 `a4-run-duplicate-name`, `d2-get-self-no-id`. |
+| `terminal.run` definite non-delivery kinds | `invalid_params`, `name_taken`, `spawn_failed`, `invalid_template`, `not_found`, `machine_unknown`, `config` | `hc-boundary.mjs` | `hc schema --json` `terminal.run` errors (all listed kinds except `unavailable`); P3 `a4-run-duplicate-name`. |
+| `terminal.run` ambiguous error kind | `unavailable` | `hc-boundary.mjs` | `hc schema --json` `terminal.run` errors (`unavailable` stays uncertain). |
+| Missing terminal exit and error kind | Exit `3` with `error.kind === "not_found"` on `get`, `read`, `wait`; exit `3` on `kill`, `rm` | `hc-boundary.mjs`, `tracer.mjs` | `hc --skill` line 348 (`3 not_found`); `hc schema --json` `terminal.get`, `terminal.read`, `terminal.wait`, `terminal.kill`, `terminal.rm` errors; P3 `N6`. |
+| `hc run` address-in-output guard | Address token (`t<n>` or `<machine>/t<n>`) in raw `stdout`, raw `stderr`, or any decoded string value in either stream | `hc-boundary.mjs` | `hc schema --json` `RunResult.properties.address`, `WaitResult.properties.terminal`; `docs/architecture.md` section 8. |
 
-Error `message` and `hint` fields are free text in `hc`. No code path and no test depends on their wording. Any response that does not match its schema type counts as unknown, leaves the attempt `uncertain`, and escalates.
+Error `message` and `hint` fields are free text in `hc`. No code path and no test depends on their wording. Any response that misses a required field or has the wrong type counts as unknown, leaves the attempt `uncertain`, and escalates.
 
 Neither `hc schema --json` nor `hc --skill` records what a registry save failure looks like. Line 150 of `hc --skill` notes only that the program may already have run and tells callers to check `hc ls --all`. Any `hc run` failure that misses one of the four definite non-delivery checks follows section 8 row 2. It looks up the terminal by name, keeps the attempt `uncertain`, escalates, and never launches again.
 
@@ -98,7 +97,7 @@ The control channel in `fake-hc.mjs` is fixture protocol for offline tests, not 
 - State folder set by `FAKE_HC_STATE_DIR` (exits `2` on missing or invalid fixture setup).
 - Fault and sync env vars: `FAKE_HC_PROC_TOKEN`, `FAKE_HC_HANG_CMD`, `FAKE_HC_HANG_MS`, `FAKE_HC_RUN_FIRST_MSG_UNSENT`, `FAKE_HC_FAIL_RUN_MODE`, `FAKE_HC_KILL_HOLDER_ON_CMD`, `FAKE_HC_OWNER_JSON`, `FAKE_HC_REPLACE_AFTER_WAIT`, and `FAKE_HC_INVALID_RESPONSE_CMD`.
 
-All normal JSON payloads and error kinds returned by `fake-hc.mjs` follow `hc schema --json` and `hc --skill`.
+`fake-hc.mjs` prints the same short forms as real `hc` `0.1.22` for `run` and `ls` entries (omitting `name` on unnamed terminals) and prints the full `Terminal` object for `get`. Error envelopes follow `hc schema --json` and `hc --skill`.
 
 ## Left to Slice S3
 

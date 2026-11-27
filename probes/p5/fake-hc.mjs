@@ -13,8 +13,8 @@
  * - FAKE_HC_HANG_CMD + FAKE_HC_HANG_MS: sleeps on the named command to test call timeouts.
  * - FAKE_HC_RUN_FIRST_MSG_UNSENT: sets unsent `first_message` on launched terminal.
  * - FAKE_HC_FAIL_RUN_MODE: injects run failures (`unparseable`, `unavailable`,
- *   `error_with_address`, `unknown_kind`). Note: `unknown_kind` emits an unlisted kind
- *   solely to test rejection of non-schema kinds.
+ *   `error_with_address`, `stderr_message_address`, `stderr_hint_address`, `unknown_kind`).
+ *   Note: `unknown_kind` emits an unlisted kind solely to test rejection of non-schema kinds.
  * - FAKE_HC_KILL_HOLDER_ON_CMD + FAKE_HC_OWNER_JSON: sends SIGKILL to `owner.json`'s
  *   `holderPid` after the named command completes its read and before it exits.
  * - FAKE_HC_REPLACE_AFTER_WAIT: JSON `{name, argv}`; once `wait` sees the terminal finish,
@@ -178,7 +178,7 @@ function refreshTerminal(rec) {
 }
 
 /**
- * Emits `Terminal` / `RunResult` fields defined by `hc schema --json`,
+ * Emits full `Terminal` fields defined by `hc schema --json` (`hc get --json`),
  * including all required fields and optional `first_message` only when unsent.
  */
 function toPublicTerminal(rec) {
@@ -213,6 +213,52 @@ function toPublicTerminal(rec) {
   };
   if (rec.first_message && rec.first_message.sent === false) {
     out.first_message = rec.first_message;
+  }
+  return out;
+}
+
+/**
+ * Short CLI launch form matching `hc 0.1.22` `hc run --bg --json` (P3 `a1`/`b1`/`c1`/`d3`
+ * and Captain's field-name reading of 2026-11-27).
+ */
+function toShortRunResult(rec) {
+  const out = {
+    address: rec.address,
+    agent: path.basename(rec.argv[0] ?? ""),
+    cwd: rec.cwd,
+    state: rec.state,
+    turn: rec.turn,
+  };
+  if (rec.name !== null) {
+    out.name = rec.name;
+  }
+  if (rec.parent !== null) {
+    out.parent = rec.parent;
+  }
+  if (rec.template !== null) {
+    out.template = rec.template;
+  }
+  if (rec.first_message && rec.first_message.sent === false) {
+    out.first_message = rec.first_message;
+  }
+  return out;
+}
+
+/**
+ * Short CLI list entry matching `hc 0.1.22` `hc ls --all --json`
+ * (Captain's field-name reading of 2026-11-27; omits `name` when unnamed).
+ */
+function toShortListEntry(rec) {
+  const out = {
+    address: rec.address,
+    agent: path.basename(rec.argv[0] ?? ""),
+    cwd: rec.cwd,
+    state: rec.state,
+    turn: rec.turn,
+    where: rec.cwd,
+  };
+  if (rec.name !== null) {
+    out.name = rec.name;
   }
   return out;
 }
@@ -345,13 +391,21 @@ function maybeReplaceTerminalAfterWaitUnlocked(state, rec) {
 function runCommand(argv) {
   const cmd = argv[0];
 
+  // Count every `run` invocation once, before any fault branch, so hidden launches are impossible.
+  if (cmd === "run") {
+    withStateLock(() => {
+      const state = loadStateUnlocked();
+      state.runCount = (state.runCount ?? 0) + 1;
+      saveStateUnlocked(state);
+    });
+  }
+
   // Fixture protocol: hang injection for timeout testing.
   if (process.env.FAKE_HC_HANG_CMD && process.env.FAKE_HC_HANG_CMD === cmd) {
     const hangMs = Number(process.env.FAKE_HC_HANG_MS ?? "5000");
     if (cmd === "run") {
       withStateLock(() => {
         const state = loadStateUnlocked();
-        state.runCount = (state.runCount ?? 0) + 1;
         recordCallUnlocked(state, argv, -1);
         saveStateUnlocked(state);
       });
@@ -366,7 +420,17 @@ function runCommand(argv) {
       recordCallUnlocked(state, argv, 0);
       saveStateUnlocked(state);
     });
-    jsonOut({ address: "t1", state: 123 });
+    if (cmd === "run") {
+      jsonOut({ state: "live" });
+    } else if (cmd === "get") {
+      jsonOut({ address: "t1", state: "finished", cwd: "/tmp" });
+    } else if (cmd === "ls") {
+      jsonOut({ terminals: "not-an-array", hidden_finished: 0, machines: [] });
+    } else if (cmd === "wait") {
+      jsonOut({ terminal: "t1", reason: "exit", turn: 0, children: [] });
+    } else {
+      jsonOut({ address: "t1", state: 123 });
+    }
     return 0;
   }
 
@@ -454,8 +518,6 @@ function runCommand(argv) {
 
     const prepared = withStateLock(() => {
       const state = loadStateUnlocked();
-      // Always count every run call so hidden duplicate launches are impossible.
-      state.runCount = (state.runCount ?? 0) + 1;
 
       const failMode = process.env.FAKE_HC_FAIL_RUN_MODE;
       if (failMode === "unparseable") {
@@ -477,6 +539,20 @@ function runCommand(argv) {
         jsonOut({ address: "t99" });
         return {
           exitCode: errorOut(1, "spawn_failed", "failed after allocation", "inspect before retrying"),
+        };
+      }
+      if (failMode === "stderr_message_address") {
+        recordCallUnlocked(state, argv, 1);
+        saveStateUnlocked(state);
+        return {
+          exitCode: errorOut(1, "spawn_failed", "allocated t123 before failing", "inspect before retrying"),
+        };
+      }
+      if (failMode === "stderr_hint_address") {
+        recordCallUnlocked(state, argv, 1);
+        saveStateUnlocked(state);
+        return {
+          exitCode: errorOut(1, "spawn_failed", "spawn failed after start", "check t123 before retrying"),
         };
       }
       // Fixture fault injection: emits an unlisted error kind to exercise R5 ambiguous handling.
@@ -627,7 +703,7 @@ function runCommand(argv) {
       }
       recordCallUnlocked(state, argv, 0);
       saveStateUnlocked(state);
-      return toPublicTerminal(stored ?? rec);
+      return toShortRunResult(stored ?? rec);
     });
 
     jsonOut(runResult);
@@ -646,7 +722,7 @@ function runCommand(argv) {
           hiddenFinished += 1;
           continue;
         }
-        terminals.push(toPublicTerminal(rec));
+        terminals.push(toShortListEntry(rec));
       }
       recordCallUnlocked(state, argv, 0);
       saveStateUnlocked(state);

@@ -1098,10 +1098,10 @@ export async function runCleanup({ hcBin, stateRoot, projectKey, prefix, hcTimeo
         });
         const killRes = killStep.effectResult;
         if (!killRes.ok && !killRes.notFound) {
-          failures.push({ address: addr, name: term.name, step: "kill", errorKind: killRes.errorKind });
+          failures.push({ address: addr, name: term.name, step: "kill", exitCode: killRes.exitCode });
           continue;
         }
-        if (killRes.ok && killRes.terminal?.state !== "finished") {
+        if (killRes.ok) {
           await hc.wait(addr, { timeoutSecs: 5, timeoutMs: Math.max(hcTimeoutMs, 6000) });
         }
       }
@@ -1111,7 +1111,7 @@ export async function runCleanup({ hcBin, stateRoot, projectKey, prefix, hcTimeo
       });
       const rmRes = rmStep.effectResult;
       if (!rmRes.ok && !rmRes.notFound) {
-        failures.push({ address: addr, name: term.name, step: "rm", errorKind: rmRes.errorKind });
+        failures.push({ address: addr, name: term.name, step: "rm", exitCode: rmRes.exitCode });
         continue;
       }
 

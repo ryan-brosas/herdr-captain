@@ -1419,6 +1419,18 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
         expectedReason: "address_in_output",
       },
       {
+        label: "address-in-stderr-message",
+        extraEnv: { FAKE_HC_FAIL_RUN_MODE: "stderr_message_address" },
+        extraArgs: [],
+        expectedReason: "address_in_output",
+      },
+      {
+        label: "address-in-stderr-hint",
+        extraEnv: { FAKE_HC_FAIL_RUN_MODE: "stderr_hint_address" },
+        extraArgs: [],
+        expectedReason: "address_in_output",
+      },
+      {
         label: "unlisted-kind",
         extraEnv: { FAKE_HC_FAIL_RUN_MODE: "unknown_kind" },
         extraArgs: [],
@@ -1746,6 +1758,400 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(JSON.parse(r2.stdout).address).toBe("t2");
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(3);
       releaseGateFifo(gateFifo);
+    }
+
+    assertTripwireNeverRan();
+  });
+
+  test("r10-r11-r12: short-form launch passes, malformed run/get/ls/wait are rejected, kill/rm read exit code only, fake counts run once across faults, and unused client fields are absent", async () => {
+    function writeStubHc(dir, name, body) {
+      const stubPath = path.join(dir, name);
+      fs.writeFileSync(stubPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+      return stubPath;
+    }
+
+    // 1. Short-form launch response (`{ address, state }` alone) passes and commits a launch receipt;
+    //    fake-hc prints short forms for run and ls entries (omitting name when unnamed) and full Terminal for get.
+    {
+      const sb = createSandbox("r10-short-launch");
+      const issue = "7";
+      const minimalHc = writeStubHc(sb.workDir, "minimal-hc", 'printf \'{"address":"t7","state":"live"}\\n\'');
+      const startRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          minimalHc,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+        ],
+        sb.env,
+      );
+      expect(startRes.exitCode, "minimal short-form {address, state} launch must succeed").toBe(0);
+      const payload = JSON.parse(startRes.stdout);
+      expect(payload.outcome).toBe("launched");
+      expect(payload.address).toBe("t7");
+      const folded = foldCommitLog(getTicketDir(sb.stateRoot, issue));
+      expect(folded.records.map((r) => r.event)).toEqual([
+        "brief_committed",
+        "launch_intent",
+        "launch_receipt",
+      ]);
+      expect(folded.records[2].receipt.address).toBe("t7");
+      expect(folded.records[2].receipt.state).toBe("live");
+      expect(folded.records[2].receipt.name).toBe(payload.terminalName);
+      expect(folded.openAttempt?.state).toBe("delivered");
+
+      // Check fake-hc emits real hc 0.1.22 short forms for run and ls entries and full Terminal for get.
+      const runNamed = runFakeHcDirect(
+        ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", `${sb.prefix}-short`, "--cwd", sb.workDir, "--", "true"],
+        sb.env,
+      );
+      expect(runNamed.exitCode).toBe(0);
+      const runJson = JSON.parse(runNamed.stdout);
+      expect(runJson.address).toBe("t1");
+      expect(runJson.state).toBeTypeOf("string");
+      for (const fullOnlyKey of ["labels", "argv", "created_ms", "screen", "cols", "rows"]) {
+        expect(fullOnlyKey in runJson, `fake run must print short form without ${fullOnlyKey}`).toBe(false);
+      }
+
+      // Unnamed terminal omits `name` in fake ls output.
+      const runUnnamed = runFakeHcDirect(
+        ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--cwd", sb.workDir, "--", "true"],
+        sb.env,
+      );
+      expect(runUnnamed.exitCode).toBe(0);
+      const lsRes = runFakeHcDirect(["ls", "--all", "--json"], sb.env);
+      expect(lsRes.exitCode).toBe(0);
+      const lsJson = JSON.parse(lsRes.stdout);
+      expect(Array.isArray(lsJson.terminals)).toBe(true);
+      expect(typeof lsJson.hidden_finished).toBe("number");
+      expect(Array.isArray(lsJson.machines)).toBe(true);
+      const unnamedEntry = lsJson.terminals.find((t) => t.address === "t2");
+      expect(unnamedEntry).toBeTruthy();
+      expect("name" in unnamedEntry).toBe(false);
+      for (const fullOnlyKey of ["labels", "argv", "created_ms", "screen", "cols", "rows"]) {
+        expect(fullOnlyKey in unnamedEntry, `fake ls entry must print short form without ${fullOnlyKey}`).toBe(false);
+      }
+
+      const getRes = runFakeHcDirect(["get", "t1", "--json"], sb.env);
+      expect(getRes.exitCode).toBe(0);
+      const getJson = JSON.parse(getRes.stdout);
+      for (const reqKey of ["address", "labels", "argv", "cwd", "state", "created_ms", "screen", "cols", "rows"]) {
+        expect(reqKey in getJson, `fake get must include full Terminal required key ${reqKey}`).toBe(true);
+      }
+    }
+
+    // 2. Malformed `run` response (no `address`): ends uncertain, commits no launch_receipt, and counts runCount === 1 (R10 + R11).
+    {
+      const sb = createSandbox("r10-bad-run");
+      const issue = "7";
+      const startRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+        ],
+        { ...sb.env, FAKE_HC_INVALID_RESPONSE_CMD: "run" },
+      );
+      expect(startRes.exitCode, "malformed run response must exit 1").toBe(1);
+      const payload = JSON.parse(startRes.stdout);
+      expect(payload.outcome).toBe("uncertain");
+      expect(payload.escalated).toBe(true);
+      expect(payload.reason).toBe("invalid_response_schema");
+      const folded = foldCommitLog(getTicketDir(sb.stateRoot, issue));
+      expect(folded.phase).toBe("escalated");
+      expect(folded.openAttempt?.state).toBe("uncertain");
+      expect(folded.records.map((r) => r.event)).toEqual([
+        "brief_committed",
+        "launch_intent",
+        "reconcile_unresolved",
+      ]);
+      expect(
+        readFakeHcState(sb.fakeHcStateDir).runCount,
+        "R11: malformed run response must still count as 1 run call",
+      ).toBe(1);
+    }
+
+    // 3. Malformed `get` response (missing required Terminal fields, plus non-string labels rejected).
+    {
+      const sb = createSandbox("r10-bad-get");
+      const issue = "7";
+      const crashRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+          "--crash-at",
+          "after_intent_before_launch",
+        ],
+        sb.env,
+      );
+      expect(crashRes.signal).toBe("SIGKILL");
+      waitForKernelLockRelease(sb.stateRoot);
+
+      const recRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+        ],
+        { ...sb.env, FAKE_HC_INVALID_RESPONSE_CMD: "get" },
+      );
+      expect(recRes.exitCode).toBe(0);
+      const recPayload = JSON.parse(recRes.stdout);
+      expect(recPayload.outcome).toBe("uncertain");
+      expect(recPayload.escalated).toBe(true);
+      expect(recPayload.reason).toBe("invalid_response_schema");
+
+      const badLabelsHc = writeStubHc(
+        sb.workDir,
+        "bad-labels-hc",
+        `printf '{"address":"t1","name":"${sb.prefix}-x","labels":{"k":123},"argv":["sh"],"cwd":"/tmp","state":"finished","created_ms":1,"screen":"exact","cols":80,"rows":24}\\n'`,
+      );
+      const hc = createHcClient({ hcBin: badLabelsHc, prefix: sb.prefix, env: sb.env });
+      const getBadLabels = await hc.get(`${sb.prefix}-x`);
+      expect(getBadLabels.ok).toBe(false);
+      expect(getBadLabels.schemaInvalid).toBe(true);
+    }
+
+    // 4. Malformed `ls` response (`terminals` is not an array): cleanup rejects before killing or removing anything;
+    //    `hc.ls` also rejects missing `machines`.
+    {
+      const sb = createSandbox("r10-bad-ls");
+      const gateFifo = makeGateFifo(sb.workDir);
+      const liveName = `${sb.prefix}-keep-live`;
+      const seeded = runFakeHcDirect(
+        [
+          "run",
+          "--bg",
+          "--json",
+          "--no-parent",
+          "--no-notify",
+          "--outlive-parent",
+          "--name",
+          liveName,
+          "--cwd",
+          sb.workDir,
+          "--",
+          "sh",
+          "-c",
+          `IFS= read -r _ < '${gateFifo}' || true`,
+        ],
+        sb.env,
+      );
+      expect(seeded.exitCode).toBe(0);
+
+      const cleanRes = await runTracerProcess(
+        [
+          "cleanup",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--prefix",
+          sb.prefix,
+        ],
+        { ...sb.env, FAKE_HC_INVALID_RESPONSE_CMD: "ls" },
+      );
+      expect(cleanRes.exitCode, "malformed ls in cleanup must exit non-zero").toBe(1);
+
+      const calls = readFakeHcCalls(sb.fakeHcStateDir);
+      const killCalls = calls.filter((c) => c.argv[0] === "kill");
+      const rmCalls = calls.filter((c) => c.argv[0] === "rm");
+      expect(killCalls.length, "malformed ls in cleanup must make 0 kill calls").toBe(0);
+      expect(rmCalls.length, "malformed ls in cleanup must make 0 rm calls").toBe(0);
+
+      const stillLive = runFakeHcDirect(["get", liveName, "--json"], sb.env);
+      expect(stillLive.exitCode).toBe(0);
+      expect(JSON.parse(stillLive.stdout).state).toBe("live");
+
+      const noMachinesHc = writeStubHc(
+        sb.workDir,
+        "no-machines-hc",
+        'printf \'{"terminals":[],"hidden_finished":0}\\n\'',
+      );
+      const hc = createHcClient({ hcBin: noMachinesHc, prefix: sb.prefix, env: sb.env });
+      let lsErr = null;
+      try {
+        await hc.ls({ all: true });
+      } catch (err) {
+        lsErr = err;
+      }
+      expect(lsErr).toBeInstanceOf(HcBoundaryError);
+      expect(lsErr.code).toBe("invalid_json");
+
+      releaseGateFifo(gateFifo);
+    }
+
+    // 5. Malformed `wait` response (no `ended`): recover ends uncertain, escalates, and writes zero new artifacts;
+    //    `hc.wait` also rejects malformed `children`.
+    {
+      const sb = createSandbox("r10-bad-wait");
+      const gateFifo = makeGateFifo(sb.workDir);
+      const issue = "7";
+      const crashRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+          "--gate-fifo",
+          gateFifo,
+          "--crash-at",
+          "after_receipt",
+        ],
+        sb.env,
+      );
+      expect(crashRes.signal).toBe("SIGKILL");
+      waitForKernelLockRelease(sb.stateRoot);
+
+      const ticketDir = getTicketDir(sb.stateRoot, issue);
+      const artifactsBefore = fs.readdirSync(path.join(ticketDir, "artifacts")).sort();
+
+      const recRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+        ],
+        { ...sb.env, FAKE_HC_INVALID_RESPONSE_CMD: "wait" },
+      );
+      expect(recRes.exitCode, "malformed wait response must exit 3").toBe(3);
+      const recPayload = JSON.parse(recRes.stdout);
+      expect(recPayload.outcome).toBe("uncertain");
+      expect(recPayload.escalated).toBe(true);
+      expect(recPayload.reason).toBe("invalid_response_schema");
+      const folded = foldCommitLog(ticketDir);
+      expect(folded.phase).toBe("escalated");
+      expect(folded.openAttempt?.state).toBe("uncertain");
+      const artifactsAfter = fs.readdirSync(path.join(ticketDir, "artifacts")).sort();
+      expect(artifactsAfter).toEqual(artifactsBefore);
+
+      const badChildrenHc = writeStubHc(
+        sb.workDir,
+        "bad-children-hc",
+        'printf \'{"terminal":"t1","ended":true,"reason":"exit","turn":0,"children":[{"terminal":"t2"}]}\\n\'',
+      );
+      const hc = createHcClient({ hcBin: badChildrenHc, prefix: sb.prefix, env: sb.env });
+      const badWait = await hc.wait(`${sb.prefix}-w`);
+      expect(badWait.ok).toBe(false);
+      expect(badWait.schemaInvalid).toBe(true);
+
+      releaseGateFifo(gateFifo);
+    }
+
+    // 6. `kill` and `rm` read exit code only (0 ok, 3 not_found) and ignore unrecorded output shapes.
+    {
+      const sb = createSandbox("r10-kill-rm-exit-only");
+      const exitZeroStub = writeStubHc(sb.workDir, "exit-zero-hc", "printf 'not-json-at-all\\n'; exit 0");
+      const exitThreeStub = writeStubHc(sb.workDir, "exit-three-hc", "exit 3");
+
+      const hcOk = createHcClient({ hcBin: exitZeroStub, prefix: sb.prefix, env: sb.env });
+      expect(await hcOk.kill(`${sb.prefix}-t`)).toEqual({ ok: true, exitCode: 0, notFound: false });
+      expect(await hcOk.rm(`${sb.prefix}-t`)).toEqual({ ok: true, exitCode: 0, notFound: false });
+
+      const hcNf = createHcClient({ hcBin: exitThreeStub, prefix: sb.prefix, env: sb.env });
+      expect(await hcNf.kill(`${sb.prefix}-t`)).toEqual({ ok: false, exitCode: 3, notFound: true });
+      expect(await hcNf.rm(`${sb.prefix}-t`)).toEqual({ ok: false, exitCode: 3, notFound: true });
+    }
+
+    // 7. R11: a `run` hang that resumes before the caller's time limit counts `runCount === 1`, not 2.
+    {
+      const sb = createSandbox("r11-hang-resumes");
+      const issue = "7";
+      const startRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+          "--hc-timeout-ms",
+          "5000",
+        ],
+        { ...sb.env, FAKE_HC_HANG_CMD: "run", FAKE_HC_HANG_MS: "80" },
+      );
+      expect(startRes.exitCode, "resumed hung run must succeed").toBe(0);
+      const payload = JSON.parse(startRes.stdout);
+      expect(payload.outcome).toBe("launched");
+      expect(payload.address).toBe("t1");
+      expect(
+        readFakeHcState(sb.fakeHcStateDir).runCount,
+        "R11: resumed hung run must count as 1, not 2",
+      ).toBe(1);
+    }
+
+    // 8. R12: createHcClient returns no unused properties (validateArgs, hcBin, prefix, namespace).
+    {
+      const sb = createSandbox("r12-client-surface");
+      const hc = createHcClient({ hcBin: FAKE_HC_PATH, prefix: sb.prefix, env: sb.env });
+      expect("validateArgs" in hc).toBe(false);
+      expect("hcBin" in hc).toBe(false);
+      expect("prefix" in hc).toBe(false);
+      expect("namespace" in hc).toBe(false);
     }
 
     assertTripwireNeverRan();
