@@ -181,8 +181,10 @@ function spawnWorker(args, extraEnv = undefined) {
     env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
   });
 
-  child.stdin.on("error", () => {
-    // Suppress EPIPE/ECONNRESET if worker exits while stdin is closing.
+  child.stdin.on("error", (err) => {
+    const code = err && typeof err === "object" && "code" in err ? err.code : "unknown";
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`worker stdin error (code=${code}): ${message}`);
   });
 
   let exitedFlag = false;
