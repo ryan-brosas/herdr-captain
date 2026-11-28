@@ -252,6 +252,15 @@ export async function runStart({
   requireNonEmptyString(String(issue ?? ""), "--issue");
   const { prefix: normPrefix } = normalizePrefix(prefix === undefined ? generateRandomPrefix() : prefix);
   requireNonEmptyString(cwd, "--cwd");
+  const resolvedCwd = path.resolve(cwd);
+  const resolvedReportFile =
+    typeof reportFile === "string" && reportFile.length > 0
+      ? path.resolve(resolvedCwd, reportFile)
+      : null;
+  const resolvedGateFifo =
+    typeof gateFifo === "string" && gateFifo.length > 0
+      ? path.resolve(resolvedCwd, gateFifo)
+      : null;
 
   if (crashAt !== null && !CRASH_POINT_SET.has(crashAt)) {
     throw new Error(`Invalid --crash-at value ${JSON.stringify(crashAt)}; expected one of ${CRASH_POINTS.join(", ")}`);
@@ -289,7 +298,7 @@ export async function runStart({
             briefSha256: briefArtifact.sha256,
             riskTier: "mid",
             expectedLines,
-            reportFile: reportFile ?? null,
+            reportFile: resolvedReportFile,
           },
           evidenceRefs: [
             {
@@ -321,8 +330,8 @@ export async function runStart({
     const workerArgv = buildStandInWorkerArgv({
       attemptId,
       expectedLines,
-      reportFile,
-      gateFifo,
+      reportFile: resolvedReportFile,
+      gateFifo: resolvedGateFifo,
       delaySeconds,
     });
 
@@ -344,9 +353,9 @@ export async function runStart({
           intent: {
             terminalName,
             prefix: normPrefix,
-            cwd,
+            cwd: resolvedCwd,
             expectedLines,
-            reportFile: reportFile ?? null,
+            reportFile: resolvedReportFile,
           },
           evidenceRefs: [],
           countersAfter: countersAfterIntent,
@@ -364,7 +373,7 @@ export async function runStart({
       effect: async () => {
         const runRes = await hc.run({
           name: terminalName,
-          cwd,
+          cwd: resolvedCwd,
           argv: workerArgv,
           timeoutMs: hcTimeoutMs,
         });

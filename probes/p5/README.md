@@ -8,7 +8,7 @@ The fold in `ledger.mjs` and the allow-list in `hc-boundary.mjs` are hand-writte
 
 ## Run the offline tests
 
-The tests use Bun and standard library modules only, with no install step and no network access.
+The tests use Bun and standard library modules only, with no install step and no network access. The suite is tested with Bun 1.4.0.
 
 Run the test suite:
 
@@ -25,6 +25,8 @@ bun probes/p5/negative-controls.mjs
 ## Command shapes for a later live run
 
 A later ticket runs this tracer against a real `hc` binary. Pass an explicit `hc` path that contains `/`. The tracer refuses to start without one and never searches `PATH`.
+
+`--state-root` must name the same folder in every call. A relative value is read against each controller's own working folder.
 
 The boundary accepts a prefix in one fixed shape only: `p5-` plus 8 to 16 lowercase letters or digits (`^p5-[a-z0-9]{8,16}$`). It refuses any other prefix before starting a process. A terminal name belongs to the probe only if it starts with `<prefix>-`, has a non-empty suffix, and has at most 32 characters (`a-z`, `0-9`, `-`, `_`, `.`).
 

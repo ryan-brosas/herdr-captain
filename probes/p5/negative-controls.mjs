@@ -359,6 +359,49 @@ const ANY_ADDRESS_TOKEN_RE = /(?:^|[^A-Za-z0-9._/-])(?:[a-z0-9._-]+\\/)?t[0-9]+(
     expectedErrorRe:
       /error: unnamed run response must not authorise its address before name lookup[\s\S]*Expected constructor:\s*\[class HcBoundaryError[\s\S]*Received value:\s*null/,
   },
+  {
+    id: "ctrl-r18",
+    check: "r18-relative-paths",
+    description: "keep relative --cwd, --report-file, and --gate-fifo unresolved in start",
+    testNameFilter: "r18-relative-paths:",
+    mutate(p5Dir) {
+      replaceExact(
+        path.join(p5Dir, "tracer.mjs"),
+        `  const resolvedCwd = path.resolve(cwd);
+  const resolvedReportFile =
+    typeof reportFile === "string" && reportFile.length > 0
+      ? path.resolve(resolvedCwd, reportFile)
+      : null;
+  const resolvedGateFifo =
+    typeof gateFifo === "string" && gateFifo.length > 0
+      ? path.resolve(resolvedCwd, gateFifo)
+      : null;`,
+        `  // Mutation: leave relative paths unresolved.
+  const resolvedCwd = cwd;
+  const resolvedReportFile = reportFile ?? null;
+  const resolvedGateFifo = gateFifo ?? null;`,
+      );
+    },
+    expectedErrorRe:
+      /error: relative --report-file must recover from a third folder \(got reason=report_file_missing\)[\s\S]*Expected:\s*"captured"[\s\S]*Received:\s*"capture_unusable"/,
+  },
+  {
+    id: "ctrl-r19",
+    check: "r19b-timeout-after-hang-entry",
+    description: "fake-hc skips its injected hang block",
+    testNameFilter: "r19b-timeout-after-hang-entry:",
+    mutate(p5Dir) {
+      replaceExact(
+        path.join(p5Dir, "fake-hc.mjs"),
+        `  // Fixture protocol: hang injection for timeout testing.
+  if (process.env.FAKE_HC_HANG_CMD && process.env.FAKE_HC_HANG_CMD === cmd) {`,
+        `  // Mutation: fake-hc skips its injected hang block.
+  if (false && process.env.FAKE_HC_HANG_CMD && process.env.FAKE_HC_HANG_CMD === cmd) {`,
+      );
+    },
+    expectedErrorRe:
+      /error: fake-hc must record hang entry for run before timeout[\s\S]*Received:\s*null/,
+  },
 ];
 
 let passed = 0;

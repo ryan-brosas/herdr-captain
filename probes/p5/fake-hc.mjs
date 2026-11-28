@@ -7,10 +7,11 @@
  *
  * FIXTURE PROTOCOL (test harness control channel, NOT real `hc` behaviour):
  * - FAKE_HC_STATE_DIR: required absolute temp folder for fixture state (`state.json`,
- *   `calls.ndjson`, `outputs/`, `jobs/`, `ready/`). Exit code 2 reports missing or
+ *   `calls.ndjson`, `hangs.ndjson`, `outputs/`, `jobs/`, `ready/`). Exit code 2 reports missing or
  *   non-absolute FAKE_HC_STATE_DIR.
  * - FAKE_HC_PROC_TOKEN: env token propagated to worker children for deterministic cleanup.
- * - FAKE_HC_HANG_CMD + FAKE_HC_HANG_MS: sleeps on the named command to test call timeouts.
+ * - FAKE_HC_HANG_CMD + FAKE_HC_HANG_MS: records `calls.ndjson` (`exitCode: -1`) and `hangs.ndjson`
+ *   `entered`/`exited` records around a synchronous wait on the named command for timeout testing.
  * - FAKE_HC_RUN_FIRST_MSG_UNSENT: sets unsent `first_message` on launched terminal.
  * - FAKE_HC_FAIL_RUN_MODE: injects run failures (`unparseable`, `unavailable`,
  *   `error_with_address`, `stderr_message_address`, `stderr_hint_address`, `unknown_kind`).
@@ -49,6 +50,7 @@ fs.mkdirSync(path.join(STATE_DIR, "ready"), { recursive: true });
 const LOCK_DIR = path.join(STATE_DIR, ".state.lock");
 const STATE_PATH = path.join(STATE_DIR, "state.json");
 const CALLS_PATH = path.join(STATE_DIR, "calls.ndjson");
+const HANGS_PATH = path.join(STATE_DIR, "hangs.ndjson");
 
 function sleepMsSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -115,6 +117,16 @@ function recordCallUnlocked(state, argv, exitCode) {
     exitCode,
   };
   fs.appendFileSync(CALLS_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+function recordHangEventUnlocked(state, event) {
+  state.hangSeq = (state.hangSeq ?? 0) + 1;
+  const entry = {
+    seq: state.hangSeq,
+    ts: new Date().toISOString(),
+    ...event,
+  };
+  fs.appendFileSync(HANGS_PATH, `${JSON.stringify(entry)}\n`, "utf8");
 }
 
 function maybeKillLeaseHolderForFixture(cmd) {
@@ -410,15 +422,40 @@ function runCommand(argv) {
 
   // Fixture protocol: hang injection for timeout testing.
   if (process.env.FAKE_HC_HANG_CMD && process.env.FAKE_HC_HANG_CMD === cmd) {
-    const hangMs = Number(process.env.FAKE_HC_HANG_MS ?? "5000");
-    if (cmd === "run") {
-      withStateLock(() => {
-        const state = loadStateUnlocked();
-        recordCallUnlocked(state, argv, -1);
-        saveStateUnlocked(state);
+    const rawHangMs = Number(process.env.FAKE_HC_HANG_MS ?? "5000");
+    const effectiveHangMs = Number.isFinite(rawHangMs) && rawHangMs > 0 ? rawHangMs : 5000;
+    const procStat = readProcessStat(process.pid);
+    const t0 = performance.now();
+    withStateLock(() => {
+      const state = loadStateUnlocked();
+      recordCallUnlocked(state, argv, -1);
+      recordHangEventUnlocked(state, {
+        phase: "entered",
+        cmd,
+        argv,
+        pid: process.pid,
+        startTime: procStat?.startTime ?? null,
+        runCountAtEntry: state.runCount ?? 0,
+        hangMs: effectiveHangMs,
       });
-    }
-    sleepMsSync(Number.isFinite(hangMs) && hangMs > 0 ? hangMs : 5000);
+      saveStateUnlocked(state);
+    });
+    sleepMsSync(effectiveHangMs);
+    const elapsedMs = Math.round(performance.now() - t0);
+    withStateLock(() => {
+      const state = loadStateUnlocked();
+      recordHangEventUnlocked(state, {
+        phase: "exited",
+        cmd,
+        argv,
+        pid: process.pid,
+        startTime: procStat?.startTime ?? null,
+        runCountAtExit: state.runCount ?? 0,
+        hangMs: effectiveHangMs,
+        elapsedMs,
+      });
+      saveStateUnlocked(state);
+    });
   }
 
   // Fixture protocol: schema-invalid response injection.

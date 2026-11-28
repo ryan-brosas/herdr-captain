@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  isProcessAliveNonZombie,
   isSameProcessAlive,
   readOwnerRecord,
   readProcessStat,
@@ -123,11 +124,87 @@ function readFakeHcCalls(fakeHcStateDir) {
   return raw.split("\n").map((line) => JSON.parse(line));
 }
 
-function runTracerProcess(args, env) {
+function readFakeHcHangs(fakeHcStateDir) {
+  const p = path.join(fakeHcStateDir, "hangs.ndjson");
+  if (!fs.existsSync(p)) {
+    return [];
+  }
+  const raw = fs.readFileSync(p, "utf8").trim();
+  if (raw.length === 0) {
+    return [];
+  }
+  return raw.split("\n").map((line) => JSON.parse(line));
+}
+
+async function waitForHangEventOrDone(fakeHcStateDir, predicate, isDone, timeoutMs = 5000) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    const match = readFakeHcHangs(fakeHcStateDir).find(predicate);
+    if (match) {
+      return match;
+    }
+    if (isDone()) {
+      return readFakeHcHangs(fakeHcStateDir).find(predicate) ?? null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return readFakeHcHangs(fakeHcStateDir).find(predicate) ?? null;
+}
+
+function measureFakeStartupMs(hcBin, env) {
+  const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-p5-startup-"));
+  try {
+    const probeEnv = { ...env, FAKE_HC_STATE_DIR: probeDir };
+    delete probeEnv.FAKE_HC_HANG_CMD;
+    delete probeEnv.FAKE_HC_HANG_MS;
+    const t0 = performance.now();
+    const res = spawnSync(hcBin, ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: probeEnv,
+      timeout: 10_000,
+    });
+    const elapsedMs = performance.now() - t0;
+    expect(res.status, `startup probe for ${hcBin} must exit 0`).toBe(0);
+    return elapsedMs;
+  } finally {
+    fs.rmSync(probeDir, { recursive: true, force: true });
+  }
+}
+
+function computeHangTimeoutBudget(hcBin, env) {
+  const startupMs = measureFakeStartupMs(hcBin, env);
+  const timeoutMs = Math.max(400, Math.ceil(startupMs) + 350);
+  const hangMs = timeoutMs + 2000;
+  return { startupMs, timeoutMs, hangMs };
+}
+
+function writeDelayedFakeHcWrapper(dir, name, delaySeconds) {
+  const wrapperPath = path.join(dir, name);
+  fs.writeFileSync(
+    wrapperPath,
+    `#!/bin/sh\nsleep ${delaySeconds}\nexec '${FAKE_HC_PATH}' "$@"\n`,
+    { mode: 0o755 },
+  );
+  return wrapperPath;
+}
+
+function writeGatedStartupFakeHcWrapper(dir, name, gateFifoPath, pidFilePath) {
+  const wrapperPath = path.join(dir, name);
+  fs.writeFileSync(
+    wrapperPath,
+    `#!/bin/sh\nprintf '%s\\n' "$$" > '${pidFilePath}'\nIFS= read -r _ < '${gateFifoPath}' || true\nexec '${FAKE_HC_PATH}' "$@"\n`,
+    { mode: 0o755 },
+  );
+  return wrapperPath;
+}
+
+function runTracerProcess(args, env, { cwd } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [TRACER_PATH, ...args], {
       stdio: ["ignore", "pipe", "pipe"],
       env,
+      ...(cwd ? { cwd } : {}),
     });
     let stdout = "";
     let stderr = "";
@@ -856,32 +933,62 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     }
     expect(readFakeHcCalls(sb.fakeHcStateDir).length).toBe(callsBeforeRefusals);
 
-    // Hung hc call is cut at its time limit and reported.
+    // Hung hc call is cut at its time limit and reported, with evidence from fake-hc that ls entered its hang.
+    const { timeoutMs: lsTimeoutMs, hangMs: lsHangMs } = computeHangTimeoutBudget(FAKE_HC_PATH, sb.env);
     const hangClient = createHcClient({
       hcBin: FAKE_HC_PATH,
       prefix: sb.prefix,
-      defaultTimeoutMs: 150,
+      defaultTimeoutMs: lsTimeoutMs,
       env: {
         ...sb.env,
         FAKE_HC_HANG_CMD: "ls",
-        FAKE_HC_HANG_MS: "2500",
+        FAKE_HC_HANG_MS: String(lsHangMs),
       },
     });
 
+    const callsBeforeHang = readFakeHcCalls(sb.fakeHcStateDir).length;
     const t0 = performance.now();
+    let lsSettled = false;
     let timeoutErr = null;
-    try {
-      await hangClient.ls({ all: true, timeoutMs: 150 });
-    } catch (err) {
-      timeoutErr = err;
-    }
+    const lsPromise = hangClient
+      .ls({ all: true, timeoutMs: lsTimeoutMs })
+      .catch((err) => {
+        timeoutErr = err;
+      })
+      .finally(() => {
+        lsSettled = true;
+      });
+
+    const hangEntered = await waitForHangEventOrDone(
+      sb.fakeHcStateDir,
+      (ev) => ev.phase === "entered" && ev.cmd === "ls",
+      () => lsSettled,
+      lsTimeoutMs + 1000,
+    );
+    await lsPromise;
     const elapsedMs = performance.now() - t0;
 
+    expect(hangEntered, "fake-hc must record hang entry for ls before timeout").not.toBeNull();
     expect(timeoutErr, "hung hc call must be killed at timeout with HcBoundaryError").toBeInstanceOf(HcBoundaryError);
     expect(timeoutErr.code).toBe("hc_timeout");
     expect(timeoutErr.details.killed).toBe(true);
-    expect(timeoutErr.details.timeoutMs).toBe(150);
-    expect(elapsedMs).toBeLessThan(1200);
+    expect(timeoutErr.details.timeoutMs).toBe(lsTimeoutMs);
+    expect(elapsedMs).toBeLessThan(lsHangMs - 500);
+
+    const lsHangs = readFakeHcHangs(sb.fakeHcStateDir);
+    const hangExited = lsHangs.find(
+      (ev) => ev.phase === "exited" && ev.cmd === "ls" && ev.pid === hangEntered.pid,
+    );
+    expect(hangExited, "hung ls fake-hc must be killed before hang exits").toBeUndefined();
+    expect(
+      isSameProcessAlive(hangEntered.pid, hangEntered.startTime),
+      "hung ls fake-hc process must be dead after timeout",
+    ).toBe(false);
+    const lsHangCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBeforeHang);
+    expect(
+      lsHangCalls.some((c) => c.argv[0] === "ls" && c.exitCode === -1),
+      "fake-hc must record ls invocation before hanging",
+    ).toBe(true);
     assertTripwireNeverRan();
   });
 
@@ -1417,14 +1524,10 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       releaseGateFifo(gateFifo);
     }
 
-    // 2. Ambiguous cases: time limit, unparseable stderr, unavailable, address in output, unlisted error kind.
+    // 2. Non-timeout ambiguous cases: unparseable stderr, unavailable, address in output, unlisted error kind.
+    //    Timeout during startup and timeout after hang entry are tested apart in r19a-timeout-during-startup
+    //    and r19b-timeout-after-hang-entry.
     const ambiguousCases = [
-      {
-        label: "timeout",
-        extraEnv: { FAKE_HC_HANG_CMD: "run", FAKE_HC_HANG_MS: "2500" },
-        extraArgs: ["--hc-timeout-ms", "150"],
-        expectedReason: "hc_timeout",
-      },
       {
         label: "unparseable",
         extraEnv: { FAKE_HC_FAIL_RUN_MODE: "unparseable" },
@@ -2135,41 +2238,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(await hcNf.rm(`${sb.prefix}-t`)).toEqual({ ok: false, exitCode: 3, notFound: true });
     }
 
-    // 7. R11: a `run` hang that resumes before the caller's time limit counts `runCount === 1`, not 2.
-    {
-      const sb = createSandbox("r11-hang-resumes");
-      const issue = "7";
-      const startRes = await runTracerProcess(
-        [
-          "start",
-          "--hc-bin",
-          FAKE_HC_PATH,
-          "--state-root",
-          sb.stateRoot,
-          "--project-key",
-          sb.projectKey,
-          "--issue",
-          issue,
-          "--prefix",
-          sb.prefix,
-          "--cwd",
-          sb.workDir,
-          "--hc-timeout-ms",
-          "5000",
-        ],
-        { ...sb.env, FAKE_HC_HANG_CMD: "run", FAKE_HC_HANG_MS: "80" },
-      );
-      expect(startRes.exitCode, "resumed hung run must succeed").toBe(0);
-      const payload = JSON.parse(startRes.stdout);
-      expect(payload.outcome).toBe("launched");
-      expect(payload.address).toBe("t1a");
-      expect(
-        readFakeHcState(sb.fakeHcStateDir).runCount,
-        "R11: resumed hung run must count as 1, not 2",
-      ).toBe(1);
-    }
-
-    // 8. R12: createHcClient returns no unused properties (validateArgs, hcBin, prefix, namespace).
+    // 7. R12: createHcClient returns no unused properties (validateArgs, hcBin, prefix, namespace).
     {
       const sb = createSandbox("r12-client-surface");
       const hc = createHcClient({ hcBin: FAKE_HC_PATH, prefix: sb.prefix, env: sb.env });
@@ -2178,6 +2247,56 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect("prefix" in hc).toBe(false);
       expect("namespace" in hc).toBe(false);
     }
+
+    assertTripwireNeverRan();
+  });
+
+  test("r11-hang-resumes: 80 ms pause in run is entered and left in fake-hc record and counts runCount 1", async () => {
+    const sb = createSandbox("r11-hang-resumes");
+    const issue = "7";
+    const startRes = await runTracerProcess(
+      [
+        "start",
+        "--hc-bin",
+        FAKE_HC_PATH,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+        "--cwd",
+        sb.workDir,
+        "--hc-timeout-ms",
+        "5000",
+      ],
+      { ...sb.env, FAKE_HC_HANG_CMD: "run", FAKE_HC_HANG_MS: "80" },
+    );
+    expect(startRes.exitCode, "resumed hung run must succeed").toBe(0);
+    const payload = JSON.parse(startRes.stdout);
+    expect(payload.outcome).toBe("launched");
+    expect(payload.address).toBe("t1a");
+    expect(
+      readFakeHcState(sb.fakeHcStateDir).runCount,
+      "R11: resumed hung run must count as 1, not 2",
+    ).toBe(1);
+    const hangs = readFakeHcHangs(sb.fakeHcStateDir);
+    const pauseEntered = hangs.find((ev) => ev.phase === "entered" && ev.cmd === "run");
+    const pauseExited = hangs.find(
+      (ev) => ev.phase === "exited" && ev.cmd === "run" && ev.pid === pauseEntered?.pid,
+    );
+    expect(pauseEntered, "R11: fake-hc must record pause entry for run").toBeDefined();
+    expect(pauseExited, "R11: fake-hc must record pause exit after resuming").toBeDefined();
+    expect(pauseEntered.hangMs).toBe(80);
+    expect(pauseEntered.runCountAtEntry).toBe(1);
+    expect(pauseExited.runCountAtExit).toBe(1);
+    expect(pauseExited.seq).toBeGreaterThan(pauseEntered.seq);
+    expect(pauseExited.elapsedMs).toBeGreaterThanOrEqual(50);
+    const pauseCalls = readFakeHcCalls(sb.fakeHcStateDir).filter((c) => c.argv[0] === "run");
+    expect(pauseCalls.some((c) => c.exitCode === -1)).toBe(true);
+    expect(pauseCalls.some((c) => c.exitCode === 0)).toBe(true);
 
     assertTripwireNeverRan();
   });
@@ -2712,6 +2831,531 @@ process.exit(res.status ?? 1);
     expect(secondRec.exitCode).toBe(0);
     expect(JSON.parse(secondRec.stdout).alreadyEscalated).toBe(true);
     expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(runCountBeforeRecover);
+
+    assertTripwireNeverRan();
+  });
+
+  test("r18-relative-paths: start resolves --cwd, bare --report-file, and bare --gate-fifo before intent; recover verifies across three folders while still refusing missing or tampered reports", async () => {
+    // 1. Start, worker, and recover run in three distinct folders; --cwd is relative and --report-file / --gate-fifo are bare filenames.
+    {
+      const sb = createSandbox("r18-three-dirs");
+      const startDir = path.join(sb.root, "start-dir");
+      const workerDir = path.join(sb.root, "worker-dir");
+      const recoverDir = path.join(sb.root, "recover-dir");
+      fs.mkdirSync(startDir, { recursive: true });
+      fs.mkdirSync(workerDir, { recursive: true });
+      fs.mkdirSync(recoverDir, { recursive: true });
+
+      const bareReportName = "worker-report.txt";
+      const bareGateName = "gate.fifo";
+      const expectedReportPath = path.join(workerDir, bareReportName);
+      const expectedGatePath = makeGateFifo(workerDir, bareGateName);
+      const relativeWorkerCwd = path.relative(startDir, workerDir);
+      expect(path.isAbsolute(relativeWorkerCwd)).toBe(false);
+
+      const issue = "18";
+      const expectedLines = 40;
+      const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
+
+      const crashRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          relativeWorkerCwd,
+          "--expected-lines",
+          String(expectedLines),
+          "--report-file",
+          bareReportName,
+          "--gate-fifo",
+          bareGateName,
+          "--crash-at",
+          "after_receipt",
+        ],
+        sb.env,
+        { cwd: startDir },
+      );
+      expect(crashRes.signal).toBe("SIGKILL");
+      expect(crashRes.exitCode).toBeNull();
+      waitForKernelLockRelease(sb.stateRoot);
+
+      releaseGateFifo(expectedGatePath);
+      const waitRes = runFakeHcDirect(["wait", expectedName, "--timeout", "10", "--json"], sb.env);
+      expect(waitRes.exitCode).toBe(0);
+      expect(JSON.parse(waitRes.stdout).ended).toBe(true);
+
+      // The fake worker wrote the report inside workerDir, not startDir or recoverDir.
+      expect(fs.existsSync(expectedReportPath), "worker must write report inside workerDir").toBe(true);
+      expect(fs.existsSync(path.join(startDir, bareReportName))).toBe(false);
+      expect(fs.existsSync(path.join(recoverDir, bareReportName))).toBe(false);
+
+      const recoverRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--read-lines",
+          "1000",
+        ],
+        sb.env,
+        { cwd: recoverDir },
+      );
+      expect(recoverRes.signal).toBeNull();
+      const recovered = JSON.parse(recoverRes.stdout);
+      expect(
+        recovered.outcome,
+        `relative --report-file must recover from a third folder (got reason=${recovered.reason})`,
+      ).toBe("captured");
+      expect(recoverRes.exitCode).toBe(0);
+      expect(recovered.reportFileVerified, "recover must verify report file on disk").toBe(true);
+      expect(recovered.linesVerified).toBe(expectedLines);
+
+      // Recorded brief_committed and launch_intent must hold resolved absolute paths.
+      const ticketDir = getTicketDir(sb.stateRoot, issue);
+      const folded = foldCommitLog(ticketDir);
+      expect(folded.status).toBe("ok");
+      expect(folded.phase).toBe("gating");
+      const briefRec = folded.records.find((r) => r.event === "brief_committed");
+      const intentRec = folded.records.find((r) => r.event === "launch_intent");
+      expect(path.isAbsolute(intentRec.intent.cwd)).toBe(true);
+      expect(intentRec.intent.cwd).toBe(workerDir);
+      expect(path.isAbsolute(intentRec.intent.reportFile)).toBe(true);
+      expect(intentRec.intent.reportFile).toBe(expectedReportPath);
+      expect(briefRec.intent.reportFile).toBe(expectedReportPath);
+
+      // hc run received resolved absolute --cwd, report path, and gate FIFO path.
+      const runCall = readFakeHcCalls(sb.fakeHcStateDir).find((c) => c.argv[0] === "run");
+      expect(runCall).toBeDefined();
+      const cwdIdx = runCall.argv.indexOf("--cwd");
+      expect(cwdIdx).toBeGreaterThan(-1);
+      expect(runCall.argv[cwdIdx + 1]).toBe(workerDir);
+      const workerScript = runCall.argv[runCall.argv.length - 1];
+      expect(workerScript).toContain(expectedReportPath);
+      expect(workerScript).toContain(expectedGatePath);
+    }
+
+    // 2. Missing report file on disk is still refused with report_file_missing.
+    {
+      const sb = createSandbox("r18-missing-report");
+      const startDir = path.join(sb.root, "start-dir");
+      const workerDir = path.join(sb.root, "worker-dir");
+      const recoverDir = path.join(sb.root, "recover-dir");
+      fs.mkdirSync(startDir, { recursive: true });
+      fs.mkdirSync(workerDir, { recursive: true });
+      fs.mkdirSync(recoverDir, { recursive: true });
+
+      const bareReportName = "missing-report.txt";
+      const expectedReportPath = path.join(workerDir, bareReportName);
+      const issue = "19";
+      const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
+
+      const crashRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          workerDir,
+          "--expected-lines",
+          "20",
+          "--report-file",
+          bareReportName,
+          "--crash-at",
+          "after_receipt",
+        ],
+        sb.env,
+        { cwd: startDir },
+      );
+      expect(crashRes.signal).toBe("SIGKILL");
+      waitForKernelLockRelease(sb.stateRoot);
+
+      expect(runFakeHcDirect(["wait", expectedName, "--timeout", "10", "--json"], sb.env).exitCode).toBe(0);
+      expect(fs.existsSync(expectedReportPath)).toBe(true);
+      fs.unlinkSync(expectedReportPath);
+
+      const recoverRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--read-lines",
+          "1000",
+        ],
+        sb.env,
+        { cwd: recoverDir },
+      );
+      expect(recoverRes.exitCode).toBe(3);
+      const payload = JSON.parse(recoverRes.stdout);
+      expect(payload.outcome).toBe("capture_unusable");
+      expect(payload.reason).toBe("report_file_missing");
+      expect(payload.terminalKept).toBe(true);
+    }
+
+    // 3. Report file on disk with another digest is still refused with report_file_digest_mismatch.
+    {
+      const sb = createSandbox("r18-digest-mismatch");
+      const startDir = path.join(sb.root, "start-dir");
+      const workerDir = path.join(sb.root, "worker-dir");
+      const recoverDir = path.join(sb.root, "recover-dir");
+      fs.mkdirSync(startDir, { recursive: true });
+      fs.mkdirSync(workerDir, { recursive: true });
+      fs.mkdirSync(recoverDir, { recursive: true });
+
+      const bareReportName = "tampered-report.txt";
+      const expectedReportPath = path.join(workerDir, bareReportName);
+      const issue = "20";
+      const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
+
+      const crashRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          workerDir,
+          "--expected-lines",
+          "20",
+          "--report-file",
+          bareReportName,
+          "--crash-at",
+          "after_receipt",
+        ],
+        sb.env,
+        { cwd: startDir },
+      );
+      expect(crashRes.signal).toBe("SIGKILL");
+      waitForKernelLockRelease(sb.stateRoot);
+
+      expect(runFakeHcDirect(["wait", expectedName, "--timeout", "10", "--json"], sb.env).exitCode).toBe(0);
+      expect(fs.existsSync(expectedReportPath)).toBe(true);
+      fs.writeFileSync(expectedReportPath, "tampered report body\n", "utf8");
+
+      const recoverRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--read-lines",
+          "1000",
+        ],
+        sb.env,
+        { cwd: recoverDir },
+      );
+      expect(recoverRes.exitCode).toBe(3);
+      const payload = JSON.parse(recoverRes.stdout);
+      expect(payload.outcome).toBe("capture_unusable");
+      expect(payload.reason).toBe("report_file_digest_mismatch");
+      expect(payload.terminalKept).toBe(true);
+    }
+
+    assertTripwireNeverRan();
+  });
+
+  test("r19a-timeout-during-startup: timeout during deliberately delayed startup settles uncertain with runCount 0 and no relaunch", async () => {
+    const sb = createSandbox("r19a-startup-timeout");
+    const issue = "21";
+    const startupGate = makeGateFifo(sb.workDir, "startup-gate.fifo");
+    const wrapperPidFile = path.join(sb.workDir, "startup-wrapper.pid");
+    const gatedWrapper = writeGatedStartupFakeHcWrapper(
+      sb.workDir,
+      "slow-start-hc",
+      startupGate,
+      wrapperPidFile,
+    );
+
+    const startRes = await runTracerProcess(
+      [
+        "start",
+        "--hc-bin",
+        gatedWrapper,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+        "--cwd",
+        sb.workDir,
+        "--hc-timeout-ms",
+        "150",
+      ],
+      sb.env,
+    );
+
+    expect(startRes.exitCode, "startup timeout must exit 1").toBe(1);
+    const payload = JSON.parse(startRes.stdout);
+    expect(payload.outcome, "startup timeout must settle uncertain").toBe("uncertain");
+    expect(payload.escalated).toBe(true);
+    expect(payload.reason).toBe("hc_timeout");
+
+    // Because timeout fired during wrapper startup before exec fake-hc.mjs, fake-hc never ran.
+    expect(
+      readFakeHcState(sb.fakeHcStateDir).runCount,
+      "startup timeout before fake-hc starts must leave runCount at 0",
+    ).toBe(0);
+    expect(readFakeHcCalls(sb.fakeHcStateDir).length).toBe(0);
+    expect(readFakeHcHangs(sb.fakeHcStateDir).length).toBe(0);
+
+    if (fs.existsSync(wrapperPidFile)) {
+      const wrapperPid = Number(fs.readFileSync(wrapperPidFile, "utf8").trim());
+      if (Number.isInteger(wrapperPid) && wrapperPid > 0) {
+        expect(
+          isProcessAliveNonZombie(wrapperPid),
+          "hung startup wrapper process must be dead after hc_timeout",
+        ).toBe(false);
+      }
+    }
+
+    const folded = foldCommitLog(getTicketDir(sb.stateRoot, issue));
+    expect(folded.status).toBe("ok");
+    expect(folded.phase).toBe("escalated");
+    expect(folded.openAttempt?.state).toBe("uncertain");
+    expect(folded.records.map((r) => r.event)).toEqual([
+      "brief_committed",
+      "launch_intent",
+      "reconcile_unresolved",
+    ]);
+
+    // Subsequent recover stays escalated and never launches again (runCount remains 0).
+    const recRes = await runTracerProcess(
+      [
+        "recover",
+        "--hc-bin",
+        FAKE_HC_PATH,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+      ],
+      sb.env,
+    );
+    expect(recRes.exitCode).toBe(0);
+    expect(JSON.parse(recRes.stdout).alreadyEscalated).toBe(true);
+    expect(
+      readFakeHcState(sb.fakeHcStateDir).runCount,
+      "recover after startup timeout must not relaunch (runCount remains 0)",
+    ).toBe(0);
+
+    assertTripwireNeverRan();
+  });
+
+  async function verifyRunTimeoutAfterHang({ label, makeHcBin }) {
+    const sb = createSandbox(label);
+    const issue = "22";
+    const hcBin = makeHcBin(sb);
+    const { timeoutMs, hangMs } = computeHangTimeoutBudget(hcBin, sb.env);
+
+    let startSettled = false;
+    const startPromise = runTracerProcess(
+      [
+        "start",
+        "--hc-bin",
+        hcBin,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+        "--cwd",
+        sb.workDir,
+        "--hc-timeout-ms",
+        String(timeoutMs),
+      ],
+      { ...sb.env, FAKE_HC_HANG_CMD: "run", FAKE_HC_HANG_MS: String(hangMs) },
+    ).then((res) => {
+      startSettled = true;
+      return res;
+    });
+
+    const hangEntered = await waitForHangEventOrDone(
+      sb.fakeHcStateDir,
+      (ev) => ev.phase === "entered" && ev.cmd === "run",
+      () => startSettled,
+      timeoutMs + 1000,
+    );
+    const startRes = await startPromise;
+
+    expect(hangEntered, "fake-hc must record hang entry for run before timeout").not.toBeNull();
+    expect(hangEntered.cmd).toBe("run");
+    expect(hangEntered.runCountAtEntry).toBe(1);
+    expect(Number.isInteger(hangEntered.pid) && hangEntered.pid > 0).toBe(true);
+    expect(hangEntered.startTime).not.toBeNull();
+
+    const hangs = readFakeHcHangs(sb.fakeHcStateDir);
+    const hangExited = hangs.find(
+      (ev) => ev.phase === "exited" && ev.cmd === "run" && ev.pid === hangEntered.pid,
+    );
+    expect(hangExited, "hung run fake-hc must be killed before hang exits").toBeUndefined();
+    expect(
+      isSameProcessAlive(hangEntered.pid, hangEntered.startTime),
+      "hung run fake-hc process must be dead after timeout",
+    ).toBe(false);
+
+    const calls = readFakeHcCalls(sb.fakeHcStateDir);
+    expect(
+      calls.some((c) => c.argv[0] === "run" && c.exitCode === -1),
+      "fake-hc must record run invocation before hanging",
+    ).toBe(true);
+
+    expect(startRes.exitCode, `${label} must exit 1`).toBe(1);
+    const payload = JSON.parse(startRes.stdout);
+    expect(payload.outcome, `${label} must settle uncertain`).toBe("uncertain");
+    expect(payload.escalated).toBe(true);
+    expect(payload.reason).toBe("hc_timeout");
+    expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
+
+    const folded = foldCommitLog(getTicketDir(sb.stateRoot, issue));
+    expect(folded.status).toBe("ok");
+    expect(folded.phase).toBe("escalated");
+    expect(folded.openAttempt?.state).toBe("uncertain");
+    expect(folded.records.map((r) => r.event)).toEqual([
+      "brief_committed",
+      "launch_intent",
+      "reconcile_unresolved",
+    ]);
+
+    // Subsequent recover stays escalated with the same launch count and zero relaunch.
+    const recRes = await runTracerProcess(
+      [
+        "recover",
+        "--hc-bin",
+        FAKE_HC_PATH,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+      ],
+      sb.env,
+    );
+    expect(recRes.exitCode).toBe(0);
+    expect(JSON.parse(recRes.stdout).alreadyEscalated).toBe(true);
+    expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
+  }
+
+  test("r19b-timeout-after-hang-entry: timeout after fake-hc records run and enters hang kills hung process and settles uncertain with runCount 1 through recovery", async () => {
+    await verifyRunTimeoutAfterHang({
+      label: "r19b-run-direct",
+      makeHcBin: () => FAKE_HC_PATH,
+    });
+    assertTripwireNeverRan();
+  });
+
+  test("r19c-timeout-after-hang-entry-delayed-start: run hang timeout still passes when fake-hc startup is delayed by 400 ms", async () => {
+    await verifyRunTimeoutAfterHang({
+      label: "r19c-run-delayed-400ms",
+      makeHcBin: (sb) => writeDelayedFakeHcWrapper(sb.workDir, "delayed-run-hc", "0.4"),
+    });
+    assertTripwireNeverRan();
+  });
+
+  test("r19d-ls-timeout-after-hang-entry-delayed-start: ls hang timeout proves hang entry and termination even when fake-hc startup is delayed by 400 ms", async () => {
+    const sb = createSandbox("r19d-ls-delayed-400ms");
+    const delayedLsBin = writeDelayedFakeHcWrapper(sb.workDir, "delayed-ls-hc", "0.4");
+    const { timeoutMs: lsTimeoutMs, hangMs: lsHangMs } = computeHangTimeoutBudget(delayedLsBin, sb.env);
+    const hangClient = createHcClient({
+      hcBin: delayedLsBin,
+      prefix: sb.prefix,
+      defaultTimeoutMs: lsTimeoutMs,
+      env: {
+        ...sb.env,
+        FAKE_HC_HANG_CMD: "ls",
+        FAKE_HC_HANG_MS: String(lsHangMs),
+      },
+    });
+
+    let lsSettled = false;
+    let timeoutErr = null;
+    const lsPromise = hangClient
+      .ls({ all: true, timeoutMs: lsTimeoutMs })
+      .catch((err) => {
+        timeoutErr = err;
+      })
+      .finally(() => {
+        lsSettled = true;
+      });
+
+    const hangEntered = await waitForHangEventOrDone(
+      sb.fakeHcStateDir,
+      (ev) => ev.phase === "entered" && ev.cmd === "ls",
+      () => lsSettled,
+      lsTimeoutMs + 1000,
+    );
+    await lsPromise;
+
+    expect(hangEntered, "delayed-start fake-hc must record hang entry for ls before timeout").not.toBeNull();
+    expect(timeoutErr, "delayed-start hung ls must throw HcBoundaryError").toBeInstanceOf(HcBoundaryError);
+    expect(timeoutErr.code).toBe("hc_timeout");
+    expect(timeoutErr.details.killed).toBe(true);
+    const hangExited = readFakeHcHangs(sb.fakeHcStateDir).find(
+      (ev) => ev.phase === "exited" && ev.cmd === "ls" && ev.pid === hangEntered.pid,
+    );
+    expect(hangExited, "delayed-start hung ls fake-hc must be killed before hang exits").toBeUndefined();
+    expect(isSameProcessAlive(hangEntered.pid, hangEntered.startTime)).toBe(false);
+    expect(
+      readFakeHcCalls(sb.fakeHcStateDir).some((c) => c.argv[0] === "ls" && c.exitCode === -1),
+    ).toBe(true);
 
     assertTripwireNeverRan();
   });
