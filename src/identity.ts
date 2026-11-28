@@ -13,6 +13,7 @@ export const IDENTITY_DECISIONS_DIR = "identity-decisions";
 const PROJECT_KEY_PATTERN = /^[0-9a-f]{16}$/;
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+const PROJECT_RECORD_TMP_PATTERN = /^\.project\.json\.tmp\.[1-9][0-9]*\.[0-9a-f]{12}$/;
 
 const PROJECT_RECORD_REQUIRED_KEYS = new Set([
   "schemaVersion",
@@ -231,6 +232,16 @@ function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
     }
   }
   return true;
+}
+
+function hasSharedString(a: readonly string[], b: readonly string[]): boolean {
+  const bSet = new Set(b);
+  for (const item of a) {
+    if (bSet.has(item)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isStrictlySortedUniqueCommitShas(value: unknown): value is string[] {
@@ -942,6 +953,7 @@ function assertDecisionMatchesLive(
   decision: IdentityDecision,
   decisionPath: string,
   live: LiveProjectIdentity,
+  applied = false,
 ): void {
   if (
     decision.newProjectKey !== live.projectKey ||
@@ -961,7 +973,11 @@ function assertDecisionMatchesLive(
       },
     );
   }
-  if (!sameStringArray(decision.rootCommitShas, live.rootCommitShas)) {
+  const rootsMatch = applied
+    ? decision.rootCommitShas.length === 0 ||
+      hasSharedString(decision.rootCommitShas, live.rootCommitShas)
+    : sameStringArray(decision.rootCommitShas, live.rootCommitShas);
+  if (!rootsMatch) {
     throw new IdentityError(
       "decision_mismatch",
       `Identity decision at ${decisionPath} has rootCommitShas that do not match live repository at ${live.canonicalCommonDir}`,
@@ -1508,6 +1524,61 @@ export function recordIdentityDecision(
   };
 }
 
+function isProjectRecordTempLeftover(dirPath: string, entryName: string): boolean {
+  if (!PROJECT_RECORD_TMP_PATTERN.test(entryName)) {
+    return false;
+  }
+  const stat = lstatOrNull(path.join(dirPath, entryName));
+  return stat !== null && stat.isFile();
+}
+
+function cleanInterruptedFirstOpenDir(
+  resolvedStateBase: string,
+  stateRoot: string,
+): boolean {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(stateRoot);
+  } catch (err) {
+    if (getErrnoCode(err) === "ENOENT") {
+      return true;
+    }
+    throw err;
+  }
+
+  for (const entryName of entries) {
+    if (!isProjectRecordTempLeftover(stateRoot, entryName)) {
+      return false;
+    }
+  }
+
+  for (const entryName of entries) {
+    try {
+      fs.unlinkSync(path.join(stateRoot, entryName));
+    } catch (err) {
+      if (getErrnoCode(err) !== "ENOENT") {
+        throw err;
+      }
+    }
+  }
+
+  try {
+    fs.rmdirSync(stateRoot);
+  } catch (err) {
+    const code = getErrnoCode(err);
+    if (code === "ENOENT") {
+      return true;
+    }
+    if (code === "ENOTEMPTY" || code === "EEXIST") {
+      return false;
+    }
+    throw err;
+  }
+
+  fsyncDir(resolvedStateBase);
+  return true;
+}
+
 function openProjectAttempt(
   io: IdentityFsOps,
   resolvedStateBase: string,
@@ -1523,19 +1594,21 @@ function openProjectAttempt(
       ? readIdentityDecisionFile(decisionPath, live.projectKey)
       : null;
 
-  if (decision !== null) {
-    assertDecisionMatchesLive(decision, decisionPath, live);
-  }
+  let destStat = lstatOrNull(newStateRoot);
+  const decisionOldStateRoot =
+    destStat !== null &&
+    decision !== null &&
+    decision.choice === "rebind" &&
+    decision.oldProjectKey !== null
+      ? path.join(resolvedStateBase, decision.oldProjectKey)
+      : null;
+  const oldStillExists = decisionOldStateRoot !== null && lstatOrNull(decisionOldStateRoot) !== null;
 
-  const destStat = lstatOrNull(newStateRoot);
   if (destStat !== null) {
-    const oldStateRoot =
-      decision !== null && decision.choice === "rebind" && decision.oldProjectKey !== null
-        ? path.join(resolvedStateBase, decision.oldProjectKey)
-        : null;
-    const oldStillExists = oldStateRoot !== null && lstatOrNull(oldStateRoot) !== null;
-
     if (!destStat.isDirectory()) {
+      if (decision !== null) {
+        assertDecisionMatchesLive(decision, decisionPath, live, false);
+      }
       if (oldStillExists) {
         throw new IdentityError(
           "rebind_destination_exists",
@@ -1550,6 +1623,9 @@ function openProjectAttempt(
     }
 
     if (lstatOrNull(newProjectJsonPath) === null) {
+      if (decision !== null) {
+        assertDecisionMatchesLive(decision, decisionPath, live, false);
+      }
       if (oldStillExists) {
         throw new IdentityError(
           "rebind_destination_exists",
@@ -1557,16 +1633,39 @@ function openProjectAttempt(
           { details: { projectKey: live.projectKey, stateRoot: newStateRoot } },
         );
       }
-      throw new IdentityError(
-        "invalid_project_record",
-        `Project folder exists without ${PROJECT_RECORD_FILENAME}: ${newStateRoot}`,
-      );
+      if (
+        (decision === null || decision.choice === "new_project") &&
+        cleanInterruptedFirstOpenDir(resolvedStateBase, newStateRoot)
+      ) {
+        destStat = null;
+      } else {
+        if (canRetryLostRebindRace && lstatOrNull(newProjectJsonPath) !== null) {
+          return openProjectAttempt(io, resolvedStateBase, live, false);
+        }
+        throw new IdentityError(
+          "invalid_project_record",
+          `Project folder exists without ${PROJECT_RECORD_FILENAME}: ${newStateRoot}`,
+        );
+      }
     }
+  }
 
-    const stored = readProjectRecordFile(newProjectJsonPath);
+  if (destStat !== null) {
+    let stored: ProjectRecord;
+    try {
+      stored = readProjectRecordFile(newProjectJsonPath);
+    } catch (err) {
+      if (decision !== null) {
+        assertDecisionMatchesLive(decision, decisionPath, live, false);
+      }
+      throw err;
+    }
 
     if (stored.canonicalCommonDir === live.canonicalCommonDir) {
       if (stored.commonDirSha256 !== live.commonDirSha256) {
+        if (decision !== null) {
+          assertDecisionMatchesLive(decision, decisionPath, live, false);
+        }
         throw new IdentityError(
           "identity_mismatch",
           `Stored commonDirSha256 does not match live identity for ${live.projectKey}`,
@@ -1580,19 +1679,23 @@ function openProjectAttempt(
         );
       }
 
-      if (decision !== null && decision.choice === "rebind") {
-        const rebindCompleted =
-          decision.oldProjectKey !== null &&
-          stored.reboundFrom !== undefined &&
-          stored.reboundFrom.includes(decision.oldProjectKey) &&
-          sameStringArray(stored.rootCommitShas, decision.rootCommitShas);
-        if (!rebindCompleted) {
-          throw new IdentityError(
-            "rebind_destination_exists",
-            `Destination ${live.projectKey} already exists and was not rebound from ${String(decision.oldProjectKey)}`,
-            { details: { oldProjectKey: decision.oldProjectKey, newProjectKey: live.projectKey } },
-          );
+      if (decision !== null) {
+        if (decision.choice === "rebind") {
+          const rebindCompleted =
+            decision.oldProjectKey !== null &&
+            stored.reboundFrom !== undefined &&
+            stored.reboundFrom.includes(decision.oldProjectKey) &&
+            sameStringArray(stored.rootCommitShas, decision.rootCommitShas);
+          if (!rebindCompleted) {
+            assertDecisionMatchesLive(decision, decisionPath, live, false);
+            throw new IdentityError(
+              "rebind_destination_exists",
+              `Destination ${live.projectKey} already exists and was not rebound from ${String(decision.oldProjectKey)}`,
+              { details: { oldProjectKey: decision.oldProjectKey, newProjectKey: live.projectKey } },
+            );
+          }
         }
+        assertDecisionMatchesLive(decision, decisionPath, live, true);
       }
 
       return {
@@ -1604,6 +1707,10 @@ function openProjectAttempt(
         rebound: false,
         appliedDecisionId: null,
       };
+    }
+
+    if (decision !== null) {
+      assertDecisionMatchesLive(decision, decisionPath, live, false);
     }
 
     if (decision !== null && decision.choice === "rebind") {
@@ -1640,6 +1747,10 @@ function openProjectAttempt(
         },
       },
     );
+  }
+
+  if (decision !== null) {
+    assertDecisionMatchesLive(decision, decisionPath, live, false);
   }
 
   if (decision === null) {

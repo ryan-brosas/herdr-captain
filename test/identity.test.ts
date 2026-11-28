@@ -3265,6 +3265,572 @@ describe("project identity (S1b)", () => {
       "recordIdentityDecision(rebind) must read input.oldProjectKey once",
     );
   });
+
+  function createFirstCommit(repoDir: string, content: string): string {
+    fs.writeFileSync(path.join(repoDir, "README.md"), content, "utf8");
+    runGit(["add", "README.md"], repoDir);
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repoDir,
+        "-c",
+        "user.name=Test Author",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "first commit",
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: cleanGitEnv() },
+    );
+    return runGit(["rev-parse", "HEAD"], repoDir);
+  }
+
+  async function interruptFirstOpenWithSigkill(
+    repoDir: string,
+    stateBase: string,
+    expectedStateRoot: string,
+    leaveTempFile: boolean,
+  ): Promise<{ readonly tmpName: string | null }> {
+    const childScript = `
+      import fs from "node:fs";
+      import path from "node:path";
+      import { openProject } from ${JSON.stringify(IDENTITY_MODULE_URL)};
+
+      const [cwd, stateBase, expectedRoot, leaveTmpFlag] = process.argv.slice(1);
+      const leaveTmp = leaveTmpFlag === "1";
+
+      openProject(cwd, stateBase, {
+        fs: {
+          openSync(targetPath, flags, mode) {
+            const target = String(targetPath);
+            if (
+              path.dirname(target) === expectedRoot &&
+              path.basename(target).startsWith(".project.json.tmp.")
+            ) {
+              let tmpName = null;
+              if (leaveTmp) {
+                const fd = fs.openSync(targetPath, flags, mode);
+                fs.writeSync(fd, '{"schemaVersion":1');
+                tmpName = path.basename(target);
+              }
+              fs.writeSync(
+                1,
+                JSON.stringify({ event: "paused_first_open", pid: process.pid, tmpName }) + "\\n",
+              );
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+            }
+            return fs.openSync(targetPath, flags, mode);
+          },
+        },
+      });
+    `;
+
+    const child = spawn(
+      process.execPath,
+      ["-e", childScript, repoDir, stateBase, expectedStateRoot, leaveTempFile ? "1" : "0"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    assert.ok(child.pid !== undefined, "first-open crash child did not report a pid");
+    const childProc = trackProcess(child.pid);
+
+    const childExited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => {
+        child.once("exit", (code, signal) => resolve({ code, signal }));
+      },
+    );
+
+    try {
+      let stderrBuf = "";
+      const pausedEvent = await new Promise<{
+        event: string;
+        pid: number;
+        tmpName: string | null;
+      }>((resolve, reject) => {
+        let stdoutBuf = "";
+        const timer = setTimeout(() => {
+          reject(new Error(`Timed out waiting for first-open pause event (stderr=${stderrBuf})`));
+        }, 5000);
+        child.stderr.on("data", (chunk: Buffer) => {
+          stderrBuf += chunk.toString("utf8");
+        });
+        child.stdout.on("data", (chunk: Buffer) => {
+          stdoutBuf += chunk.toString("utf8");
+          const nl = stdoutBuf.indexOf("\n");
+          if (nl !== -1) {
+            clearTimeout(timer);
+            resolve(
+              JSON.parse(stdoutBuf.slice(0, nl)) as {
+                event: string;
+                pid: number;
+                tmpName: string | null;
+              },
+            );
+          }
+        });
+        child.once("exit", (code, signal) => {
+          clearTimeout(timer);
+          reject(
+            new Error(
+              `Child exited before pausing on first open (code=${code}, signal=${signal}, stderr=${stderrBuf})`,
+            ),
+          );
+        });
+      });
+
+      assert.strictEqual(pausedEvent.event, "paused_first_open");
+      process.kill(child.pid, "SIGKILL");
+      const exitInfo = await childExited;
+      assert.strictEqual(exitInfo.signal, "SIGKILL");
+      await ensureProcessDead(childProc);
+      return { tmpName: pausedEvent.tmpName };
+    } finally {
+      await ensureProcessDead(childProc);
+    }
+  }
+
+  function openProjectInFreshProcess(repoDir: string, stateBase: string): OpenProjectResult {
+    const script = `
+      import { openProject } from ${JSON.stringify(IDENTITY_MODULE_URL)};
+      const [cwd, stateBase] = process.argv.slice(1);
+      const res = openProject(cwd, stateBase);
+      process.stdout.write(JSON.stringify(res));
+    `;
+    const run = spawnSync(process.execPath, ["-e", script, repoDir, stateBase], {
+      encoding: "utf8",
+    });
+    assert.strictEqual(
+      run.status,
+      0,
+      `fresh process openProject failed (status=${String(run.status)}): ${run.stderr}`,
+    );
+    return JSON.parse(run.stdout) as OpenProjectResult;
+  }
+
+  test("fix-4 R13a: applied rebind of commitless repo opens after first commit", () => {
+    const scratch = createScratchDir("fix4-r13a");
+    const stateBase = path.join(scratch, "state");
+    const locA = path.join(scratch, "repo-a");
+    const locB = path.join(scratch, "repo-b");
+
+    fs.mkdirSync(locA, { recursive: true });
+    runGit(["init", "-b", "main"], locA);
+
+    const openA = openProject(locA, stateBase);
+    assert.strictEqual(openA.created, true);
+    assert.deepStrictEqual(openA.record.rootCommitShas, []);
+    seedStateFiles(openA.stateRoot);
+
+    fs.renameSync(locA, locB);
+    const dec = recordIdentityDecision({
+      cwd: locB,
+      stateBase,
+      choice: "rebind",
+      oldProjectKey: openA.projectKey,
+      decidedBy: "user-r13a",
+    });
+    assert.deepStrictEqual(dec.decision.rootCommitShas, []);
+
+    const openB1 = openProject(locB, stateBase);
+    assert.strictEqual(openB1.rebound, true);
+    assert.strictEqual(openB1.appliedDecisionId, dec.decision.decisionId);
+    assert.deepStrictEqual(openB1.record.rootCommitShas, []);
+    const seededBeforeCommit = snapshotTree(openB1.stateRoot);
+
+    const firstSha = createFirstCommit(locB, "first commit after rebind\n");
+    assert.deepStrictEqual(resolveProjectIdentity(locB).rootCommitShas, [firstSha]);
+
+    const openB2 = openProject(locB, stateBase);
+    assert.strictEqual(openB2.projectKey, openB1.projectKey);
+    assert.strictEqual(openB2.stateRoot, openB1.stateRoot);
+    assert.strictEqual(openB2.created, false);
+    assert.strictEqual(openB2.rebound, false);
+    assert.strictEqual(openB2.appliedDecisionId, null);
+    assert.deepStrictEqual(snapshotTree(openB2.stateRoot), seededBeforeCommit);
+  });
+
+  test("fix-4 R13b: applied decision opens after adding an orphan branch with unrelated history", () => {
+    const scratch = createScratchDir("fix4-r13b");
+
+    // Subcase 1: applied rebind decision followed by an unrelated-history orphan branch.
+    const stateRebind = path.join(scratch, "state-rebind");
+    const rebA = path.join(scratch, "reb-a");
+    const rebB = path.join(scratch, "reb-b");
+    const origRoot = initRepoWithCommit(rebA, {
+      content: "r13b rebind root\n",
+      commitDate: "2026-01-01T00:00:00Z",
+    });
+    const openRebA = openProject(rebA, stateRebind);
+    seedStateFiles(openRebA.stateRoot);
+
+    fs.renameSync(rebA, rebB);
+    const decReb = recordIdentityDecision({
+      cwd: rebB,
+      stateBase: stateRebind,
+      choice: "rebind",
+      oldProjectKey: openRebA.projectKey,
+      decidedBy: "user-r13b-rebind",
+    });
+    const openRebB1 = openProject(rebB, stateRebind);
+    assert.strictEqual(openRebB1.rebound, true);
+    assert.strictEqual(openRebB1.appliedDecisionId, decReb.decision.decisionId);
+    const beforeOrphanRebind = snapshotTree(openRebB1.stateRoot);
+
+    const orphanRoot = addOrphanRootCommit(rebB, "unrelated", "orphan branch\n", "2026-01-02T00:00:00Z");
+    assert.deepStrictEqual(
+      resolveProjectIdentity(rebB).rootCommitShas,
+      [origRoot, orphanRoot].sort(),
+    );
+
+    const openRebB2 = openProject(rebB, stateRebind);
+    assert.strictEqual(openRebB2.projectKey, openRebB1.projectKey);
+    assert.strictEqual(openRebB2.created, false);
+    assert.strictEqual(openRebB2.rebound, false);
+    assert.strictEqual(openRebB2.appliedDecisionId, null);
+    assert.deepStrictEqual(snapshotTree(openRebB2.stateRoot), beforeOrphanRebind);
+
+    // Subcase 2: applied new_project decision followed by an unrelated-history orphan branch.
+    const stateNew = path.join(scratch, "state-new");
+    const npA = path.join(scratch, "np-a");
+    const npB = path.join(scratch, "np-b");
+    const npOrigRoot = initRepoWithCommit(npA, {
+      content: "r13b new_project root\n",
+      commitDate: "2026-01-03T00:00:00Z",
+    });
+    openProject(npA, stateNew);
+
+    fs.renameSync(npA, npB);
+    const decNp = recordIdentityDecision({
+      cwd: npB,
+      stateBase: stateNew,
+      choice: "new_project",
+      decidedBy: "user-r13b-new",
+    });
+    const openNpB1 = openProject(npB, stateNew);
+    assert.strictEqual(openNpB1.created, true);
+    assert.strictEqual(openNpB1.appliedDecisionId, decNp.decision.decisionId);
+    seedStateFiles(openNpB1.stateRoot);
+    const beforeOrphanNew = snapshotTree(openNpB1.stateRoot);
+
+    const npOrphanRoot = addOrphanRootCommit(
+      npB,
+      "side-history",
+      "orphan on new_project\n",
+      "2026-01-04T00:00:00Z",
+    );
+    assert.deepStrictEqual(
+      resolveProjectIdentity(npB).rootCommitShas,
+      [npOrigRoot, npOrphanRoot].sort(),
+    );
+
+    const openNpB2 = openProject(npB, stateNew);
+    assert.strictEqual(openNpB2.projectKey, openNpB1.projectKey);
+    assert.strictEqual(openNpB2.created, false);
+    assert.strictEqual(openNpB2.rebound, false);
+    assert.strictEqual(openNpB2.appliedDecisionId, null);
+    assert.deepStrictEqual(snapshotTree(openNpB2.stateRoot), beforeOrphanNew);
+  });
+
+  test("fix-4 R13c: applied new_project decision of commitless repo opens after first commit", () => {
+    const scratch = createScratchDir("fix4-r13c");
+    const stateBase = path.join(scratch, "state");
+    const locA = path.join(scratch, "empty-a");
+    const locB = path.join(scratch, "empty-b");
+
+    fs.mkdirSync(locA, { recursive: true });
+    runGit(["init", "-b", "main"], locA);
+    openProject(locA, stateBase);
+
+    fs.renameSync(locA, locB);
+    const dec = recordIdentityDecision({
+      cwd: locB,
+      stateBase,
+      choice: "new_project",
+      decidedBy: "user-r13c",
+    });
+    assert.deepStrictEqual(dec.decision.rootCommitShas, []);
+
+    const openB1 = openProject(locB, stateBase);
+    assert.strictEqual(openB1.created, true);
+    assert.strictEqual(openB1.appliedDecisionId, dec.decision.decisionId);
+    assert.deepStrictEqual(openB1.record.rootCommitShas, []);
+    seedStateFiles(openB1.stateRoot);
+    const beforeCommit = snapshotTree(openB1.stateRoot);
+
+    const firstSha = createFirstCommit(locB, "first commit after new_project\n");
+    assert.deepStrictEqual(resolveProjectIdentity(locB).rootCommitShas, [firstSha]);
+
+    const openB2 = openProject(locB, stateBase);
+    assert.strictEqual(openB2.projectKey, openB1.projectKey);
+    assert.strictEqual(openB2.created, false);
+    assert.strictEqual(openB2.rebound, false);
+    assert.strictEqual(openB2.appliedDecisionId, null);
+    assert.deepStrictEqual(snapshotTree(openB2.stateRoot), beforeCommit);
+  });
+
+  test("fix-4 R13e: interrupted rebind with an added root commit refuses with decision_mismatch and leaves state unchanged", async () => {
+    const scratch = createScratchDir("fix4-r13e");
+    const stateBase = path.join(scratch, "state");
+    const locA = path.join(scratch, "int-a");
+    const locB = path.join(scratch, "int-b");
+
+    const origRoot = initRepoWithCommit(locA, {
+      content: "r13e root one\n",
+      commitDate: "2026-01-05T00:00:00Z",
+    });
+    const openA = openProject(locA, stateBase);
+    seedStateFiles(openA.stateRoot);
+
+    fs.renameSync(locA, locB);
+    const liveB = resolveProjectIdentity(locB);
+    const stateRootB = path.join(stateBase, liveB.projectKey);
+    const dec = recordIdentityDecision({
+      cwd: locB,
+      stateBase,
+      choice: "rebind",
+      oldProjectKey: openA.projectKey,
+      decidedBy: "user-r13e",
+    });
+
+    await interruptRebindWithSigkill(
+      locB,
+      stateBase,
+      openA.stateRoot,
+      stateRootB,
+      openA.record.canonicalCommonDir,
+    );
+
+    const extraRoot = addOrphanRootCommit(
+      locB,
+      "extra-root",
+      "added root during interrupted rebind\n",
+      "2026-01-06T00:00:00Z",
+    );
+    assert.deepStrictEqual(
+      resolveProjectIdentity(locB).rootCommitShas,
+      [origRoot, extraRoot].sort(),
+    );
+
+    const beforeTree = snapshotTree(stateBase);
+    const err = expectIdentityError(
+      () => openProject(locB, stateBase),
+      "decision_mismatch",
+      "interrupted rebind with one extra root commit must still refuse with decision_mismatch",
+    );
+    assert.ok(err.message.includes(dec.decisionPath));
+    assert.match(err.message, /root/i);
+    assert.strictEqual(err.details?.decisionPath, dec.decisionPath);
+    assert.deepStrictEqual(
+      snapshotTree(stateBase),
+      beforeTree,
+      "refused interrupted rebind must leave state tree unchanged",
+    );
+  });
+
+  test("fix-4 R14a: first open recovers after ENOSPC leaves an empty project folder", () => {
+    const scratch = createScratchDir("fix4-r14a");
+    const stateBase = path.join(scratch, "state");
+    const repoDir = path.join(scratch, "repo");
+    initRepoWithCommit(repoDir, { content: "r14a enospc\n" });
+
+    const live = resolveProjectIdentity(repoDir);
+    const expectedRoot = path.join(stateBase, live.projectKey);
+
+    let threwEnospc = false;
+    try {
+      openProject(repoDir, stateBase, {
+        fs: {
+          openSync(targetPath, flags, mode) {
+            const target = String(targetPath);
+            if (
+              path.dirname(target) === expectedRoot &&
+              path.basename(target).startsWith(".project.json.tmp.")
+            ) {
+              const err = new Error("ENOSPC: no space left on device") as NodeJS.ErrnoException;
+              err.code = "ENOSPC";
+              throw err;
+            }
+            return fs.openSync(targetPath, flags, mode);
+          },
+        },
+      });
+    } catch (err) {
+      assert.strictEqual((err as NodeJS.ErrnoException).code, "ENOSPC");
+      threwEnospc = true;
+    }
+    assert.strictEqual(threwEnospc, true, "first open must propagate ENOSPC");
+    assert.strictEqual(fs.existsSync(expectedRoot), true);
+    assert.deepStrictEqual(fs.readdirSync(expectedRoot), []);
+
+    const recovered = openProject(repoDir, stateBase);
+    assert.strictEqual(recovered.created, true);
+    assert.strictEqual(recovered.rebound, false);
+    assert.strictEqual(recovered.appliedDecisionId, null);
+    assert.strictEqual(recovered.projectKey, live.projectKey);
+    assert.deepStrictEqual(fs.readdirSync(expectedRoot), [PROJECT_RECORD_FILENAME]);
+
+    const repeat = openProject(repoDir, stateBase);
+    assert.strictEqual(repeat.created, false);
+    assert.strictEqual(repeat.projectKey, live.projectKey);
+  });
+
+  test("fix-4 R14b: first open recovers after SIGKILL leaves an empty project folder", async () => {
+    const scratch = createScratchDir("fix4-r14b");
+    const stateBase = path.join(scratch, "state");
+    const repoDir = path.join(scratch, "repo");
+    initRepoWithCommit(repoDir, { content: "r14b sigkill empty\n" });
+
+    const live = resolveProjectIdentity(repoDir);
+    const expectedRoot = path.join(stateBase, live.projectKey);
+
+    const killed = await interruptFirstOpenWithSigkill(repoDir, stateBase, expectedRoot, false);
+    assert.strictEqual(killed.tmpName, null);
+    assert.strictEqual(fs.existsSync(expectedRoot), true);
+    assert.deepStrictEqual(fs.readdirSync(expectedRoot), []);
+
+    const recovered = openProjectInFreshProcess(repoDir, stateBase);
+    assert.strictEqual(recovered.created, true);
+    assert.strictEqual(recovered.rebound, false);
+    assert.strictEqual(recovered.appliedDecisionId, null);
+    assert.strictEqual(recovered.projectKey, live.projectKey);
+    assert.deepStrictEqual(fs.readdirSync(expectedRoot), [PROJECT_RECORD_FILENAME]);
+  });
+
+  test("fix-4 R14c: first open recovers after SIGKILL leaves a record-write temp file in the project folder", async () => {
+    const scratch = createScratchDir("fix4-r14c");
+    const stateBase = path.join(scratch, "state");
+    const repoDir = path.join(scratch, "repo");
+    initRepoWithCommit(repoDir, { content: "r14c sigkill temp file\n" });
+
+    const live = resolveProjectIdentity(repoDir);
+    const expectedRoot = path.join(stateBase, live.projectKey);
+
+    const killed = await interruptFirstOpenWithSigkill(repoDir, stateBase, expectedRoot, true);
+    assert.ok(killed.tmpName !== null, "child must have created the record-write temp file");
+    assert.match(killed.tmpName, /^\.project\.json\.tmp\.[1-9][0-9]*\.[0-9a-f]{12}$/);
+    assert.deepStrictEqual(fs.readdirSync(expectedRoot), [killed.tmpName]);
+
+    const recovered = openProjectInFreshProcess(repoDir, stateBase);
+    assert.strictEqual(recovered.created, true);
+    assert.strictEqual(recovered.rebound, false);
+    assert.strictEqual(recovered.appliedDecisionId, null);
+    assert.strictEqual(recovered.projectKey, live.projectKey);
+    assert.deepStrictEqual(
+      fs.readdirSync(expectedRoot),
+      [PROJECT_RECORD_FILENAME],
+      "recovery must remove the leftover temp file and publish project.json",
+    );
+  });
+
+  test("fix-4 R14d: project folder with a foreign file and no project.json refuses with invalid_project_record and leaves state unchanged", () => {
+    const scratch = createScratchDir("fix4-r14d");
+
+    // Subcase 1: single plain foreign file.
+    const state1 = path.join(scratch, "state-1");
+    const repo1 = path.join(scratch, "repo-1");
+    initRepoWithCommit(repo1, { content: "r14d plain foreign\n" });
+    const root1 = path.join(state1, resolveProjectIdentity(repo1).projectKey);
+    fs.mkdirSync(root1, { recursive: true });
+    fs.writeFileSync(path.join(root1, "foreign.txt"), "keep me\n", "utf8");
+    const before1 = snapshotTree(state1);
+    expectIdentityError(
+      () => openProject(repo1, state1),
+      "invalid_project_record",
+      "folder with a foreign file and no project.json must refuse with invalid_project_record",
+    );
+    assert.deepStrictEqual(snapshotTree(state1), before1);
+
+    // Subcase 2: loose-pattern impostor temp name (not matching exact pid + 12-hex write format).
+    const state2 = path.join(scratch, "state-2");
+    const repo2 = path.join(scratch, "repo-2");
+    initRepoWithCommit(repo2, { content: "r14d impostor\n" });
+    const root2 = path.join(state2, resolveProjectIdentity(repo2).projectKey);
+    fs.mkdirSync(root2, { recursive: true });
+    fs.writeFileSync(path.join(root2, ".project.json.tmp.notapid.short"), "impostor\n", "utf8");
+    const before2 = snapshotTree(state2);
+    expectIdentityError(
+      () => openProject(repo2, state2),
+      "invalid_project_record",
+      "loose temp filename must be refused as foreign, not removed",
+    );
+    assert.deepStrictEqual(snapshotTree(state2), before2);
+
+    // Subcase 3: valid temp leftover alongside a foreign file — neither may be removed.
+    const state3 = path.join(scratch, "state-3");
+    const repo3 = path.join(scratch, "repo-3");
+    initRepoWithCommit(repo3, { content: "r14d mixed\n" });
+    const root3 = path.join(state3, resolveProjectIdentity(repo3).projectKey);
+    fs.mkdirSync(root3, { recursive: true });
+    fs.writeFileSync(path.join(root3, ".project.json.tmp.99999.0123456789ab"), "tmp\n", "utf8");
+    fs.writeFileSync(path.join(root3, "notes.txt"), "foreign\n", "utf8");
+    const before3 = snapshotTree(state3);
+    expectIdentityError(
+      () => openProject(repo3, state3),
+      "invalid_project_record",
+      "folder mixing a temp leftover with a foreign file must refuse without deleting either file",
+    );
+    assert.deepStrictEqual(snapshotTree(state3), before3);
+
+    // Subcase 4: subdirectory with a matching temp name (not a regular file).
+    const state4 = path.join(scratch, "state-4");
+    const repo4 = path.join(scratch, "repo-4");
+    initRepoWithCommit(repo4, { content: "r14d subdir\n" });
+    const root4 = path.join(state4, resolveProjectIdentity(repo4).projectKey);
+    fs.mkdirSync(path.join(root4, ".project.json.tmp.99999.0123456789ab"), { recursive: true });
+    const before4 = snapshotTree(state4);
+    expectIdentityError(
+      () => openProject(repo4, state4),
+      "invalid_project_record",
+      "subdirectory matching temp name must refuse as foreign without removal",
+    );
+    assert.deepStrictEqual(snapshotTree(state4), before4);
+  });
+
+  test("fix-4 R14e: empty leftover folder at new key with relocation candidate refuses with identity_relocated", () => {
+    const scratch = createScratchDir("fix4-r14e");
+    const stateBase = path.join(scratch, "state");
+    const locA = path.join(scratch, "reloc-a");
+    const locB = path.join(scratch, "reloc-b");
+
+    initRepoWithCommit(locA, { content: "r14e relocation candidate\n" });
+    const openA = openProject(locA, stateBase);
+    seedStateFiles(openA.stateRoot);
+    const beforeOldTree = snapshotTree(openA.stateRoot);
+
+    fs.renameSync(locA, locB);
+    const liveB = resolveProjectIdentity(locB);
+    const stateRootB = path.join(stateBase, liveB.projectKey);
+    fs.mkdirSync(stateRootB, { recursive: true });
+
+    const err = expectIdentityError(
+      () => openProject(locB, stateBase),
+      "identity_relocated",
+      "empty leftover folder at new key must be cleared and refuse with identity_relocated when a candidate exists",
+    );
+    assert.ok(
+      err.candidates?.some((candidate) => candidate.projectKey === openA.projectKey),
+      "identity_relocated must list the moved project candidate",
+    );
+    assert.strictEqual(
+      fs.existsSync(stateRootB),
+      false,
+      "empty leftover folder must be removed so the user can record a decision",
+    );
+    assert.deepStrictEqual(snapshotTree(openA.stateRoot), beforeOldTree);
+
+    // Confirm normal decision recording and rebind now succeed cleanly.
+    const dec = recordIdentityDecision({
+      cwd: locB,
+      stateBase,
+      choice: "rebind",
+      oldProjectKey: openA.projectKey,
+      decidedBy: "user-r14e",
+    });
+    const reopened = openProject(locB, stateBase);
+    assert.strictEqual(reopened.rebound, true);
+    assert.strictEqual(reopened.appliedDecisionId, dec.decision.decisionId);
+  });
 });
 
 // ---------------------------------------------------------------------------
