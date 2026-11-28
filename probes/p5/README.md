@@ -22,9 +22,9 @@ Run the negative controls (each runs a mutated scratch copy and checks that the 
 bun probes/p5/negative-controls.mjs
 ```
 
-## Command shapes for a later live run
+## Command shapes for a live run
 
-A later ticket runs this tracer against a real `hc` binary. Pass an explicit `hc` path that contains `/`. The tracer refuses to start without one and never searches `PATH`.
+The live run on 2026-11-28 against real `hc` `0.1.22` is recorded in [docs/probes/p5.md](../../docs/probes/p5.md). Pass an explicit `hc` path that contains `/`. The tracer refuses to start without one and never searches `PATH`.
 
 `--state-root` must name the same folder in every call. A relative value is read against each controller's own working folder.
 
