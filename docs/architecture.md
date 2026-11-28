@@ -103,7 +103,7 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/herdr-captain/<projectKey>/
    3. Acquire the owner lease for `projectKey` (section 5). The lease creates the project directory and writes its own files (`owner.lock`, `owner.json`).
    4. Inside the lease queue, read the repository again. If the key is no longer the acquired key, refuse with `identity_mismatch`. If no root commit is found because commits vanished after step 1, refuse with `identity_unborn`; only the lease's files were written.
    5. If the directory holds no `project.json`, run the relocation scan (item 6) and publish `project.json` as below. Otherwise verify the existing record (item 5).
-   6. Every refusal after step 3 releases the lease before returning the error, except `lease_revoked`, which has no lease left to release.
+   6. Every refusal after step 3 releases the lease before returning the error. A claim that fails with `lease_revoked` releases nothing itself. Either the lock holder has died and the lock is already free, or a controlled revocation is under way and frees the lock when it resolves (section 5, rule (d)).
    7. As the last step of every claim, run one more lease check (section 5, rule (c)) after the publication or verification. If the lease is no longer valid, the claim fails with `lease_revoked`, whatever it published or verified. No claim returns an open project before this check.
 
    A directory holding only the lease's files is a first publication, at this claim or any later one. A second process claiming the same project gets `owner_conflict` and writes nothing. A second claim inside one process follows section 5 rule (e): it revokes and drains the first lease, acquires the second at the next epoch, and runs step 4.
