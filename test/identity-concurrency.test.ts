@@ -92,14 +92,35 @@ describe("project identity concurrency, handoff, crashes, and fencing (proofs 1-
       assert.equal(winner.event.published, true, "Winner must publish project.json");
       assert.equal(loser.event.code, "owner_conflict", "Loser must fail with owner_conflict");
 
-      // Only one project.json exists and holds the winner's bytes.
+      // Only one project.json exists and holds the winner's exact written bytes.
       const entries = fs.readdirSync(stateRoot);
       assert.deepEqual(
         entries.filter((name) => name === PROJECT_RECORD_FILENAME),
         [PROJECT_RECORD_FILENAME],
       );
       const winnerRecordBytes = snapshotRawFile(projectPath);
-      assert.deepEqual(JSON.parse(winnerRecordBytes.bytes.toString("utf8")), winner.event.record);
+      assert.equal(
+        typeof winner.event.writtenBytesBase64,
+        "string",
+        "Winner must report the exact bytes it wrote",
+      );
+      const winnerWrittenBytes = Buffer.from(String(winner.event.writtenBytesBase64), "base64");
+      assert.equal(winnerWrittenBytes.length > 0, true, "Winner must write non-empty bytes");
+      assert.equal(
+        Buffer.compare(winnerRecordBytes.bytes, winnerWrittenBytes),
+        0,
+        "project.json on disk must match the winner's exact written bytes buffer for buffer",
+      );
+      assert.equal(
+        winnerRecordBytes.bytes.equals(winnerWrittenBytes),
+        true,
+        "project.json buffer must equal the winner's written buffer",
+      );
+      assert.equal(
+        loser.event.writtenBytesBase64,
+        null,
+        "Conflicting loser must write no project.json payload bytes",
+      );
 
       // Verify a conflicting claim writes nothing while the winner holds the lease.
       const beforeConflictDir = snapshotDirFiles(stateRoot);
@@ -138,6 +159,7 @@ describe("project identity concurrency, handoff, crashes, and fencing (proofs 1-
       const loserSecond = await loser.worker.nextEvent();
       assert.equal(loserSecond.event, "claimed");
       assert.equal(loserSecond.published, false, "Loser later claim must verify, not publish");
+      assert.equal(loserSecond.writtenBytesBase64, null, "Loser later claim must write nothing");
       assert.deepEqual(loserSecond.record, winner.event.record);
       assertRawFileUnchanged(projectPath, winnerRecordBytes, "winner project.json bytes");
 
@@ -405,15 +427,18 @@ describe("project identity concurrency, handoff, crashes, and fencing (proofs 1-
       assert.equal(claimed2.published, true);
       const owner2Bytes = snapshotRawFile(projectPath);
 
-      // Resume first owner: its link fails with EEXIST, claim fails with lease_revoked, record unchanged.
+      // Resume first owner: its link fails with EEXIST, temporary is not removed, claim fails with lease_revoked, record unchanged.
+      const owner1TmpPath = String(paused1.tmpPath);
       owner1.resumePause("go");
       const failed1 = await owner1.nextEvent();
       const exit1 = await owner1.exited;
       assert.equal(failed1.event, "claim_failed");
       assert.equal(failed1.linkErrno, "EEXIST", "First owner linkSync must fail with EEXIST");
       assert.equal(failed1.linkSucceeded, false);
+      assert.equal(failed1.unlinksAfterPause, 0, "First owner must not remove temporary after holder death");
       assert.equal(failed1.code, "lease_revoked", "First owner must fail with lease_revoked");
       assert.equal(exit1.code, 0);
+      assert.equal(fs.existsSync(owner1TmpPath), true, "First owner temporary must remain on disk");
       assertRawFileUnchanged(projectPath, owner2Bytes, "Second owner project.json must be unchanged");
 
       owner2.sendCommand("release");
@@ -448,6 +473,9 @@ describe("project identity concurrency, handoff, crashes, and fencing (proofs 1-
       const paused1 = await owner1.nextEvent();
       assert.equal(paused1.event, "paused");
       assert.equal(paused1.point, "before-link");
+      const owner1TmpPath = String(paused1.tmpPath);
+      assert.equal(fs.existsSync(owner1TmpPath), true, "First owner temporary must exist before link");
+      const owner1TmpBefore = snapshotRawFile(owner1TmpPath);
       await ctx.killHolderAndWaitDead(Number(paused1.holderPid), String(paused1.holderStartTime));
 
       // Second owner acquires the lease and pauses before its own link so both stand at the barrier.
@@ -466,6 +494,8 @@ describe("project identity concurrency, handoff, crashes, and fencing (proofs 1-
       const paused2 = await owner2.nextEvent();
       assert.equal(paused2.event, "paused");
       assert.equal(paused2.point, "before-link");
+      const owner2TmpPath = String(paused2.tmpPath);
+      assert.equal(fs.existsSync(owner2TmpPath), true, "Second owner temporary must exist before link");
       const barrierRecord = [
         `${String(paused1.workerId)}:${String(paused1.point)}`,
         `${String(paused2.workerId)}:${String(paused2.point)}`,
@@ -476,23 +506,32 @@ describe("project identity concurrency, handoff, crashes, and fencing (proofs 1-
         "Both owners must be recorded at the pre-link barrier before either resumes",
       );
 
-      // Resume first owner first: its link lands, yet step 7 rejects with lease_revoked.
+      // Resume first owner first: its link lands, temporary is not removed after holder death, claim fails with lease_revoked.
       owner1.resumePause("go");
       const failed1 = await owner1.nextEvent();
       const exit1 = await owner1.exited;
       assert.equal(failed1.event, "claim_failed");
       assert.equal(failed1.linkSucceeded, true, "First owner link must land first");
       assert.equal(failed1.code, "lease_revoked", "First owner claim must still fail with lease_revoked");
+      assert.equal(failed1.unlinksAfterPause, 0, "First owner must not remove temporary after holder death");
       assert.equal(exit1.code, 0);
       assert.equal(fs.existsSync(projectPath), true);
+      assert.equal(fs.existsSync(owner1TmpPath), true, "First owner temporary must still exist");
+      assertRawFileUnchanged(owner1TmpPath, owner1TmpBefore, "First owner temporary bytes");
       const firstLinkBytes = snapshotRawFile(projectPath);
 
-      // Resume second owner: hits EEXIST, verifies first owner's linked record, and opens.
+      // Resume second owner: hits EEXIST with a valid lease, removes its own temp, verifies first owner's linked record, and opens.
       owner2.resumePause("go");
       const claimed2 = await owner2.nextEvent();
       assert.equal(claimed2.event, "claimed");
       assert.equal(claimed2.linkErrno, "EEXIST");
       assert.equal(claimed2.published, false, "Second owner must verify existing record, not publish");
+      assert.equal(
+        fs.existsSync(owner2TmpPath),
+        false,
+        "Second owner with valid lease must remove its own temporary after EEXIST",
+      );
+      assertRawFileUnchanged(owner1TmpPath, owner1TmpBefore, "First owner temporary stays after second owner opens");
       assertRawFileUnchanged(projectPath, firstLinkBytes, "Linked project.json bytes must stay unchanged");
 
       owner2.sendCommand("release");
@@ -501,11 +540,12 @@ describe("project identity concurrency, handoff, crashes, and fencing (proofs 1-
       owner2.sendCommand("exit");
       assert.equal((await owner2.exited).code, 0);
 
-      // A fresh subsequent claim also finds, verifies, and opens the same record.
+      // A fresh subsequent claim also finds, verifies, and opens the same record without removing leftovers.
       const third = await claimProject(repoDir, stateBase);
       ctx.trackLease(third.lease, "post-p4b-holder");
       assert.equal(third.published, false);
       assertRawFileUnchanged(projectPath, firstLinkBytes);
+      assertRawFileUnchanged(owner1TmpPath, owner1TmpBefore, "First owner temporary stays after third claim");
       await third.lease.release();
     } finally {
       await ctx.cleanup();
@@ -571,6 +611,204 @@ describe("project identity concurrency, handoff, crashes, and fencing (proofs 1-
       assert.equal(rel2.event, "released");
       owner2.sendCommand("exit");
       assert.equal((await owner2.exited).code, 0);
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  test("proof 4: holder killed after exclusive temporary creation returns; claim fails with lease_revoked, empty temporary stays, no project.json, and no write, link, or removal follows", async () => {
+    const ctx = createIdentityTestContext("herdr-s1b-p4d-");
+    try {
+      const repoDir = initGitRepo(path.join(ctx.scratchRoot, "repo-p4d"));
+      const stateBase = path.join(ctx.scratchRoot, "state");
+      const live = resolveProjectIdentity(repoDir);
+      const stateRoot = path.join(stateBase, live.projectKey);
+      const projectPath = path.join(stateRoot, PROJECT_RECORD_FILENAME);
+
+      const owner1 = ctx.spawnIdentityWorker([
+        "--worker-id",
+        "owner1",
+        "--cwd",
+        repoDir,
+        "--state-base",
+        stateBase,
+        "--pause-at",
+        "after-create-temp",
+      ]);
+      const paused = await owner1.nextEvent();
+      assert.equal(paused.event, "paused");
+      assert.equal(paused.point, "after-create-temp");
+      const tmpPath = String(paused.tmpPath);
+      assert.equal(fs.existsSync(tmpPath), true, "Temporary file must exist after exclusive creation");
+      assert.equal(fs.readFileSync(tmpPath).length, 0, "Temporary file must be empty before payload write");
+      assert.equal(fs.existsSync(projectPath), false, "project.json must not exist before link");
+
+      // Kill the lock holder from outside before openSync returns control to publishProjectRecord.
+      await ctx.killHolderAndWaitDead(Number(paused.holderPid), String(paused.holderStartTime));
+
+      owner1.resumePause("go");
+      const failed = await owner1.nextEvent();
+      const exit = await owner1.exited;
+      assert.equal(failed.event, "claim_failed");
+      assert.equal(failed.code, "lease_revoked", "Claim must fail with lease_revoked before payload write");
+      assert.equal(failed.writesAfterPause, 0, "No payload write may reach fs after holder death");
+      assert.equal(failed.linksAfterPause, 0, "No link may reach fs after holder death");
+      assert.equal(failed.unlinksAfterPause, 0, "No removal may reach fs after holder death");
+      assert.equal(failed.writtenBytesBase64, null, "No payload bytes may be written");
+      assert.equal(exit.code, 0);
+
+      assert.equal(fs.existsSync(tmpPath), true, "Empty temporary file must remain on disk");
+      assert.equal(fs.readFileSync(tmpPath).length, 0, "Temporary file must remain empty");
+      assert.equal(fs.existsSync(projectPath), false, "No project.json may exist");
+
+      const emptyTmpSnap = snapshotRawFile(tmpPath);
+      const next = await claimProject(repoDir, stateBase);
+      ctx.trackLease(next.lease, "post-p4d-holder");
+      assert.equal(next.published, true, "Next claim must publish project.json");
+      assertRawFileUnchanged(tmpPath, emptyTmpSnap, "Empty leftover temp must survive next claim");
+      await next.lease.release();
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  test("proof 4: holder killed after link returns; claim fails with lease_revoked, temporary stays, project.json holds linked bytes, and no write, link, or removal follows", async () => {
+    const ctx = createIdentityTestContext("herdr-s1b-p4e-");
+    try {
+      const repoDir = initGitRepo(path.join(ctx.scratchRoot, "repo-p4e"));
+      const stateBase = path.join(ctx.scratchRoot, "state");
+      const live = resolveProjectIdentity(repoDir);
+      const stateRoot = path.join(stateBase, live.projectKey);
+      const projectPath = path.join(stateRoot, PROJECT_RECORD_FILENAME);
+
+      const owner1 = ctx.spawnIdentityWorker([
+        "--worker-id",
+        "owner1",
+        "--cwd",
+        repoDir,
+        "--state-base",
+        stateBase,
+        "--pause-at",
+        "after-link",
+      ]);
+      const paused = await owner1.nextEvent();
+      assert.equal(paused.event, "paused");
+      assert.equal(paused.point, "after-link");
+      const tmpPath = String(paused.tmpPath);
+      assert.equal(typeof paused.writtenBytesBase64, "string");
+      const linkedBytes = Buffer.from(String(paused.writtenBytesBase64), "base64");
+      assert.equal(linkedBytes.length > 0, true);
+      assert.equal(fs.existsSync(tmpPath), true, "Temporary must still exist right after link");
+      assert.equal(fs.existsSync(projectPath), true, "project.json must exist right after link");
+      assert.equal(Buffer.compare(fs.readFileSync(projectPath), linkedBytes), 0);
+
+      // Kill the lock holder from outside before linkSync returns control to publishProjectRecord.
+      await ctx.killHolderAndWaitDead(Number(paused.holderPid), String(paused.holderStartTime));
+
+      owner1.resumePause("go");
+      const failed = await owner1.nextEvent();
+      const exit = await owner1.exited;
+      assert.equal(failed.event, "claim_failed");
+      assert.equal(failed.code, "lease_revoked", "Claim must fail with lease_revoked before temporary removal");
+      assert.equal(failed.linkSucceeded, true);
+      assert.equal(failed.writesAfterPause, 0, "No payload write may reach fs after holder death");
+      assert.equal(failed.linksAfterPause, 0, "No link may reach fs after holder death");
+      assert.equal(failed.unlinksAfterPause, 0, "No removal may reach fs after holder death");
+      assert.equal(exit.code, 0);
+
+      assert.equal(fs.existsSync(tmpPath), true, "Temporary file must stay when check before removal fails");
+      assert.equal(
+        Buffer.compare(fs.readFileSync(projectPath), linkedBytes),
+        0,
+        "project.json must hold the exact bytes that were linked",
+      );
+      assert.equal(Buffer.compare(fs.readFileSync(tmpPath), linkedBytes), 0);
+
+      const tmpSnap = snapshotRawFile(tmpPath);
+      const projectSnap = snapshotRawFile(projectPath);
+      const next = await claimProject(repoDir, stateBase);
+      ctx.trackLease(next.lease, "post-p4e-holder");
+      assert.equal(next.published, false, "Next claim must verify existing project.json");
+      assertRawFileUnchanged(projectPath, projectSnap, "Linked project.json must survive next claim");
+      assertRawFileUnchanged(tmpPath, tmpSnap, "Leftover temporary must survive next claim");
+      await next.lease.release();
+    } finally {
+      await ctx.cleanup();
+    }
+  });
+
+  test("proof 4: primary write error reaches caller when holder dies before temporary removal, and temporary stays; valid lease still removes its temporary", async () => {
+    const ctx = createIdentityTestContext("herdr-s1b-p4f-");
+    try {
+      // Sub-case A: holder dies while a primary write error is already on its way.
+      const repoA = initGitRepo(path.join(ctx.scratchRoot, "repo-p4f-dead"));
+      const stateBaseA = path.join(ctx.scratchRoot, "state-a");
+      const liveA = resolveProjectIdentity(repoA);
+      const projectPathA = path.join(stateBaseA, liveA.projectKey, PROJECT_RECORD_FILENAME);
+
+      const workerA = ctx.spawnIdentityWorker([
+        "--worker-id",
+        "owner-primary-dead",
+        "--cwd",
+        repoA,
+        "--state-base",
+        stateBaseA,
+        "--pause-at",
+        "fail-write-paused",
+      ]);
+      const pausedA = await workerA.nextEvent();
+      assert.equal(pausedA.event, "paused");
+      assert.equal(pausedA.point, "fail-write-paused");
+      const tmpPathA = String(pausedA.tmpPath);
+      assert.equal(fs.existsSync(tmpPathA), true);
+
+      await ctx.killHolderAndWaitDead(Number(pausedA.holderPid), String(pausedA.holderStartTime));
+      workerA.resumePause("go");
+      const failedA = await workerA.nextEvent();
+      const exitA = await workerA.exited;
+      assert.equal(failedA.event, "claim_failed");
+      assert.equal(
+        failedA.code,
+        "ENOSPC",
+        "Primary error already on its way must reach the caller instead of lease_revoked",
+      );
+      assert.equal(failedA.writesAfterPause, 0);
+      assert.equal(failedA.linksAfterPause, 0);
+      assert.equal(failedA.unlinksAfterPause, 0, "No removal may run after holder death");
+      assert.equal(exitA.code, 0);
+      assert.equal(fs.existsSync(tmpPathA), true, "Temporary must stay when holder died before removal");
+      assert.equal(fs.existsSync(projectPathA), false);
+
+      // Sub-case B: same primary write error with a valid lease removes this call's temporary.
+      const repoB = initGitRepo(path.join(ctx.scratchRoot, "repo-p4f-alive"));
+      const stateBaseB = path.join(ctx.scratchRoot, "state-b");
+      const liveB = resolveProjectIdentity(repoB);
+      const projectPathB = path.join(stateBaseB, liveB.projectKey, PROJECT_RECORD_FILENAME);
+
+      const workerB = ctx.spawnIdentityWorker([
+        "--worker-id",
+        "owner-primary-alive",
+        "--cwd",
+        repoB,
+        "--state-base",
+        stateBaseB,
+        "--pause-at",
+        "fail-write-paused",
+      ]);
+      const pausedB = await workerB.nextEvent();
+      assert.equal(pausedB.event, "paused");
+      const tmpPathB = String(pausedB.tmpPath);
+      assert.equal(fs.existsSync(tmpPathB), true);
+
+      workerB.resumePause("go");
+      const failedB = await workerB.nextEvent();
+      const exitB = await workerB.exited;
+      assert.equal(failedB.event, "claim_failed");
+      assert.equal(failedB.code, "ENOSPC");
+      assert.equal(failedB.unlinksAfterPause, 1, "Valid lease must still remove its own temporary");
+      assert.equal(exitB.code, 0);
+      assert.equal(fs.existsSync(tmpPathB), false, "Temporary must be removed while lease is valid");
+      assert.equal(fs.existsSync(projectPathB), false);
     } finally {
       await ctx.cleanup();
     }

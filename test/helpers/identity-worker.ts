@@ -88,9 +88,22 @@ interface HookTelemetry {
   linkSucceeded: boolean;
   holderPid: number | null;
   holderStartTime: string | null;
+  tmpPath: string | null;
+  writtenBytesBase64: string | null;
+  writesAfterPause: number;
+  linksAfterPause: number;
+  unlinksAfterPause: number;
 }
 
-function buildPausedFsOps(
+function captureWrittenBytes(data: string | NodeJS.ArrayBufferView): string {
+  const buf =
+    typeof data === "string"
+      ? Buffer.from(data, "utf8")
+      : Buffer.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  return buf.toString("base64");
+}
+
+function buildWorkerFsOps(
   pauseAt: string | undefined,
   workerId: string,
   cwd: string,
@@ -98,12 +111,9 @@ function buildPausedFsOps(
   swapTarget: string | undefined,
   selfStartTime: string | null,
   telemetry: HookTelemetry,
-): Partial<IdentityFsOps> | undefined {
-  if (!pauseAt) {
-    return undefined;
-  }
-
+): Partial<IdentityFsOps> {
   let pausedOnce = false;
+  let afterPause = false;
   let realpathCalls = 0;
   let verifyFd: number | null = null;
 
@@ -115,12 +125,53 @@ function buildPausedFsOps(
     }
   };
 
+  const baseOps: Partial<IdentityFsOps> = {
+    openSync(targetPath, flags, mode) {
+      const pathStr = String(targetPath);
+      if (path.basename(pathStr).startsWith(`.${PROJECT_RECORD_FILENAME}.tmp.`)) {
+        telemetry.tmpPath = pathStr;
+      }
+      return fs.openSync(targetPath, flags, mode);
+    },
+    writeFileSync(file, data, options) {
+      if (afterPause) {
+        telemetry.writesAfterPause += 1;
+      }
+      telemetry.writtenBytesBase64 = captureWrittenBytes(data);
+      fs.writeFileSync(file, data, options as never);
+    },
+    linkSync(existingPath, newPath) {
+      if (afterPause) {
+        telemetry.linksAfterPause += 1;
+      }
+      try {
+        fs.linkSync(existingPath, newPath);
+        telemetry.linkSucceeded = true;
+      } catch (err) {
+        telemetry.linkErrno = getErrorCode(err);
+        throw err;
+      }
+    },
+    unlinkSync(targetPath) {
+      if (afterPause) {
+        telemetry.unlinksAfterPause += 1;
+      }
+      fs.unlinkSync(targetPath);
+    },
+  };
+
+  if (!pauseAt) {
+    return baseOps;
+  }
+
   if (pauseAt === "after-lease") {
     return {
+      ...baseOps,
       openSync(targetPath, flags, mode) {
         const pathStr = String(targetPath);
         if (!pausedOnce && path.basename(pathStr).startsWith(`.${PROJECT_RECORD_FILENAME}.tmp.`)) {
           pausedOnce = true;
+          telemetry.tmpPath = pathStr;
           resolveOwnerFromDir(pathStr);
           emitSync({
             event: "paused",
@@ -133,19 +184,86 @@ function buildPausedFsOps(
             holderStartTime: telemetry.holderStartTime,
           });
           readControlLineSync();
+          afterPause = true;
         }
         return fs.openSync(targetPath, flags, mode);
       },
     };
   }
 
+  if (pauseAt === "after-create-temp") {
+    return {
+      ...baseOps,
+      openSync(targetPath, flags, mode) {
+        const pathStr = String(targetPath);
+        const fd = fs.openSync(targetPath, flags, mode);
+        if (!pausedOnce && path.basename(pathStr).startsWith(`.${PROJECT_RECORD_FILENAME}.tmp.`)) {
+          pausedOnce = true;
+          telemetry.tmpPath = pathStr;
+          resolveOwnerFromDir(pathStr);
+          emitSync({
+            event: "paused",
+            workerId,
+            point: "after-create-temp",
+            tmpPath: pathStr,
+            pid: process.pid,
+            startTime: selfStartTime,
+            holderPid: telemetry.holderPid,
+            holderStartTime: telemetry.holderStartTime,
+          });
+          readControlLineSync();
+          afterPause = true;
+        }
+        return fd;
+      },
+    };
+  }
+
+  if (pauseAt === "fail-write-paused") {
+    return {
+      ...baseOps,
+      writeFileSync(file, data, options) {
+        if (!pausedOnce) {
+          pausedOnce = true;
+          if (telemetry.tmpPath !== null) {
+            resolveOwnerFromDir(telemetry.tmpPath);
+          }
+          emitSync({
+            event: "paused",
+            workerId,
+            point: "fail-write-paused",
+            tmpPath: telemetry.tmpPath,
+            pid: process.pid,
+            startTime: selfStartTime,
+            holderPid: telemetry.holderPid,
+            holderStartTime: telemetry.holderStartTime,
+          });
+          readControlLineSync();
+          afterPause = true;
+          throw Object.assign(new Error("ENOSPC: no space left on device, write"), {
+            code: "ENOSPC",
+          });
+        }
+        if (afterPause) {
+          telemetry.writesAfterPause += 1;
+        }
+        telemetry.writtenBytesBase64 = captureWrittenBytes(data);
+        fs.writeFileSync(file, data, options as never);
+      },
+    };
+  }
+
   if (pauseAt === "before-link") {
     return {
+      ...baseOps,
       linkSync(existingPath, newPath) {
         const tmpStr = String(existingPath);
         const targetStr = String(newPath);
+        let didPauseHere = false;
         if (!pausedOnce && path.basename(targetStr) === PROJECT_RECORD_FILENAME) {
           pausedOnce = true;
+          didPauseHere = true;
+          telemetry.tmpPath = tmpStr;
           resolveOwnerFromDir(targetStr);
           emitSync({
             event: "paused",
@@ -153,12 +271,40 @@ function buildPausedFsOps(
             point: "before-link",
             tmpPath: tmpStr,
             targetPath: targetStr,
+            writtenBytesBase64: telemetry.writtenBytesBase64,
             pid: process.pid,
             startTime: selfStartTime,
             holderPid: telemetry.holderPid,
             holderStartTime: telemetry.holderStartTime,
           });
           readControlLineSync();
+        }
+        if (afterPause) {
+          telemetry.linksAfterPause += 1;
+        }
+        try {
+          fs.linkSync(existingPath, newPath);
+          telemetry.linkSucceeded = true;
+        } catch (err) {
+          telemetry.linkErrno = getErrorCode(err);
+          throw err;
+        } finally {
+          if (didPauseHere) {
+            afterPause = true;
+          }
+        }
+      },
+    };
+  }
+
+  if (pauseAt === "after-link") {
+    return {
+      ...baseOps,
+      linkSync(existingPath, newPath) {
+        const tmpStr = String(existingPath);
+        const targetStr = String(newPath);
+        if (afterPause) {
+          telemetry.linksAfterPause += 1;
         }
         try {
           fs.linkSync(existingPath, newPath);
@@ -167,16 +313,37 @@ function buildPausedFsOps(
           telemetry.linkErrno = getErrorCode(err);
           throw err;
         }
+        if (!pausedOnce && path.basename(targetStr) === PROJECT_RECORD_FILENAME) {
+          pausedOnce = true;
+          telemetry.tmpPath = tmpStr;
+          resolveOwnerFromDir(targetStr);
+          emitSync({
+            event: "paused",
+            workerId,
+            point: "after-link",
+            tmpPath: tmpStr,
+            targetPath: targetStr,
+            writtenBytesBase64: telemetry.writtenBytesBase64,
+            pid: process.pid,
+            startTime: selfStartTime,
+            holderPid: telemetry.holderPid,
+            holderStartTime: telemetry.holderStartTime,
+          });
+          readControlLineSync();
+          afterPause = true;
+        }
       },
     };
   }
 
   if (pauseAt === "before-unlink") {
     return {
+      ...baseOps,
       unlinkSync(targetPath) {
         const tmpStr = String(targetPath);
         if (!pausedOnce && path.basename(tmpStr).startsWith(`.${PROJECT_RECORD_FILENAME}.tmp.`)) {
           pausedOnce = true;
+          telemetry.tmpPath = tmpStr;
           resolveOwnerFromDir(tmpStr);
           emitSync({
             event: "paused",
@@ -189,6 +356,9 @@ function buildPausedFsOps(
             holderStartTime: telemetry.holderStartTime,
           });
           readControlLineSync();
+          afterPause = true;
+        } else if (afterPause) {
+          telemetry.unlinksAfterPause += 1;
         }
         fs.unlinkSync(targetPath);
       },
@@ -197,6 +367,7 @@ function buildPausedFsOps(
 
   if (pauseAt === "during-verify") {
     return {
+      ...baseOps,
       openSync(targetPath, flags, mode) {
         const fd = fs.openSync(targetPath, flags, mode);
         const pathStr = String(targetPath);
@@ -219,6 +390,7 @@ function buildPausedFsOps(
             holderStartTime: telemetry.holderStartTime,
           });
           readControlLineSync();
+          afterPause = true;
         }
         return fs.readFileSync(fdOrPath, options as never);
       },
@@ -227,6 +399,7 @@ function buildPausedFsOps(
 
   if (pauseAt === "step4-make-unborn") {
     return {
+      ...baseOps,
       realpathSync: ((targetPath: fs.PathLike, options?: fs.EncodingOption) => {
         realpathCalls += 1;
         if (!pausedOnce && realpathCalls === 3) {
@@ -263,6 +436,7 @@ function buildPausedFsOps(
       throw new Error("--pause-at step4-swap-cwd requires --swap-target");
     }
     return {
+      ...baseOps,
       realpathSync: ((targetPath: fs.PathLike, options?: fs.EncodingOption) => {
         realpathCalls += 1;
         if (!pausedOnce && realpathCalls === 3) {
@@ -356,13 +530,24 @@ async function main(): Promise<void> {
       linkSucceeded: false,
       holderPid: null,
       holderStartTime: null,
+      tmpPath: null,
+      writtenBytesBase64: null,
+      writesAfterPause: 0,
+      linksAfterPause: 0,
+      unlinksAfterPause: 0,
     };
-    const fsOps = usePauseHooks
-      ? buildPausedFsOps(pauseAt, workerId, cwd, stateBase, swapTarget, selfStartTime, telemetry)
-      : undefined;
+    const fsOps = buildWorkerFsOps(
+      usePauseHooks ? pauseAt : undefined,
+      workerId,
+      cwd,
+      stateBase,
+      swapTarget,
+      selfStartTime,
+      telemetry,
+    );
 
     try {
-      const result = await claimProject(cwd, stateBase, fsOps ? { fs: fsOps } : undefined);
+      const result = await claimProject(cwd, stateBase, { fs: fsOps });
       activeResult = result;
       emitSync({
         event: "claimed",
@@ -377,8 +562,13 @@ async function main(): Promise<void> {
         published: result.published,
         record: result.record,
         originWarning: result.originWarning,
+        tmpPath: telemetry.tmpPath,
+        writtenBytesBase64: telemetry.writtenBytesBase64,
         linkErrno: telemetry.linkErrno,
         linkSucceeded: telemetry.linkSucceeded,
+        writesAfterPause: telemetry.writesAfterPause,
+        linksAfterPause: telemetry.linksAfterPause,
+        unlinksAfterPause: telemetry.unlinksAfterPause,
       });
     } catch (err) {
       emitSync({
@@ -388,8 +578,13 @@ async function main(): Promise<void> {
         startTime: selfStartTime,
         code: getErrorCode(err),
         message: err instanceof Error ? err.message : String(err),
+        tmpPath: telemetry.tmpPath,
+        writtenBytesBase64: telemetry.writtenBytesBase64,
         linkErrno: telemetry.linkErrno,
         linkSucceeded: telemetry.linkSucceeded,
+        writesAfterPause: telemetry.writesAfterPause,
+        linksAfterPause: telemetry.linksAfterPause,
+        unlinksAfterPause: telemetry.unlinksAfterPause,
         holderPid: telemetry.holderPid,
         holderStartTime: telemetry.holderStartTime,
       });

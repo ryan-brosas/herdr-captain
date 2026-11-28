@@ -688,9 +688,6 @@ function publishProjectRecord(
   };
   const bytes = serializeProjectRecord(record);
 
-  // Check lease right before creating and writing the temporary file.
-  lease.assertValid();
-
   const tmpName = `.${PROJECT_RECORD_FILENAME}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`;
   const tmpPath = path.join(stateRoot, tmpName);
 
@@ -698,8 +695,11 @@ function publishProjectRecord(
   let createdTemp = false;
   let published = false;
   let linkedExisting = false;
+  let hasPrimaryError = false;
 
   try {
+    // Check lease right before write 1: exclusive temporary file creation.
+    lease.assertValid();
     fd = io.openSync(
       tmpPath,
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
@@ -707,14 +707,15 @@ function publishProjectRecord(
     );
     createdTemp = true;
 
+    // Check lease right before write 2: payload write.
+    lease.assertValid();
     io.writeFileSync(fd, bytes);
     io.fsyncSync(fd);
     io.closeSync(fd);
     fd = undefined;
 
-    // Check lease right before hard-linking project.json.
+    // Check lease right before write 3: hard-linking project.json.
     lease.assertValid();
-
     try {
       io.linkSync(tmpPath, projectPath);
       published = true;
@@ -729,6 +730,9 @@ function publishProjectRecord(
     if (published) {
       fsyncDir(io, stateRoot);
     }
+  } catch (err) {
+    hasPrimaryError = true;
+    throw err;
   } finally {
     if (fd !== undefined) {
       try {
@@ -738,10 +742,22 @@ function publishProjectRecord(
       }
     }
     if (createdTemp) {
+      let leaseValidForUnlink = false;
       try {
-        io.unlinkSync(tmpPath);
-      } catch {
-        // Leftover temp stays ignored and never masks a primary error.
+        // Check lease right before write 4: removing the temporary file.
+        lease.assertValid();
+        leaseValidForUnlink = true;
+      } catch (err) {
+        if (!hasPrimaryError) {
+          throw err;
+        }
+      }
+      if (leaseValidForUnlink) {
+        try {
+          io.unlinkSync(tmpPath);
+        } catch {
+          // Leftover temp stays ignored and never masks a primary error.
+        }
       }
     }
   }
