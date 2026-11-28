@@ -388,10 +388,8 @@ function ensureDirChain(io: StoreFsOps, lease: OwnerLease, baseDir: string, segm
     }
     if (!exists) {
       lease.assertValid();
-      let created = false;
       try {
         io.mkdirSync(next, 0o700);
-        created = true;
       } catch (err) {
         if (getErrnoCode(err) === "EEXIST") {
           const stat = io.lstatSync(next);
@@ -400,8 +398,8 @@ function ensureDirChain(io: StoreFsOps, lease: OwnerLease, baseDir: string, segm
           throw err;
         }
       }
-      if (created) fsyncDir(io, parent);
     }
+    fsyncDir(io, parent);
     current = next;
   }
   return current;
