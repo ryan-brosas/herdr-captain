@@ -35,3 +35,4 @@ bun run test
 ```
 
 This runs `bun test ./test` on Linux with Bun 1.4.0 or newer, no install, and no external dependencies. Bun 1.4.0 and Bun 1.2.14 are the two versions that were run. On Bun 1.2.14, four lease checks that need an unreaped holder before its exit callback failed, so the test files refuse to load on a version below 1.4.0. The owner lease tests also require `util-linux` `flock` with `--no-fork` and `--conflict-exit-code`, plus readable Linux `/proc`. No package build or type-check command exists yet; Slice S1 adds no development dependencies ([#8](https://github.com/ryan-brosas/herdr-captain/issues/8)).
+Every tracked file under `src/` and `test/` must stay at 1,000 lines or fewer. `bun run test` fails if one is longer ([#41](https://github.com/ryan-brosas/herdr-captain/issues/41)).
