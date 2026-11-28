@@ -2,45 +2,30 @@ import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  acquireLease,
+  LeaseError,
+  type LeaseErrorCode,
+  type OwnerLease,
+} from "./lease.ts";
+
+export { LeaseError, type LeaseErrorCode, type OwnerLease };
 
 export const PROJECT_SCHEMA_VERSION = 1 as const;
-export const IDENTITY_DECISION_SCHEMA_VERSION = 1 as const;
 export const MAX_PROJECT_RECORD_BYTES = 2048;
-export const MAX_DECISION_RECORD_BYTES = 8192;
 export const PROJECT_RECORD_FILENAME = "project.json";
-export const IDENTITY_DECISIONS_DIR = "identity-decisions";
 
 const PROJECT_KEY_PATTERN = /^[0-9a-f]{16}$/;
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
-const PROJECT_RECORD_TMP_PATTERN = /^\.project\.json\.tmp\.[1-9][0-9]*\.[0-9a-f]{12}$/;
 
-const PROJECT_RECORD_REQUIRED_KEYS = new Set([
+const PROJECT_RECORD_KEYS = new Set([
   "schemaVersion",
   "slug",
   "canonicalCommonDir",
   "commonDirSha256",
   "originUrl",
   "rootCommitShas",
-]);
-
-const PROJECT_RECORD_ALLOWED_KEYS = new Set([
-  ...PROJECT_RECORD_REQUIRED_KEYS,
-  "reboundFrom",
-]);
-
-const DECISION_REQUIRED_KEYS = new Set([
-  "schemaVersion",
-  "decisionId",
-  "choice",
-  "oldProjectKey",
-  "newProjectKey",
-  "oldCanonicalCommonDir",
-  "newCanonicalCommonDir",
-  "rootCommitShas",
-  "originUrl",
-  "decidedBy",
-  "time",
 ]);
 
 const GIT_ENV_KEYS_TO_STRIP = [
@@ -58,15 +43,13 @@ const UTF8_FATAL_DECODER = new TextDecoder("utf-8", { fatal: true });
 export type IdentityErrorCode =
   | "not_git_repo"
   | "invalid_argument"
+  | "identity_unborn"
   | "identity_mismatch"
   | "identity_relocated"
   | "project_record_too_large"
-  | "invalid_project_record"
-  | "decision_exists"
-  | "invalid_decision"
-  | "decision_mismatch"
-  | "decision_candidate_not_found"
-  | "rebind_destination_exists";
+  | "invalid_project_record";
+
+export type ClaimErrorCode = IdentityErrorCode | LeaseErrorCode;
 
 export interface RelocationCandidate {
   readonly projectKey: string;
@@ -123,65 +106,62 @@ export interface ProjectRecord {
   readonly commonDirSha256: string;
   readonly originUrl: string | null;
   readonly rootCommitShas: readonly string[];
-  readonly reboundFrom?: readonly string[];
 }
 
-export type IdentityDecisionChoice = "rebind" | "new_project";
-
-export interface IdentityDecision {
-  readonly schemaVersion: 1;
-  readonly decisionId: string;
-  readonly choice: IdentityDecisionChoice;
-  readonly oldProjectKey: string | null;
-  readonly newProjectKey: string;
-  readonly oldCanonicalCommonDir: string | null;
-  readonly newCanonicalCommonDir: string;
-  readonly rootCommitShas: readonly string[];
-  readonly originUrl: string | null;
-  readonly decidedBy: string;
-  readonly time: string;
-}
-
-export interface OriginUrlDrift {
+export interface OriginWarning {
   readonly stored: string | null;
   readonly live: string | null;
 }
 
-export interface OpenProjectResult {
-  readonly projectKey: string;
-  readonly stateRoot: string;
-  readonly record: ProjectRecord;
-  readonly originDrift: OriginUrlDrift | null;
-  readonly created: boolean;
-  readonly rebound: boolean;
-  readonly appliedDecisionId: string | null;
-}
-
-export interface RecordIdentityDecisionInput {
-  readonly cwd: string;
-  readonly stateBase: string;
-  readonly choice: IdentityDecisionChoice;
-  readonly decidedBy: string;
-  readonly oldProjectKey?: string | null;
-}
-
-export interface RecordIdentityDecisionResult {
-  readonly decisionPath: string;
-  readonly decision: IdentityDecision;
-}
-
 export interface IdentityFsOps {
+  readonly realpathSync: typeof fs.realpathSync;
   readonly openSync: typeof fs.openSync;
-  readonly renameSync: typeof fs.renameSync;
+  readonly writeFileSync: typeof fs.writeFileSync;
+  readonly fsyncSync: typeof fs.fsyncSync;
+  readonly closeSync: typeof fs.closeSync;
+  readonly linkSync: typeof fs.linkSync;
+  readonly unlinkSync: typeof fs.unlinkSync;
+  readonly readFileSync: typeof fs.readFileSync;
+  readonly fstatSync: typeof fs.fstatSync;
+  readonly lstatSync: typeof fs.lstatSync;
 }
 
-export interface IdentityOperationOptions {
+export interface ResolveIdentityOptions {
   readonly fs?: Partial<IdentityFsOps>;
 }
 
+export interface ClaimProjectOptions {
+  readonly fs?: Partial<IdentityFsOps>;
+  readonly acquireTimeoutMs?: number;
+  readonly releaseTimeoutMs?: number;
+}
+
+export interface ClaimProjectResult {
+  readonly projectKey: string;
+  readonly stateRoot: string;
+  readonly lease: OwnerLease;
+  readonly record: ProjectRecord;
+  readonly published: boolean;
+  readonly originWarning: OriginWarning | null;
+}
+
+interface PublishOrVerifyOutcome {
+  readonly record: ProjectRecord;
+  readonly published: boolean;
+  readonly originWarning: OriginWarning | null;
+}
+
 const DEFAULT_FS_OPS: IdentityFsOps = {
+  realpathSync: fs.realpathSync,
   openSync: fs.openSync,
-  renameSync: fs.renameSync,
+  writeFileSync: fs.writeFileSync,
+  fsyncSync: fs.fsyncSync,
+  closeSync: fs.closeSync,
+  linkSync: fs.linkSync,
+  unlinkSync: fs.unlinkSync,
+  readFileSync: fs.readFileSync,
+  fstatSync: fs.fstatSync,
+  lstatSync: fs.lstatSync,
 };
 
 function resolveFsOps(overrides?: Partial<IdentityFsOps>): IdentityFsOps {
@@ -189,8 +169,16 @@ function resolveFsOps(overrides?: Partial<IdentityFsOps>): IdentityFsOps {
     return DEFAULT_FS_OPS;
   }
   return {
+    realpathSync: overrides.realpathSync ?? fs.realpathSync,
     openSync: overrides.openSync ?? fs.openSync,
-    renameSync: overrides.renameSync ?? fs.renameSync,
+    writeFileSync: overrides.writeFileSync ?? fs.writeFileSync,
+    fsyncSync: overrides.fsyncSync ?? fs.fsyncSync,
+    closeSync: overrides.closeSync ?? fs.closeSync,
+    linkSync: overrides.linkSync ?? fs.linkSync,
+    unlinkSync: overrides.unlinkSync ?? fs.unlinkSync,
+    readFileSync: overrides.readFileSync ?? fs.readFileSync,
+    fstatSync: overrides.fstatSync ?? fs.fstatSync,
+    lstatSync: overrides.lstatSync ?? fs.lstatSync,
   };
 }
 
@@ -222,18 +210,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  for (let i = 0; i < a.length; i += 1) {
-    if (a[i] !== b[i]) {
-      return false;
-    }
-  }
-  return true;
-}
-
 function hasSharedString(a: readonly string[], b: readonly string[]): boolean {
   const bSet = new Set(b);
   for (const item of a) {
@@ -253,7 +229,7 @@ function isStrictlySortedUniqueCommitShas(value: unknown): value is string[] {
     if (typeof item !== "string" || !COMMIT_SHA_PATTERN.test(item)) {
       return false;
     }
-    if (i > 0 && !(value[i - 1] < item)) {
+    if (i > 0 && !(value[i - 1]! < item)) {
       return false;
     }
   }
@@ -261,16 +237,6 @@ function isStrictlySortedUniqueCommitShas(value: unknown): value is string[] {
 }
 
 function cloneProjectRecord(record: ProjectRecord): ProjectRecord {
-  if (record.reboundFrom === undefined) {
-    return {
-      schemaVersion: record.schemaVersion,
-      slug: record.slug,
-      canonicalCommonDir: record.canonicalCommonDir,
-      commonDirSha256: record.commonDirSha256,
-      originUrl: record.originUrl,
-      rootCommitShas: [...record.rootCommitShas],
-    };
-  }
   return {
     schemaVersion: record.schemaVersion,
     slug: record.slug,
@@ -278,52 +244,23 @@ function cloneProjectRecord(record: ProjectRecord): ProjectRecord {
     commonDirSha256: record.commonDirSha256,
     originUrl: record.originUrl,
     rootCommitShas: [...record.rootCommitShas],
-    reboundFrom: [...record.reboundFrom],
   };
 }
 
-function cloneIdentityDecision(decision: IdentityDecision): IdentityDecision {
-  return {
-    schemaVersion: decision.schemaVersion,
-    decisionId: decision.decisionId,
-    choice: decision.choice,
-    oldProjectKey: decision.oldProjectKey,
-    newProjectKey: decision.newProjectKey,
-    oldCanonicalCommonDir: decision.oldCanonicalCommonDir,
-    newCanonicalCommonDir: decision.newCanonicalCommonDir,
-    rootCommitShas: [...decision.rootCommitShas],
-    originUrl: decision.originUrl,
-    decidedBy: decision.decidedBy,
-    time: decision.time,
-  };
-}
-
-function buildReboundFrom(
-  existing: readonly string[] | undefined,
-  oldProjectKey: string,
-  currentProjectKey: string,
-): string[] {
-  const result: string[] = [];
-  if (existing !== undefined) {
-    for (const key of existing) {
-      if (key !== currentProjectKey && !result.includes(key)) {
-        result.push(key);
-      }
-    }
-  }
-  if (oldProjectKey !== currentProjectKey && !result.includes(oldProjectKey)) {
-    result.push(oldProjectKey);
-  }
-  return result;
-}
-
-function computeOriginDrift(
+function computeOriginWarning(
   storedOriginUrl: string | null,
   liveOriginUrl: string | null,
-): OriginUrlDrift | null {
+): OriginWarning | null {
   return storedOriginUrl !== liveOriginUrl
     ? { stored: storedOriginUrl, live: liveOriginUrl }
     : null;
+}
+
+function requireNonEmptyString(value: string, name: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new IdentityError("invalid_argument", `${name} must be a non-empty string`);
+  }
+  return value;
 }
 
 function buildCleanGitEnv(): NodeJS.ProcessEnv {
@@ -412,16 +349,9 @@ function resolveRootCommitShas(realCwd: string): string[] {
   return Array.from(unique).sort();
 }
 
-function requireNonEmptyString(value: string, name: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new IdentityError("invalid_argument", `${name} must be a non-empty string`);
-  }
-  return value;
-}
-
-function lstatOrNull(targetPath: string): fs.Stats | null {
+function lstatOrNull(io: IdentityFsOps, targetPath: string): fs.Stats | null {
   try {
-    return fs.lstatSync(targetPath);
+    return io.lstatSync(targetPath);
   } catch (err) {
     const code = getErrnoCode(err);
     if (code === "ENOENT" || code === "ENOTDIR") {
@@ -431,237 +361,89 @@ function lstatOrNull(targetPath: string): fs.Stats | null {
   }
 }
 
-function pathExistsAsDirectory(targetPath: string): boolean {
+function fsyncDir(io: IdentityFsOps, dirPath: string): void {
+  const dirFd = io.openSync(dirPath, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
   try {
-    return fs.statSync(targetPath).isDirectory();
-  } catch (err) {
-    const code = getErrnoCode(err);
-    if (code === "ENOENT" || code === "ENOTDIR") {
-      return false;
-    }
-    throw err;
-  }
-}
-
-function fsyncDir(dirPath: string): void {
-  const dirFd = fs.openSync(dirPath, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
-  try {
-    fs.fsyncSync(dirFd);
+    io.fsyncSync(dirFd);
   } finally {
-    fs.closeSync(dirFd);
+    io.closeSync(dirFd);
   }
 }
 
-function ensureDirectory(dirPath: string, errorCode: IdentityErrorCode): void {
-  const existing = lstatOrNull(dirPath);
-  if (existing !== null) {
-    if (!existing.isDirectory()) {
-      throw new IdentityError(errorCode, `Expected directory at ${dirPath}`);
-    }
-    return;
-  }
-
-  const firstCreated = fs.mkdirSync(dirPath, { recursive: true });
-  const parentDir = path.dirname(dirPath);
-  if (typeof firstCreated === "string") {
-    const firstParent = path.dirname(firstCreated);
-    if (firstParent !== parentDir) {
-      fsyncDir(firstParent);
-    }
-  }
-  fsyncDir(parentDir);
-  fsyncDir(dirPath);
-}
-
-function serializeRecordJson(
-  value: ProjectRecord | IdentityDecision,
-  fileName: string,
-  maxBytes: number,
-  sizeErrorCode: IdentityErrorCode,
-): string {
-  const payload = `${JSON.stringify(value, null, 2)}\n`;
-  const byteLength = Buffer.byteLength(payload, "utf8");
-  if (byteLength >= maxBytes) {
-    throw new IdentityError(
-      sizeErrorCode,
-      `${fileName} is ${byteLength} UTF-8 bytes; must be fewer than ${maxBytes} bytes`,
-      { details: { fileName, byteLength, maxBytes } },
-    );
-  }
-  return payload;
-}
-
-function writePayloadAtomic(
-  io: IdentityFsOps,
-  dirPath: string,
-  fileName: string,
-  payload: string,
-  maxBytes: number,
-  sizeErrorCode: IdentityErrorCode,
-): void {
+function serializeProjectRecord(record: ProjectRecord): Buffer {
+  const payload = `${JSON.stringify(record, null, 2)}\n`;
   const bytes = Buffer.from(payload, "utf8");
-  if (bytes.byteLength >= maxBytes) {
+  if (bytes.byteLength >= MAX_PROJECT_RECORD_BYTES) {
     throw new IdentityError(
-      sizeErrorCode,
-      `${fileName} is ${bytes.byteLength} UTF-8 bytes; must be fewer than ${maxBytes} bytes`,
-      { details: { fileName, byteLength: bytes.byteLength, maxBytes } },
+      "project_record_too_large",
+      `${PROJECT_RECORD_FILENAME} is ${bytes.byteLength} UTF-8 bytes; must be fewer than ${MAX_PROJECT_RECORD_BYTES} bytes`,
+      {
+        details: {
+          fileName: PROJECT_RECORD_FILENAME,
+          byteLength: bytes.byteLength,
+          maxBytes: MAX_PROJECT_RECORD_BYTES,
+        },
+      },
     );
   }
-
-  const targetPath = path.join(dirPath, fileName);
-  const tmpName = `.${fileName}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`;
-  const tmpPath = path.join(dirPath, tmpName);
-
-  let fd: number | undefined;
-  try {
-    fd = io.openSync(
-      tmpPath,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
-      0o600,
-    );
-    fs.writeFileSync(fd, bytes);
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-
-    fs.renameSync(tmpPath, targetPath);
-  } catch (err) {
-    if (fd !== undefined) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        // Ignore close error while cleaning up failed temp file.
-      }
-    }
-    try {
-      fs.rmSync(tmpPath, { force: true });
-    } catch {
-      // Ignore cleanup error while propagating the write failure.
-    }
-    throw err;
-  }
-
-  fsyncDir(dirPath);
+  return bytes;
 }
 
-function writePayloadExclusive(
-  dirPath: string,
-  fileName: string,
-  payload: string,
-  maxBytes: number,
-  sizeErrorCode: IdentityErrorCode,
-): string {
-  const bytes = Buffer.from(payload, "utf8");
-  if (bytes.byteLength >= maxBytes) {
-    throw new IdentityError(
-      sizeErrorCode,
-      `${fileName} is ${bytes.byteLength} UTF-8 bytes; must be fewer than ${maxBytes} bytes`,
-      { details: { fileName, byteLength: bytes.byteLength, maxBytes } },
-    );
-  }
-
-  ensureDirectory(dirPath, "invalid_decision");
-
-  const targetPath = path.join(dirPath, fileName);
-  const tmpName = `.${fileName}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`;
-  const tmpPath = path.join(dirPath, tmpName);
-
-  let fd: number | undefined;
-  let linked = false;
-  try {
-    fd = fs.openSync(
-      tmpPath,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
-      0o600,
-    );
-    fs.writeFileSync(fd, bytes);
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-
-    fs.linkSync(tmpPath, targetPath);
-    linked = true;
-    fs.unlinkSync(tmpPath);
-  } catch (err) {
-    if (fd !== undefined) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        // Ignore close error on cleanup path.
-      }
-    }
-    if (!linked) {
-      try {
-        fs.rmSync(tmpPath, { force: true });
-      } catch {
-        // Ignore cleanup error on failed link path.
-      }
-    }
-    if (getErrnoCode(err) === "EEXIST") {
-      throw new IdentityError(
-        "decision_exists",
-        `Identity decision already exists at ${targetPath}`,
-        { details: { decisionPath: targetPath }, cause: err },
-      );
-    }
-    throw err;
-  }
-
-  fsyncDir(dirPath);
-  return targetPath;
-}
-
-function readBoundedUtf8File(
-  filePath: string,
-  maxBytes: number,
-  sizeErrorCode: IdentityErrorCode,
-  invalidErrorCode: IdentityErrorCode,
-): string {
+function readBoundedUtf8File(io: IdentityFsOps, filePath: string): string {
   let fd: number;
   try {
     const flags =
       typeof fs.constants.O_NOFOLLOW === "number"
         ? fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
         : fs.constants.O_RDONLY;
-    fd = fs.openSync(filePath, flags);
+    fd = io.openSync(filePath, flags);
   } catch (err) {
-    const code = getErrnoCode(err);
-    if (code === "ELOOP") {
-      throw new IdentityError(invalidErrorCode, `Refusing symlink at ${filePath}`, { cause: err });
+    if (getErrnoCode(err) === "ELOOP") {
+      throw new IdentityError("invalid_project_record", `Refusing symlink at ${filePath}`, {
+        cause: err,
+      });
     }
     throw err;
   }
 
   try {
-    const stat = fs.fstatSync(fd);
+    const stat = io.fstatSync(fd);
     if (!stat.isFile()) {
-      throw new IdentityError(invalidErrorCode, `Expected regular file at ${filePath}`);
+      throw new IdentityError("invalid_project_record", `Expected regular file at ${filePath}`);
     }
-    if (stat.size >= maxBytes) {
+    if (stat.size >= MAX_PROJECT_RECORD_BYTES) {
       throw new IdentityError(
-        sizeErrorCode,
-        `${path.basename(filePath)} is ${stat.size} bytes; must be fewer than ${maxBytes} bytes`,
-        { details: { filePath, byteLength: stat.size, maxBytes } },
+        "project_record_too_large",
+        `${path.basename(filePath)} is ${stat.size} bytes; must be fewer than ${MAX_PROJECT_RECORD_BYTES} bytes`,
+        { details: { filePath, byteLength: stat.size, maxBytes: MAX_PROJECT_RECORD_BYTES } },
       );
     }
 
-    const raw = fs.readFileSync(fd);
+    const raw = io.readFileSync(fd);
     const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw, "utf8");
-    if (bytes.byteLength >= maxBytes) {
+    if (bytes.byteLength >= MAX_PROJECT_RECORD_BYTES) {
       throw new IdentityError(
-        sizeErrorCode,
-        `${path.basename(filePath)} is ${bytes.byteLength} bytes; must be fewer than ${maxBytes} bytes`,
-        { details: { filePath, byteLength: bytes.byteLength, maxBytes } },
+        "project_record_too_large",
+        `${path.basename(filePath)} is ${bytes.byteLength} bytes; must be fewer than ${MAX_PROJECT_RECORD_BYTES} bytes`,
+        {
+          details: {
+            filePath,
+            byteLength: bytes.byteLength,
+            maxBytes: MAX_PROJECT_RECORD_BYTES,
+          },
+        },
       );
     }
 
     try {
       return UTF8_FATAL_DECODER.decode(bytes);
     } catch (err) {
-      throw new IdentityError(invalidErrorCode, `Invalid UTF-8 in ${filePath}`, { cause: err });
+      throw new IdentityError("invalid_project_record", `Invalid UTF-8 in ${filePath}`, {
+        cause: err,
+      });
     }
   } finally {
-    fs.closeSync(fd);
+    io.closeSync(fd);
   }
 }
 
@@ -679,13 +461,12 @@ function parseProjectRecord(rawText: string, filePath: string): ProjectRecord {
     throw new IdentityError("invalid_project_record", `${filePath} must be a JSON object`);
   }
 
-  const keys = Object.keys(parsed);
-  for (const key of keys) {
-    if (!PROJECT_RECORD_ALLOWED_KEYS.has(key)) {
+  for (const key of Object.keys(parsed)) {
+    if (!PROJECT_RECORD_KEYS.has(key)) {
       throw new IdentityError("invalid_project_record", `Unexpected field ${key} in ${filePath}`);
     }
   }
-  for (const requiredKey of PROJECT_RECORD_REQUIRED_KEYS) {
+  for (const requiredKey of PROJECT_RECORD_KEYS) {
     if (!(requiredKey in parsed)) {
       throw new IdentityError(
         "invalid_project_record",
@@ -701,7 +482,6 @@ function parseProjectRecord(rawText: string, filePath: string): ProjectRecord {
     commonDirSha256,
     originUrl,
     rootCommitShas,
-    reboundFrom,
   } = parsed;
 
   if (schemaVersion !== PROJECT_SCHEMA_VERSION) {
@@ -736,37 +516,6 @@ function parseProjectRecord(rawText: string, filePath: string): ProjectRecord {
     );
   }
 
-  if ("reboundFrom" in parsed) {
-    if (!Array.isArray(reboundFrom) || reboundFrom.length === 0) {
-      throw new IdentityError("invalid_project_record", `Invalid reboundFrom in ${filePath}`);
-    }
-    const currentKey = commonDirSha256.slice(0, 16);
-    const seen = new Set<string>();
-    const validatedReboundFrom: string[] = [];
-    for (const key of reboundFrom) {
-      if (
-        typeof key !== "string" ||
-        !PROJECT_KEY_PATTERN.test(key) ||
-        key === currentKey ||
-        seen.has(key)
-      ) {
-        throw new IdentityError("invalid_project_record", `Invalid reboundFrom entry in ${filePath}`);
-      }
-      seen.add(key);
-      validatedReboundFrom.push(key);
-    }
-
-    return {
-      schemaVersion: PROJECT_SCHEMA_VERSION,
-      slug,
-      canonicalCommonDir,
-      commonDirSha256,
-      originUrl,
-      rootCommitShas: [...rootCommitShas],
-      reboundFrom: validatedReboundFrom,
-    };
-  }
-
   return {
     schemaVersion: PROJECT_SCHEMA_VERSION,
     slug,
@@ -777,497 +526,72 @@ function parseProjectRecord(rawText: string, filePath: string): ProjectRecord {
   };
 }
 
-function readProjectRecordFile(filePath: string): ProjectRecord {
-  const rawText = readBoundedUtf8File(
-    filePath,
-    MAX_PROJECT_RECORD_BYTES,
-    "project_record_too_large",
-    "invalid_project_record",
-  );
+function readProjectRecordFile(io: IdentityFsOps, filePath: string): ProjectRecord {
+  const rawText = readBoundedUtf8File(io, filePath);
   return parseProjectRecord(rawText, filePath);
 }
 
-function parseIdentityDecision(
-  rawText: string,
-  filePath: string,
-  expectedNewProjectKey: string,
-): IdentityDecision {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch (err) {
-    throw new IdentityError("invalid_decision", `Malformed JSON in ${filePath}`, { cause: err });
-  }
-
-  if (!isPlainObject(parsed)) {
-    throw new IdentityError("invalid_decision", `${filePath} must be a JSON object`);
-  }
-
-  const keys = Object.keys(parsed);
-  for (const key of keys) {
-    if (!DECISION_REQUIRED_KEYS.has(key)) {
-      throw new IdentityError("invalid_decision", `Unexpected field ${key} in ${filePath}`);
-    }
-  }
-  for (const requiredKey of DECISION_REQUIRED_KEYS) {
-    if (!(requiredKey in parsed)) {
-      throw new IdentityError("invalid_decision", `Missing required field ${requiredKey} in ${filePath}`);
-    }
-  }
-
-  const {
-    schemaVersion,
-    decisionId,
-    choice,
-    oldProjectKey,
-    newProjectKey,
-    oldCanonicalCommonDir,
-    newCanonicalCommonDir,
-    rootCommitShas,
-    originUrl,
-    decidedBy,
-    time,
-  } = parsed;
-
-  if (schemaVersion !== IDENTITY_DECISION_SCHEMA_VERSION) {
-    throw new IdentityError(
-      "invalid_decision",
-      `Unsupported decision schemaVersion in ${filePath}: ${String(schemaVersion)}`,
-    );
-  }
-  if (typeof decisionId !== "string" || decisionId.trim().length === 0) {
-    throw new IdentityError("invalid_decision", `Invalid decisionId in ${filePath}`);
-  }
-  if (choice !== "rebind" && choice !== "new_project") {
-    throw new IdentityError("invalid_decision", `Invalid choice in ${filePath}: ${String(choice)}`);
-  }
-  if (
-    typeof newProjectKey !== "string" ||
-    !PROJECT_KEY_PATTERN.test(newProjectKey) ||
-    newProjectKey !== expectedNewProjectKey
-  ) {
-    throw new IdentityError("invalid_decision", `Invalid newProjectKey in ${filePath}`);
-  }
-  if (
-    typeof newCanonicalCommonDir !== "string" ||
-    newCanonicalCommonDir.length === 0 ||
-    !path.isAbsolute(newCanonicalCommonDir) ||
-    sha256Hex(newCanonicalCommonDir).slice(0, 16) !== newProjectKey
-  ) {
-    throw new IdentityError("invalid_decision", `Invalid newCanonicalCommonDir in ${filePath}`);
-  }
-
-  let validatedOldKey: string | null;
-  let validatedOldDir: string | null;
-
-  if (choice === "rebind") {
-    if (
-      typeof oldProjectKey !== "string" ||
-      !PROJECT_KEY_PATTERN.test(oldProjectKey) ||
-      oldProjectKey === newProjectKey
-    ) {
-      throw new IdentityError("invalid_decision", `Invalid oldProjectKey for rebind in ${filePath}`);
-    }
-    if (
-      typeof oldCanonicalCommonDir !== "string" ||
-      oldCanonicalCommonDir.length === 0 ||
-      !path.isAbsolute(oldCanonicalCommonDir) ||
-      sha256Hex(oldCanonicalCommonDir).slice(0, 16) !== oldProjectKey
-    ) {
-      throw new IdentityError(
-        "invalid_decision",
-        `Invalid oldCanonicalCommonDir for rebind in ${filePath}`,
-      );
-    }
-    validatedOldKey = oldProjectKey;
-    validatedOldDir = oldCanonicalCommonDir;
-  } else {
-    if (oldProjectKey === null && oldCanonicalCommonDir === null) {
-      validatedOldKey = null;
-      validatedOldDir = null;
-    } else if (
-      typeof oldProjectKey === "string" &&
-      PROJECT_KEY_PATTERN.test(oldProjectKey) &&
-      oldProjectKey !== newProjectKey &&
-      typeof oldCanonicalCommonDir === "string" &&
-      oldCanonicalCommonDir.length > 0 &&
-      path.isAbsolute(oldCanonicalCommonDir) &&
-      sha256Hex(oldCanonicalCommonDir).slice(0, 16) === oldProjectKey
-    ) {
-      validatedOldKey = oldProjectKey;
-      validatedOldDir = oldCanonicalCommonDir;
-    } else {
-      throw new IdentityError(
-        "invalid_decision",
-        `Invalid oldProjectKey or oldCanonicalCommonDir for new_project in ${filePath}`,
-      );
-    }
-  }
-
-  if (!isStrictlySortedUniqueCommitShas(rootCommitShas)) {
-    throw new IdentityError("invalid_decision", `Invalid or unsorted rootCommitShas in ${filePath}`);
-  }
-  if (originUrl !== null && (typeof originUrl !== "string" || originUrl.length === 0)) {
-    throw new IdentityError("invalid_decision", `Invalid originUrl in ${filePath}`);
-  }
-  if (typeof decidedBy !== "string" || decidedBy.trim().length === 0) {
-    throw new IdentityError("invalid_decision", `Invalid decidedBy in ${filePath}`);
-  }
-  if (typeof time !== "string" || time.trim().length === 0 || Number.isNaN(Date.parse(time))) {
-    throw new IdentityError("invalid_decision", `Invalid time in ${filePath}`);
-  }
-
-  return {
-    schemaVersion: IDENTITY_DECISION_SCHEMA_VERSION,
-    decisionId,
-    choice,
-    oldProjectKey: validatedOldKey,
-    newProjectKey,
-    oldCanonicalCommonDir: validatedOldDir,
-    newCanonicalCommonDir,
-    rootCommitShas: [...rootCommitShas],
-    originUrl,
-    decidedBy,
-    time,
-  };
-}
-
-function readIdentityDecisionFile(
-  filePath: string,
-  expectedNewProjectKey: string,
-): IdentityDecision {
-  const rawText = readBoundedUtf8File(
-    filePath,
-    MAX_DECISION_RECORD_BYTES,
-    "invalid_decision",
-    "invalid_decision",
-  );
-  return parseIdentityDecision(rawText, filePath, expectedNewProjectKey);
-}
-
-function decisionFilePath(stateBase: string, newProjectKey: string): string {
-  return path.join(stateBase, IDENTITY_DECISIONS_DIR, `${newProjectKey}.json`);
-}
-
-function assertDecisionMatchesLive(
-  decision: IdentityDecision,
-  decisionPath: string,
+function verifyExistingProjectRecord(
+  io: IdentityFsOps,
+  projectPath: string,
+  projectKey: string,
   live: LiveProjectIdentity,
-  applied = false,
-): void {
-  if (
-    decision.newProjectKey !== live.projectKey ||
-    decision.newCanonicalCommonDir !== live.canonicalCommonDir
-  ) {
+): PublishOrVerifyOutcome {
+  const stored = readProjectRecordFile(io, projectPath);
+
+  if (stored.canonicalCommonDir !== live.canonicalCommonDir) {
     throw new IdentityError(
-      "decision_mismatch",
-      `Identity decision at ${decisionPath} names ${decision.newCanonicalCommonDir}, which does not match live repository at ${live.canonicalCommonDir}`,
+      "identity_mismatch",
+      `Stored canonicalCommonDir (${stored.canonicalCommonDir}) does not match live path (${live.canonicalCommonDir})`,
       {
         details: {
-          decisionPath,
-          decisionId: decision.decisionId,
-          newProjectKey: live.projectKey,
-          decisionCanonicalCommonDir: decision.newCanonicalCommonDir,
+          projectKey,
+          storedCanonicalCommonDir: stored.canonicalCommonDir,
           liveCanonicalCommonDir: live.canonicalCommonDir,
         },
       },
     );
   }
-  const rootsMatch = applied
-    ? decision.rootCommitShas.length === 0 ||
-      hasSharedString(decision.rootCommitShas, live.rootCommitShas)
-    : sameStringArray(decision.rootCommitShas, live.rootCommitShas);
-  if (!rootsMatch) {
+
+  if (
+    stored.commonDirSha256.slice(0, 16) !== projectKey ||
+    stored.commonDirSha256 !== live.commonDirSha256
+  ) {
     throw new IdentityError(
-      "decision_mismatch",
-      `Identity decision at ${decisionPath} has rootCommitShas that do not match live repository at ${live.canonicalCommonDir}`,
+      "identity_mismatch",
+      `Stored commonDirSha256 (${stored.commonDirSha256}) does not match directory ${projectKey}`,
       {
         details: {
-          decisionPath,
-          decisionId: decision.decisionId,
-          newProjectKey: live.projectKey,
-          decisionRootCommitShas: [...decision.rootCommitShas],
+          projectKey,
+          storedCommonDirSha256: stored.commonDirSha256,
+          liveCommonDirSha256: live.commonDirSha256,
+        },
+      },
+    );
+  }
+
+  if (
+    stored.rootCommitShas.length === 0 ||
+    !hasSharedString(stored.rootCommitShas, live.rootCommitShas)
+  ) {
+    throw new IdentityError(
+      "identity_mismatch",
+      `Stored rootCommitShas for ${projectKey} share no root commit with live repository`,
+      {
+        details: {
+          projectKey,
+          storedRootCommitShas: [...stored.rootCommitShas],
           liveRootCommitShas: [...live.rootCommitShas],
         },
       },
     );
   }
-}
 
-function isInterruptedRebindDecisionMatch(
-  stored: ProjectRecord,
-  decision: IdentityDecision,
-): boolean {
-  if (
-    decision.choice !== "rebind" ||
-    decision.oldProjectKey === null ||
-    decision.oldCanonicalCommonDir === null
-  ) {
-    return false;
-  }
-  if (sha256Hex(stored.canonicalCommonDir) !== stored.commonDirSha256) {
-    return false;
-  }
-  if (stored.commonDirSha256.slice(0, 16) !== decision.oldProjectKey) {
-    return false;
-  }
-  if (stored.canonicalCommonDir !== decision.oldCanonicalCommonDir) {
-    return false;
-  }
-  if (!sameStringArray(decision.rootCommitShas, stored.rootCommitShas)) {
-    return false;
-  }
-  return true;
-}
-
-function isMatchingInterruptedRebind(
-  stored: ProjectRecord,
-  decision: IdentityDecision,
-  live: LiveProjectIdentity,
-): boolean {
-  if (!isInterruptedRebindDecisionMatch(stored, decision)) {
-    return false;
-  }
-  if (
-    decision.newProjectKey !== live.projectKey ||
-    decision.newCanonicalCommonDir !== live.canonicalCommonDir
-  ) {
-    return false;
-  }
-  if (!sameStringArray(decision.rootCommitShas, live.rootCommitShas)) {
-    return false;
-  }
-  return true;
-}
-
-function finishInterruptedRebind(
-  io: IdentityFsOps,
-  stateRoot: string,
-  stored: ProjectRecord,
-  decision: IdentityDecision,
-): ProjectRecord {
-  if (decision.choice !== "rebind" || decision.oldProjectKey === null) {
-    throw new IdentityError("invalid_decision", "Interrupted rebind requires a rebind decision");
-  }
-  const updatedRecord: ProjectRecord = {
-    schemaVersion: PROJECT_SCHEMA_VERSION,
-    slug: stored.slug,
-    canonicalCommonDir: decision.newCanonicalCommonDir,
-    commonDirSha256: sha256Hex(decision.newCanonicalCommonDir),
-    originUrl: stored.originUrl,
-    rootCommitShas: [...stored.rootCommitShas],
-    reboundFrom: buildReboundFrom(
-      stored.reboundFrom,
-      decision.oldProjectKey,
-      decision.newProjectKey,
-    ),
-  };
-  const payload = serializeRecordJson(
-    updatedRecord,
-    PROJECT_RECORD_FILENAME,
-    MAX_PROJECT_RECORD_BYTES,
-    "project_record_too_large",
-  );
-  writePayloadAtomic(
-    io,
-    stateRoot,
-    PROJECT_RECORD_FILENAME,
-    payload,
-    MAX_PROJECT_RECORD_BYTES,
-    "project_record_too_large",
-  );
-  return updatedRecord;
-}
-
-function findInterruptedRebindDecision(
-  resolvedStateBase: string,
-  folderKey: string,
-  record: ProjectRecord,
-): IdentityDecision | null {
-  const recordKey = record.commonDirSha256.slice(0, 16);
-  const folderDecisionPath = decisionFilePath(resolvedStateBase, folderKey);
-  if (lstatOrNull(folderDecisionPath) === null) {
-    return null;
-  }
-  const folderDecision = readIdentityDecisionFile(folderDecisionPath, folderKey);
-  if (
-    !isInterruptedRebindDecisionMatch(record, folderDecision) ||
-    lstatOrNull(path.join(resolvedStateBase, recordKey)) !== null
-  ) {
-    return null;
-  }
-  return folderDecision;
-}
-
-function readVerifiedFolderRecord(folderStateRoot: string): ProjectRecord {
-  const projectPath = path.join(folderStateRoot, PROJECT_RECORD_FILENAME);
-  const record = readProjectRecordFile(projectPath);
-  if (sha256Hex(record.canonicalCommonDir) !== record.commonDirSha256) {
-    throw new IdentityError(
-      "invalid_project_record",
-      `commonDirSha256 does not match canonicalCommonDir in ${projectPath}`,
-    );
-  }
-  return record;
-}
-
-function readAndFinishFolderIfInterrupted(
-  io: IdentityFsOps,
-  resolvedStateBase: string,
-  folderKey: string,
-  folderStateRoot: string,
-): ProjectRecord {
-  const record = readVerifiedFolderRecord(folderStateRoot);
-  const recordKey = record.commonDirSha256.slice(0, 16);
-  if (recordKey === folderKey) {
-    return record;
-  }
-  const folderDecision = findInterruptedRebindDecision(resolvedStateBase, folderKey, record);
-  if (folderDecision === null) {
-    throw new IdentityError(
-      "invalid_project_record",
-      `project.json key ${recordKey} does not match directory ${folderKey}`,
-    );
-  }
-  return finishInterruptedRebind(io, folderStateRoot, record, folderDecision);
-}
-
-function resolveDecisionSourceRecord(
-  io: IdentityFsOps,
-  resolvedStateBase: string,
-  oldProjectKey: string,
-  oldCanonicalCommonDir: string,
-  rootCommitShas: readonly string[],
-): { readonly stateRoot: string; readonly record: ProjectRecord } | null {
-  const oldStateRoot = path.join(resolvedStateBase, oldProjectKey);
-  const oldDirStat = lstatOrNull(oldStateRoot);
-  if (
-    oldDirStat === null ||
-    !oldDirStat.isDirectory() ||
-    lstatOrNull(path.join(oldStateRoot, PROJECT_RECORD_FILENAME)) === null
-  ) {
-    return null;
-  }
-  const record = readAndFinishFolderIfInterrupted(
-    io,
-    resolvedStateBase,
-    oldProjectKey,
-    oldStateRoot,
-  );
-  if (
-    record.commonDirSha256.slice(0, 16) !== oldProjectKey ||
-    record.canonicalCommonDir !== oldCanonicalCommonDir ||
-    !sameStringArray(record.rootCommitShas, rootCommitShas) ||
-    pathExistsAsDirectory(record.canonicalCommonDir)
-  ) {
-    return null;
-  }
-  return { stateRoot: oldStateRoot, record };
-}
-
-function writeFreshProjectRecord(
-  io: IdentityFsOps,
-  live: LiveProjectIdentity,
-  newStateRoot: string,
-  appliedDecisionId: string | null,
-): OpenProjectResult {
-  const freshRecord: ProjectRecord = {
-    schemaVersion: PROJECT_SCHEMA_VERSION,
-    slug: live.slug,
-    canonicalCommonDir: live.canonicalCommonDir,
-    commonDirSha256: live.commonDirSha256,
-    originUrl: live.originUrl,
-    rootCommitShas: [...live.rootCommitShas],
-  };
-  const payload = serializeRecordJson(
-    freshRecord,
-    PROJECT_RECORD_FILENAME,
-    MAX_PROJECT_RECORD_BYTES,
-    "project_record_too_large",
-  );
-  ensureDirectory(newStateRoot, "invalid_project_record");
-  writePayloadAtomic(
-    io,
-    newStateRoot,
-    PROJECT_RECORD_FILENAME,
-    payload,
-    MAX_PROJECT_RECORD_BYTES,
-    "project_record_too_large",
-  );
   return {
-    projectKey: live.projectKey,
-    stateRoot: newStateRoot,
-    record: cloneProjectRecord(freshRecord),
-    originDrift: null,
-    created: true,
-    rebound: false,
-    appliedDecisionId,
+    record: stored,
+    published: false,
+    originWarning: computeOriginWarning(stored.originUrl, live.originUrl),
   };
-}
-
-function listSiblingProjectRecords(
-  io: IdentityFsOps,
-  resolvedStateBase: string,
-  excludeProjectKey: string,
-): Array<{
-  readonly projectKey: string;
-  readonly stateRoot: string;
-  readonly record: ProjectRecord;
-}> {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(resolvedStateBase, { withFileTypes: true }) as fs.Dirent[];
-  } catch (err) {
-    const code = getErrnoCode(err);
-    if (code === "ENOENT") {
-      return [];
-    }
-    throw err;
-  }
-
-  const siblings: Array<{
-    readonly projectKey: string;
-    readonly stateRoot: string;
-    readonly record: ProjectRecord;
-  }> = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const siblingKey = entry.name;
-    if (!PROJECT_KEY_PATTERN.test(siblingKey) || siblingKey === excludeProjectKey) {
-      continue;
-    }
-
-    const siblingStateRoot = path.join(resolvedStateBase, siblingKey);
-    const siblingProjectPath = path.join(siblingStateRoot, PROJECT_RECORD_FILENAME);
-    if (lstatOrNull(siblingProjectPath) === null) {
-      continue;
-    }
-
-    const record = readAndFinishFolderIfInterrupted(
-      io,
-      resolvedStateBase,
-      siblingKey,
-      siblingStateRoot,
-    );
-    siblings.push({ projectKey: siblingKey, stateRoot: siblingStateRoot, record });
-  }
-
-  return siblings;
-}
-
-function hasStateFolderReboundFrom(
-  io: IdentityFsOps,
-  resolvedStateBase: string,
-  projectKey: string,
-): boolean {
-  for (const sibling of listSiblingProjectRecords(io, resolvedStateBase, projectKey)) {
-    if (sibling.record.reboundFrom?.includes(projectKey)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function scanRelocationCandidates(
@@ -1275,20 +599,48 @@ function scanRelocationCandidates(
   resolvedStateBase: string,
   live: LiveProjectIdentity,
 ): RelocationCandidate[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(resolvedStateBase, { withFileTypes: true });
+  } catch (err) {
+    if (getErrnoCode(err) === "ENOENT") {
+      return [];
+    }
+    throw err;
+  }
+
   const candidates: RelocationCandidate[] = [];
-  for (const { projectKey, stateRoot, record } of listSiblingProjectRecords(
-    io,
-    resolvedStateBase,
-    live.projectKey,
-  )) {
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === live.projectKey) {
+      continue;
+    }
+    if (!PROJECT_KEY_PATTERN.test(entry.name)) {
+      continue;
+    }
+
+    const siblingStateRoot = path.join(resolvedStateBase, entry.name);
+    const siblingProjectPath = path.join(siblingStateRoot, PROJECT_RECORD_FILENAME);
+    if (lstatOrNull(io, siblingProjectPath) === null) {
+      continue;
+    }
+
+    let record: ProjectRecord;
+    try {
+      record = readProjectRecordFile(io, siblingProjectPath);
+    } catch {
+      continue;
+    }
+
+    if (record.rootCommitShas.length === 0) {
+      continue;
+    }
     if (
-      sameStringArray(record.rootCommitShas, live.rootCommitShas) &&
-      record.originUrl === live.originUrl &&
-      !pathExistsAsDirectory(record.canonicalCommonDir)
+      hasSharedString(record.rootCommitShas, live.rootCommitShas) &&
+      lstatOrNull(io, record.canonicalCommonDir) === null
     ) {
       candidates.push({
-        projectKey,
-        stateRoot,
+        projectKey: entry.name,
+        stateRoot: siblingStateRoot,
         slug: record.slug,
         canonicalCommonDir: record.canonicalCommonDir,
         commonDirSha256: record.commonDirSha256,
@@ -1302,12 +654,119 @@ function scanRelocationCandidates(
   return candidates;
 }
 
-export function resolveProjectIdentity(cwd: string): LiveProjectIdentity {
+function publishProjectRecord(
+  io: IdentityFsOps,
+  resolvedStateBase: string,
+  stateRoot: string,
+  projectPath: string,
+  lease: OwnerLease,
+  live: LiveProjectIdentity,
+): PublishOrVerifyOutcome {
+  const candidates = scanRelocationCandidates(io, resolvedStateBase, live);
+  if (candidates.length > 0) {
+    const namedDirs = candidates.map((candidate) => candidate.stateRoot);
+    throw new IdentityError(
+      "identity_relocated",
+      `Clone appears relocated from existing state directory: ${namedDirs.join(", ")}`,
+      {
+        candidates,
+        details: {
+          projectKey: live.projectKey,
+          matchingStateRoots: namedDirs,
+        },
+      },
+    );
+  }
+
+  const record: ProjectRecord = {
+    schemaVersion: PROJECT_SCHEMA_VERSION,
+    slug: live.slug,
+    canonicalCommonDir: live.canonicalCommonDir,
+    commonDirSha256: live.commonDirSha256,
+    originUrl: live.originUrl,
+    rootCommitShas: [...live.rootCommitShas],
+  };
+  const bytes = serializeProjectRecord(record);
+
+  // Check lease right before creating and writing the temporary file.
+  lease.assertValid();
+
+  const tmpName = `.${PROJECT_RECORD_FILENAME}.tmp.${process.pid}.${crypto.randomBytes(6).toString("hex")}`;
+  const tmpPath = path.join(stateRoot, tmpName);
+
+  let fd: number | undefined;
+  let createdTemp = false;
+  let published = false;
+  let linkedExisting = false;
+
+  try {
+    fd = io.openSync(
+      tmpPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600,
+    );
+    createdTemp = true;
+
+    io.writeFileSync(fd, bytes);
+    io.fsyncSync(fd);
+    io.closeSync(fd);
+    fd = undefined;
+
+    // Check lease right before hard-linking project.json.
+    lease.assertValid();
+
+    try {
+      io.linkSync(tmpPath, projectPath);
+      published = true;
+    } catch (err) {
+      if (getErrnoCode(err) === "EEXIST") {
+        linkedExisting = true;
+      } else {
+        throw err;
+      }
+    }
+
+    if (published) {
+      fsyncDir(io, stateRoot);
+    }
+  } finally {
+    if (fd !== undefined) {
+      try {
+        io.closeSync(fd);
+      } catch {
+        // Ignore close error while unwinding.
+      }
+    }
+    if (createdTemp) {
+      try {
+        io.unlinkSync(tmpPath);
+      } catch {
+        // Leftover temp stays ignored and never masks a primary error.
+      }
+    }
+  }
+
+  if (linkedExisting) {
+    return verifyExistingProjectRecord(io, projectPath, lease.projectKey, live);
+  }
+
+  return {
+    record,
+    published: true,
+    originWarning: null,
+  };
+}
+
+export function resolveProjectIdentity(
+  cwd: string,
+  options?: ResolveIdentityOptions,
+): LiveProjectIdentity {
   requireNonEmptyString(cwd, "cwd");
+  const io = resolveFsOps(options?.fs);
 
   let realCwd: string;
   try {
-    realCwd = fs.realpathSync(cwd);
+    realCwd = io.realpathSync(cwd);
   } catch (err) {
     throw new IdentityError("not_git_repo", `Working directory does not exist: ${cwd}`, {
       cause: err,
@@ -1328,7 +787,7 @@ export function resolveProjectIdentity(cwd: string): LiveProjectIdentity {
   const resolvedCommonDir = path.resolve(realCwd, rawCommonDir);
   let canonicalCommonDir: string;
   try {
-    canonicalCommonDir = fs.realpathSync(resolvedCommonDir);
+    canonicalCommonDir = io.realpathSync(resolvedCommonDir);
   } catch (err) {
     throw new IdentityError(
       "not_git_repo",
@@ -1353,620 +812,113 @@ export function resolveProjectIdentity(cwd: string): LiveProjectIdentity {
   };
 }
 
-export function recordIdentityDecision(
-  input: RecordIdentityDecisionInput,
-): RecordIdentityDecisionResult {
-  const cwd = input.cwd;
-  const stateBase = input.stateBase;
-  const choice = input.choice;
-  const decidedBy = input.decidedBy;
-  const requestedOldProjectKey = input.oldProjectKey;
-
-  requireNonEmptyString(cwd, "cwd");
-  requireNonEmptyString(stateBase, "stateBase");
-  requireNonEmptyString(decidedBy, "decidedBy");
-
-  if (choice !== "rebind" && choice !== "new_project") {
-    throw new IdentityError(
-      "invalid_argument",
-      `choice must be "rebind" or "new_project", received ${String(choice)}`,
-    );
-  }
-  if (choice === "rebind") {
-    if (typeof requestedOldProjectKey !== "string" || !PROJECT_KEY_PATTERN.test(requestedOldProjectKey)) {
-      throw new IdentityError(
-        "invalid_argument",
-        "rebind decision requires a valid 16-hex oldProjectKey",
-      );
-    }
-  } else if (requestedOldProjectKey !== undefined && requestedOldProjectKey !== null) {
-    if (typeof requestedOldProjectKey !== "string" || !PROJECT_KEY_PATTERN.test(requestedOldProjectKey)) {
-      throw new IdentityError(
-        "invalid_argument",
-        "oldProjectKey must be a valid 16-hex key or null",
-      );
-    }
-  }
-
-  const resolvedStateBase = path.resolve(stateBase);
-  const live = resolveProjectIdentity(cwd);
-  const newStateRoot = path.join(resolvedStateBase, live.projectKey);
-
-  if (lstatOrNull(newStateRoot) !== null) {
-    throw new IdentityError(
-      "rebind_destination_exists",
-      `Destination project folder already exists: ${newStateRoot}`,
-      { details: { projectKey: live.projectKey, stateRoot: newStateRoot } },
-    );
-  }
-
-  const decisionPath = decisionFilePath(resolvedStateBase, live.projectKey);
-  let existingDecision: IdentityDecision | null = null;
-  if (lstatOrNull(decisionPath) !== null) {
-    existingDecision = readIdentityDecisionFile(decisionPath, live.projectKey);
-    assertDecisionMatchesLive(existingDecision, decisionPath, live);
-    if (
-      existingDecision.choice === "new_project" &&
-      hasStateFolderReboundFrom(DEFAULT_FS_OPS, resolvedStateBase, live.projectKey)
-    ) {
-      throw new IdentityError(
-        "decision_mismatch",
-        `Existing identity decision at ${decisionPath} was already used for a new project that has moved on`,
-        {
-          details: {
-            decisionPath,
-            decisionId: existingDecision.decisionId,
-            newProjectKey: live.projectKey,
-          },
-        },
-      );
-    }
-    if (existingDecision.oldProjectKey !== null && existingDecision.oldCanonicalCommonDir !== null) {
-      if (
-        requestedOldProjectKey !== undefined &&
-        requestedOldProjectKey !== null &&
-        requestedOldProjectKey !== existingDecision.oldProjectKey
-      ) {
-        throw new IdentityError(
-          "decision_mismatch",
-          `Existing identity decision at ${decisionPath} names ${existingDecision.oldProjectKey} -> ${existingDecision.newProjectKey}, not ${requestedOldProjectKey} -> ${live.projectKey}`,
-          {
-            details: {
-              decisionPath,
-              decisionId: existingDecision.decisionId,
-              existingOldProjectKey: existingDecision.oldProjectKey,
-              requestedOldProjectKey,
-              newProjectKey: live.projectKey,
-            },
-          },
-        );
-      }
-      if (
-        resolveDecisionSourceRecord(
-          DEFAULT_FS_OPS,
-          resolvedStateBase,
-          existingDecision.oldProjectKey,
-          existingDecision.oldCanonicalCommonDir,
-          existingDecision.rootCommitShas,
-        ) === null
-      ) {
-        throw new IdentityError(
-          "decision_mismatch",
-          `Existing identity decision at ${decisionPath} names ${existingDecision.oldProjectKey} -> ${existingDecision.newProjectKey}, which does not match the current move`,
-          {
-            details: {
-              decisionPath,
-              decisionId: existingDecision.decisionId,
-              existingOldProjectKey: existingDecision.oldProjectKey,
-              newProjectKey: live.projectKey,
-            },
-          },
-        );
-      }
-    }
-  }
-
-  const candidates = scanRelocationCandidates(DEFAULT_FS_OPS, resolvedStateBase, live);
-
-  let oldProjectKey: string | null = null;
-  let oldCanonicalCommonDir: string | null = null;
-
-  if (choice === "rebind" || (requestedOldProjectKey !== undefined && requestedOldProjectKey !== null)) {
-    const requestedKey = requestedOldProjectKey as string;
-    const matched = candidates.find((candidate) => candidate.projectKey === requestedKey);
-    if (matched !== undefined) {
-      oldProjectKey = matched.projectKey;
-      oldCanonicalCommonDir = matched.canonicalCommonDir;
-    } else if (
-      existingDecision !== null &&
-      existingDecision.oldProjectKey === requestedKey &&
-      existingDecision.oldCanonicalCommonDir !== null
-    ) {
-      oldProjectKey = existingDecision.oldProjectKey;
-      oldCanonicalCommonDir = existingDecision.oldCanonicalCommonDir;
-    } else {
-      throw new IdentityError(
-        "decision_candidate_not_found",
-        `oldProjectKey ${requestedKey} is not a relocation candidate for ${live.projectKey}`,
-        { candidates, details: { requestedOldProjectKey: requestedKey } },
-      );
-    }
-  }
-
-  const decision: IdentityDecision = {
-    schemaVersion: IDENTITY_DECISION_SCHEMA_VERSION,
-    decisionId: crypto.randomUUID(),
-    choice,
-    oldProjectKey,
-    newProjectKey: live.projectKey,
-    oldCanonicalCommonDir,
-    newCanonicalCommonDir: live.canonicalCommonDir,
-    rootCommitShas: [...live.rootCommitShas],
-    originUrl: live.originUrl,
-    decidedBy: decidedBy.trim(),
-    time: new Date().toISOString(),
-  };
-
-  const decisionsDir = path.join(resolvedStateBase, IDENTITY_DECISIONS_DIR);
-  const fileName = `${live.projectKey}.json`;
-  const payload = `${JSON.stringify(decision, null, 2)}\n`;
-  const writtenPath = writePayloadExclusive(
-    decisionsDir,
-    fileName,
-    payload,
-    MAX_DECISION_RECORD_BYTES,
-    "invalid_decision",
-  );
-
-  return {
-    decisionPath: writtenPath,
-    decision: cloneIdentityDecision(decision),
-  };
-}
-
-function isProjectRecordTempLeftover(dirPath: string, entryName: string): boolean {
-  if (!PROJECT_RECORD_TMP_PATTERN.test(entryName)) {
-    return false;
-  }
-  const stat = lstatOrNull(path.join(dirPath, entryName));
-  return stat !== null && stat.isFile();
-}
-
-function cleanInterruptedFirstOpenDir(
-  resolvedStateBase: string,
-  stateRoot: string,
-): boolean {
-  let entries: string[];
-  try {
-    entries = fs.readdirSync(stateRoot);
-  } catch (err) {
-    if (getErrnoCode(err) === "ENOENT") {
-      return true;
-    }
-    throw err;
-  }
-
-  for (const entryName of entries) {
-    if (!isProjectRecordTempLeftover(stateRoot, entryName)) {
-      return false;
-    }
-  }
-
-  for (const entryName of entries) {
-    try {
-      fs.unlinkSync(path.join(stateRoot, entryName));
-    } catch (err) {
-      if (getErrnoCode(err) !== "ENOENT") {
-        throw err;
-      }
-    }
-  }
-
-  try {
-    fs.rmdirSync(stateRoot);
-  } catch (err) {
-    const code = getErrnoCode(err);
-    if (code === "ENOENT") {
-      return true;
-    }
-    if (code === "ENOTEMPTY" || code === "EEXIST") {
-      return false;
-    }
-    throw err;
-  }
-
-  fsyncDir(resolvedStateBase);
-  return true;
-}
-
-function openProjectAttempt(
-  io: IdentityFsOps,
-  resolvedStateBase: string,
-  live: LiveProjectIdentity,
-  canRetryLostRebindRace: boolean,
-): OpenProjectResult {
-  const newStateRoot = path.join(resolvedStateBase, live.projectKey);
-  const newProjectJsonPath = path.join(newStateRoot, PROJECT_RECORD_FILENAME);
-  const decisionPath = decisionFilePath(resolvedStateBase, live.projectKey);
-
-  const decision =
-    lstatOrNull(decisionPath) !== null
-      ? readIdentityDecisionFile(decisionPath, live.projectKey)
-      : null;
-
-  let destStat = lstatOrNull(newStateRoot);
-  const decisionOldStateRoot =
-    destStat !== null &&
-    decision !== null &&
-    decision.choice === "rebind" &&
-    decision.oldProjectKey !== null
-      ? path.join(resolvedStateBase, decision.oldProjectKey)
-      : null;
-  const oldStillExists = decisionOldStateRoot !== null && lstatOrNull(decisionOldStateRoot) !== null;
-
-  if (destStat !== null) {
-    if (!destStat.isDirectory()) {
-      if (decision !== null) {
-        assertDecisionMatchesLive(decision, decisionPath, live, false);
-      }
-      if (oldStillExists) {
-        throw new IdentityError(
-          "rebind_destination_exists",
-          `Rebind destination already exists: ${newStateRoot}`,
-          { details: { projectKey: live.projectKey, stateRoot: newStateRoot } },
-        );
-      }
-      throw new IdentityError(
-        "invalid_project_record",
-        `Expected project directory at ${newStateRoot}`,
-      );
-    }
-
-    if (lstatOrNull(newProjectJsonPath) === null) {
-      if (decision !== null) {
-        assertDecisionMatchesLive(decision, decisionPath, live, false);
-      }
-      if (oldStillExists) {
-        throw new IdentityError(
-          "rebind_destination_exists",
-          `Rebind destination folder already exists: ${newStateRoot}`,
-          { details: { projectKey: live.projectKey, stateRoot: newStateRoot } },
-        );
-      }
-      if (
-        (decision === null || decision.choice === "new_project") &&
-        cleanInterruptedFirstOpenDir(resolvedStateBase, newStateRoot)
-      ) {
-        destStat = null;
-      } else {
-        if (canRetryLostRebindRace && lstatOrNull(newProjectJsonPath) !== null) {
-          return openProjectAttempt(io, resolvedStateBase, live, false);
-        }
-        throw new IdentityError(
-          "invalid_project_record",
-          `Project folder exists without ${PROJECT_RECORD_FILENAME}: ${newStateRoot}`,
-        );
-      }
-    }
-  }
-
-  if (destStat !== null) {
-    let stored: ProjectRecord;
-    try {
-      stored = readProjectRecordFile(newProjectJsonPath);
-    } catch (err) {
-      if (decision !== null) {
-        assertDecisionMatchesLive(decision, decisionPath, live, false);
-      }
-      throw err;
-    }
-
-    if (stored.canonicalCommonDir === live.canonicalCommonDir) {
-      if (stored.commonDirSha256 !== live.commonDirSha256) {
-        if (decision !== null) {
-          assertDecisionMatchesLive(decision, decisionPath, live, false);
-        }
-        throw new IdentityError(
-          "identity_mismatch",
-          `Stored commonDirSha256 does not match live identity for ${live.projectKey}`,
-          {
-            details: {
-              projectKey: live.projectKey,
-              storedCommonDirSha256: stored.commonDirSha256,
-              liveCommonDirSha256: live.commonDirSha256,
-            },
-          },
-        );
-      }
-
-      if (decision !== null) {
-        if (decision.choice === "rebind") {
-          const rebindCompleted =
-            decision.oldProjectKey !== null &&
-            stored.reboundFrom !== undefined &&
-            stored.reboundFrom.includes(decision.oldProjectKey) &&
-            sameStringArray(stored.rootCommitShas, decision.rootCommitShas);
-          if (!rebindCompleted) {
-            assertDecisionMatchesLive(decision, decisionPath, live, false);
-            throw new IdentityError(
-              "rebind_destination_exists",
-              `Destination ${live.projectKey} already exists and was not rebound from ${String(decision.oldProjectKey)}`,
-              { details: { oldProjectKey: decision.oldProjectKey, newProjectKey: live.projectKey } },
-            );
-          }
-        }
-        assertDecisionMatchesLive(decision, decisionPath, live, true);
-      }
-
-      return {
-        projectKey: live.projectKey,
-        stateRoot: newStateRoot,
-        record: cloneProjectRecord(stored),
-        originDrift: computeOriginDrift(stored.originUrl, live.originUrl),
-        created: false,
-        rebound: false,
-        appliedDecisionId: null,
-      };
-    }
-
-    if (decision !== null) {
-      assertDecisionMatchesLive(decision, decisionPath, live, false);
-    }
-
-    if (decision !== null && decision.choice === "rebind") {
-      if (oldStillExists) {
-        throw new IdentityError(
-          "rebind_destination_exists",
-          `Rebind destination already exists while source ${decision.oldProjectKey} still exists`,
-          { details: { oldProjectKey: decision.oldProjectKey, newProjectKey: live.projectKey } },
-        );
-      }
-      if (isMatchingInterruptedRebind(stored, decision, live)) {
-        fsyncDir(resolvedStateBase);
-        const updatedRecord = finishInterruptedRebind(io, newStateRoot, stored, decision);
-        return {
-          projectKey: live.projectKey,
-          stateRoot: newStateRoot,
-          record: cloneProjectRecord(updatedRecord),
-          originDrift: computeOriginDrift(updatedRecord.originUrl, live.originUrl),
-          created: false,
-          rebound: true,
-          appliedDecisionId: decision.decisionId,
-        };
-      }
-    }
-
-    throw new IdentityError(
-      "identity_mismatch",
-      `Stored canonicalCommonDir (${stored.canonicalCommonDir}) does not match live path (${live.canonicalCommonDir})`,
-      {
-        details: {
-          projectKey: live.projectKey,
-          storedCanonicalCommonDir: stored.canonicalCommonDir,
-          liveCanonicalCommonDir: live.canonicalCommonDir,
-        },
-      },
-    );
-  }
-
-  if (decision !== null) {
-    assertDecisionMatchesLive(decision, decisionPath, live, false);
-  }
-
-  if (decision === null) {
-    const candidates = scanRelocationCandidates(io, resolvedStateBase, live);
-    if (candidates.length > 0) {
-      throw new IdentityError(
-        "identity_relocated",
-        `Repository at ${live.canonicalCommonDir} matches ${candidates.length} missing project(s); record a rebind or new_project decision before opening`,
-        {
-          candidates,
-          details: {
-            newProjectKey: live.projectKey,
-            newCanonicalCommonDir: live.canonicalCommonDir,
-          },
-        },
-      );
-    }
-
-    return writeFreshProjectRecord(io, live, newStateRoot, null);
-  }
-
-  if (decision.choice === "new_project") {
-    if (hasStateFolderReboundFrom(io, resolvedStateBase, live.projectKey)) {
-      throw new IdentityError(
-        "decision_mismatch",
-        `Identity decision at ${decisionPath} was already used for a new project that has moved on`,
-        {
-          details: {
-            decisionPath,
-            decisionId: decision.decisionId,
-            newProjectKey: live.projectKey,
-          },
-        },
-      );
-    }
-    if (decision.oldProjectKey !== null && decision.oldCanonicalCommonDir !== null) {
-      const oldSource = resolveDecisionSourceRecord(
-        io,
-        resolvedStateBase,
-        decision.oldProjectKey,
-        decision.oldCanonicalCommonDir,
-        decision.rootCommitShas,
-      );
-      if (oldSource === null) {
-        throw new IdentityError(
-          "decision_mismatch",
-          `Identity decision at ${decisionPath} names ${decision.oldProjectKey} -> ${decision.newProjectKey}, which does not match the current move`,
-          {
-            details: {
-              decisionPath,
-              decisionId: decision.decisionId,
-              oldProjectKey: decision.oldProjectKey,
-              newProjectKey: live.projectKey,
-            },
-          },
-        );
-      }
-    }
-
-    return writeFreshProjectRecord(io, live, newStateRoot, decision.decisionId);
-  }
-
-  // decision.choice === "rebind"
-  const oldProjectKey = decision.oldProjectKey;
-  const oldCanonicalCommonDir = decision.oldCanonicalCommonDir;
-  if (oldProjectKey === null || oldCanonicalCommonDir === null) {
-    throw new IdentityError("invalid_decision", `Rebind decision at ${decisionPath} is missing oldProjectKey`);
-  }
-
-  let oldSource: { readonly stateRoot: string; readonly record: ProjectRecord } | null;
-  try {
-    oldSource = resolveDecisionSourceRecord(
-      io,
-      resolvedStateBase,
-      oldProjectKey,
-      oldCanonicalCommonDir,
-      decision.rootCommitShas,
-    );
-  } catch (err) {
-    const code = getErrnoCode(err);
-    if (code === "ENOENT" || code === "ENOTDIR") {
-      if (canRetryLostRebindRace) {
-        return openProjectAttempt(io, resolvedStateBase, live, false);
-      }
-      throw new IdentityError(
-        "decision_mismatch",
-        `Identity decision at ${decisionPath} names ${oldProjectKey} -> ${decision.newProjectKey}, whose source folder disappeared during rebind`,
-        {
-          details: {
-            decisionPath,
-            decisionId: decision.decisionId,
-            oldProjectKey,
-            newProjectKey: live.projectKey,
-          },
-          cause: err,
-        },
-      );
-    }
-    throw err;
-  }
-
-  if (oldSource === null) {
-    if (canRetryLostRebindRace && lstatOrNull(newStateRoot) !== null) {
-      return openProjectAttempt(io, resolvedStateBase, live, false);
-    }
-    throw new IdentityError(
-      "decision_mismatch",
-      `Identity decision at ${decisionPath} names ${oldProjectKey} -> ${decision.newProjectKey}, which does not match the current move`,
-      {
-        details: {
-          decisionPath,
-          decisionId: decision.decisionId,
-          oldProjectKey,
-          newProjectKey: live.projectKey,
-        },
-      },
-    );
-  }
-
-  const oldStateRoot = oldSource.stateRoot;
-  const oldRecord = oldSource.record;
-  const updatedRecord: ProjectRecord = {
-    schemaVersion: PROJECT_SCHEMA_VERSION,
-    slug: live.slug,
-    canonicalCommonDir: live.canonicalCommonDir,
-    commonDirSha256: live.commonDirSha256,
-    originUrl: oldRecord.originUrl,
-    rootCommitShas: [...oldRecord.rootCommitShas],
-    reboundFrom: buildReboundFrom(oldRecord.reboundFrom, oldProjectKey, live.projectKey),
-  };
-
-  // Validate size BEFORE renaming so an oversized record never mutates disk.
-  const payload = serializeRecordJson(
-    updatedRecord,
-    PROJECT_RECORD_FILENAME,
-    MAX_PROJECT_RECORD_BYTES,
-    "project_record_too_large",
-  );
-
-  // Step 1: Move old project folder to new key in one rename; no file inside is rewritten.
-  // An empty directory appearing between the existence check and rename(2) is atomically
-  // replaced by POSIX rename(2); it holds no files or state, so replacing it loses nothing.
-  try {
-    io.renameSync(oldStateRoot, newStateRoot);
-  } catch (err) {
-    const code = getErrnoCode(err);
-    if (
-      code === "ENOENT" ||
-      code === "ENOTEMPTY" ||
-      code === "EEXIST" ||
-      code === "ENOTDIR" ||
-      code === "EISDIR"
-    ) {
-      if (canRetryLostRebindRace) {
-        return openProjectAttempt(io, resolvedStateBase, live, false);
-      }
-      if (code === "ENOENT") {
-        throw new IdentityError(
-          "decision_mismatch",
-          `Identity decision at ${decisionPath} names ${oldProjectKey} -> ${decision.newProjectKey}, whose source folder disappeared before rename`,
-          {
-            details: {
-              decisionPath,
-              decisionId: decision.decisionId,
-              oldProjectKey,
-              newProjectKey: live.projectKey,
-            },
-            cause: err,
-          },
-        );
-      }
-      throw new IdentityError(
-        "rebind_destination_exists",
-        `Rebind destination already exists with content: ${newStateRoot}`,
-        {
-          details: { oldProjectKey, newProjectKey: live.projectKey, stateRoot: newStateRoot },
-          cause: err,
-        },
-      );
-    }
-    throw err;
-  }
-
-  fsyncDir(resolvedStateBase);
-
-  // Step 2: Atomically rewrite project.json with the new path and reboundFrom list.
-  writePayloadAtomic(
-    io,
-    newStateRoot,
-    PROJECT_RECORD_FILENAME,
-    payload,
-    MAX_PROJECT_RECORD_BYTES,
-    "project_record_too_large",
-  );
-
-  return {
-    projectKey: live.projectKey,
-    stateRoot: newStateRoot,
-    record: cloneProjectRecord(updatedRecord),
-    originDrift: computeOriginDrift(updatedRecord.originUrl, live.originUrl),
-    created: false,
-    rebound: true,
-    appliedDecisionId: decision.decisionId,
-  };
-}
-
-export function openProject(
+export async function claimProject(
   cwd: string,
   stateBase: string,
-  options?: IdentityOperationOptions,
-): OpenProjectResult {
+  options?: ClaimProjectOptions,
+): Promise<ClaimProjectResult> {
   requireNonEmptyString(cwd, "cwd");
   requireNonEmptyString(stateBase, "stateBase");
 
   const io = resolveFsOps(options?.fs);
   const resolvedStateBase = path.resolve(stateBase);
-  const live = resolveProjectIdentity(cwd);
-  return openProjectAttempt(io, resolvedStateBase, live, true);
+
+  // Step 1: Read the repository without writing anything.
+  const initialLive = resolveProjectIdentity(cwd, { fs: io });
+
+  // Step 2: Refuse unborn repositories before any write or lease acquisition.
+  if (initialLive.rootCommitShas.length === 0) {
+    throw new IdentityError(
+      "identity_unborn",
+      `Repository at ${initialLive.canonicalCommonDir} has no commit on any ref`,
+      {
+        details: {
+          projectKey: initialLive.projectKey,
+          canonicalCommonDir: initialLive.canonicalCommonDir,
+        },
+      },
+    );
+  }
+
+  // Step 3: Acquire the owner lease; the lease creates the project directory.
+  const stateRoot = path.join(resolvedStateBase, initialLive.projectKey);
+  const lease = await acquireLease({
+    projectKey: initialLive.projectKey,
+    stateRoot,
+    ...(options?.acquireTimeoutMs !== undefined
+      ? { acquireTimeoutMs: options.acquireTimeoutMs }
+      : {}),
+    ...(options?.releaseTimeoutMs !== undefined
+      ? { releaseTimeoutMs: options.releaseTimeoutMs }
+      : {}),
+  });
+
+  try {
+    const projectPath = path.join(stateRoot, PROJECT_RECORD_FILENAME);
+    const { writeResult } = await lease.enqueue<PublishOrVerifyOutcome>({
+      write: () => {
+        // Step 4: Re-read the repository inside the lease queue.
+        const live = resolveProjectIdentity(cwd, { fs: io });
+        if (
+          live.projectKey !== lease.projectKey ||
+          live.canonicalCommonDir !== initialLive.canonicalCommonDir
+        ) {
+          throw new IdentityError(
+            "identity_mismatch",
+            `Repository key changed after lease acquisition: acquired ${lease.projectKey}, live ${live.projectKey}`,
+            {
+              details: {
+                acquiredProjectKey: lease.projectKey,
+                liveProjectKey: live.projectKey,
+                acquiredCanonicalCommonDir: initialLive.canonicalCommonDir,
+                liveCanonicalCommonDir: live.canonicalCommonDir,
+              },
+            },
+          );
+        }
+        if (live.rootCommitShas.length === 0) {
+          throw new IdentityError(
+            "identity_unborn",
+            `Repository at ${live.canonicalCommonDir} has no commit on any ref`,
+            {
+              details: {
+                projectKey: live.projectKey,
+                canonicalCommonDir: live.canonicalCommonDir,
+              },
+            },
+          );
+        }
+
+        // Step 5: Publish project.json once, or verify an existing record.
+        const outcome =
+          lstatOrNull(io, projectPath) !== null
+            ? verifyExistingProjectRecord(io, projectPath, lease.projectKey, live)
+            : publishProjectRecord(io, resolvedStateBase, stateRoot, projectPath, lease, live);
+
+        // Step 7: Final lease check after publication or verification.
+        lease.assertValid();
+        return outcome;
+      },
+    });
+
+    // Guard against asynchronous revocation between queue completion and return.
+    lease.assertValid();
+
+    return {
+      projectKey: lease.projectKey,
+      stateRoot: lease.stateRoot,
+      lease,
+      record: cloneProjectRecord(writeResult.record),
+      published: writeResult.published,
+      originWarning: writeResult.originWarning,
+    };
+  } catch (err) {
+    // Step 6: Release the lease after the queued step ends, never from inside it.
+    try {
+      await lease.release();
+    } catch {
+      // Preserve the original refusal error while ensuring the lease is released.
+    }
+    throw err;
+  }
 }
