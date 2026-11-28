@@ -860,7 +860,7 @@ export function createHcClient({
         errorKind: null,
       };
     }
-    recordAuthorizedTerminal({ address: parsedStdout.address, name: parsedStdout.name ?? name });
+    recordAuthorizedTerminal(parsedStdout);
     return {
       ok: true,
       exitCode: 0,

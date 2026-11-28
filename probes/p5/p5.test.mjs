@@ -2479,4 +2479,240 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
 
     assertTripwireNeverRan();
   });
+
+  test("r16a-unnamed-run-origin: unnamed short run response refuses address commands until validated get by name authorizes it", async () => {
+    const sb = createSandbox("r16a-unnamed-run");
+    const gateFifo = makeGateFifo(sb.workDir);
+    const wrapperPath = path.join(sb.workDir, "unnamed-run-hc");
+    fs.writeFileSync(
+      wrapperPath,
+      `#!/usr/bin/env bun
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+const res = spawnSync(${JSON.stringify(FAKE_HC_PATH)}, args, { encoding: "utf8", env: process.env });
+if (res.stderr) process.stderr.write(res.stderr);
+if (args[0] === "run" && res.status === 0) {
+  const parsed = JSON.parse(res.stdout);
+  process.stdout.write(JSON.stringify({ address: parsed.address, state: parsed.state }) + "\\n");
+} else if (res.stdout) {
+  process.stdout.write(res.stdout);
+}
+process.exit(res.status ?? 1);
+`,
+      { mode: 0o755 },
+    );
+
+    const termName = `${sb.prefix}-u1`;
+    const hc = createHcClient({ hcBin: wrapperPath, prefix: sb.prefix, env: sb.env });
+    try {
+      const runRes = await hc.run({
+        name: termName,
+        cwd: sb.workDir,
+        argv: ["sh", "-c", `IFS= read -r _ < '${gateFifo}' || true`],
+      });
+      expect(runRes.ok).toBe(true);
+      expect(runRes.result).toEqual({ address: "t1a", state: "live" });
+      expect("name" in runRes.result).toBe(false);
+
+      const addr = runRes.result.address;
+      const callsAfterRun = readFakeHcCalls(sb.fakeHcStateDir).length;
+      expect(callsAfterRun).toBe(1);
+
+      // Before any validated get/ls by prefixed name, every command targeting addr must be refused without spawning hc.
+      let preLookupErr = null;
+      try {
+        await hc.get(addr);
+      } catch (err) {
+        preLookupErr = err;
+      }
+      expect(
+        preLookupErr,
+        "unnamed run response must not authorise its address before name lookup",
+      ).toBeInstanceOf(HcBoundaryError);
+      expect(preLookupErr.code).toBe("prefix_violation");
+
+      for (const action of [
+        () => hc.read(addr, { lines: 0 }),
+        () => hc.wait(addr, { timeoutSecs: 1 }),
+        () => hc.kill(addr),
+        () => hc.rm(addr),
+      ]) {
+        let err = null;
+        try {
+          await action();
+        } catch (caught) {
+          err = caught;
+        }
+        expect(err).toBeInstanceOf(HcBoundaryError);
+        expect(err.code).toBe("prefix_violation");
+      }
+      expect(
+        readFakeHcCalls(sb.fakeHcStateDir).length,
+        "refused address commands must not start any hc process",
+      ).toBe(callsAfterRun);
+
+      // Once a validated get by prefixed name returns the same address, all address commands work.
+      const byName = await hc.get(termName);
+      expect(byName.ok).toBe(true);
+      expect(byName.terminal.address).toBe(addr);
+      expect(byName.terminal.name).toBe(termName);
+
+      expect((await hc.get(addr)).ok).toBe(true);
+      expect((await hc.read(addr, { lines: 0 })).ok).toBe(true);
+      expect((await hc.kill(addr)).ok).toBe(true);
+      const waitRes = await hc.wait(addr, { timeoutSecs: 5 });
+      expect(waitRes.ok).toBe(true);
+      expect(waitRes.result.ended).toBe(true);
+      expect((await hc.rm(addr)).ok).toBe(true);
+      const afterRm = await hc.get(addr);
+      expect(afterRm.ok).toBe(false);
+      expect(afterRm.notFound).toBe(true);
+      expect(afterRm.exitCode).toBe(3);
+    } finally {
+      releaseGateFifo(gateFifo);
+    }
+
+    assertTripwireNeverRan();
+  });
+
+  test("r16b-unnamed-run-mismatch: unnamed short run response followed by name lookup returning another address ends uncertain and escalates without relaunch", async () => {
+    const sb = createSandbox("r16b-unnamed-mismatch");
+    const wrapperPath = path.join(sb.workDir, "unnamed-run-hc");
+    fs.writeFileSync(
+      wrapperPath,
+      `#!/usr/bin/env bun
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+const res = spawnSync(${JSON.stringify(FAKE_HC_PATH)}, args, { encoding: "utf8", env: process.env });
+if (res.stderr) process.stderr.write(res.stderr);
+if (args[0] === "run" && res.status === 0) {
+  const parsed = JSON.parse(res.stdout);
+  process.stdout.write(JSON.stringify({ address: parsed.address, state: parsed.state }) + "\\n");
+} else if (res.stdout) {
+  process.stdout.write(res.stdout);
+}
+process.exit(res.status ?? 1);
+`,
+      { mode: 0o755 },
+    );
+
+    const issue = "7";
+    const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
+    const startRes = await runTracerProcess(
+      [
+        "start",
+        "--hc-bin",
+        wrapperPath,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+        "--cwd",
+        sb.workDir,
+        "--expected-lines",
+        "10",
+      ],
+      sb.env,
+    );
+    expect(startRes.exitCode).toBe(0);
+    const startPayload = JSON.parse(startRes.stdout);
+    expect(startPayload.outcome).toBe("launched");
+    expect(startPayload.address).toBe("t1a");
+    expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
+
+    // Finish and remove t1a, then launch replacement t1b under the exact same name so lookup by name returns another address.
+    expect(runFakeHcDirect(["wait", "t1a", "--timeout", "5", "--json"], sb.env).exitCode).toBe(0);
+    expect(runFakeHcDirect(["rm", "t1a", "--json"], sb.env).exitCode).toBe(0);
+    const replRun = runFakeHcDirect(
+      [
+        "run",
+        "--bg",
+        "--json",
+        "--no-parent",
+        "--no-notify",
+        "--outlive-parent",
+        "--name",
+        expectedName,
+        "--cwd",
+        sb.workDir,
+        "--",
+        ...buildStandInWorkerArgv({ attemptId: "a1", expectedLines: 10 }),
+      ],
+      sb.env,
+    );
+    expect(replRun.exitCode).toBe(0);
+    expect(JSON.parse(replRun.stdout).address).toBe("t1b");
+    expect(runFakeHcDirect(["wait", "t1b", "--timeout", "5", "--json"], sb.env).exitCode).toBe(0);
+
+    const ticketDir = getTicketDir(sb.stateRoot, issue);
+    const artifactsBefore = listDirSorted(path.join(ticketDir, "artifacts"));
+    const callsBeforeRecover = readFakeHcCalls(sb.fakeHcStateDir).length;
+    const runCountBeforeRecover = readFakeHcState(sb.fakeHcStateDir).runCount;
+    expect(runCountBeforeRecover).toBe(2);
+
+    const recRes = await runTracerProcess(
+      [
+        "recover",
+        "--hc-bin",
+        wrapperPath,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+      ],
+      sb.env,
+    );
+    expect(recRes.exitCode).toBe(3);
+    const recPayload = JSON.parse(recRes.stdout);
+    expect(recPayload.outcome).toBe("uncertain");
+    expect(recPayload.escalated).toBe(true);
+    expect(recPayload.reason).toBe("terminal_address_mismatch");
+    expect(recPayload.expectedAddress).toBe("t1a");
+    expect(recPayload.observedAddress).toBe("t1b");
+    expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(runCountBeforeRecover);
+
+    const recoverCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBeforeRecover);
+    expect(recoverCalls.map((c) => c.argv)).toEqual([["get", expectedName, "--json"]]);
+    expect(listDirSorted(path.join(ticketDir, "artifacts"))).toEqual(artifactsBefore);
+
+    const folded = foldCommitLog(ticketDir);
+    expect(folded.phase).toBe("escalated");
+    expect(folded.openAttempt?.state).toBe("uncertain");
+    expect(folded.records.map((r) => r.event)).toEqual([
+      "brief_committed",
+      "launch_intent",
+      "launch_receipt",
+      "reconcile_unresolved",
+    ]);
+
+    const secondRec = await runTracerProcess(
+      [
+        "recover",
+        "--hc-bin",
+        wrapperPath,
+        "--state-root",
+        sb.stateRoot,
+        "--project-key",
+        sb.projectKey,
+        "--issue",
+        issue,
+        "--prefix",
+        sb.prefix,
+      ],
+      sb.env,
+    );
+    expect(secondRec.exitCode).toBe(0);
+    expect(JSON.parse(secondRec.stdout).alreadyEscalated).toBe(true);
+    expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(runCountBeforeRecover);
+
+    assertTripwireNeverRan();
+  });
 });

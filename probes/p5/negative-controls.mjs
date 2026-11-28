@@ -344,6 +344,21 @@ const ANY_ADDRESS_TOKEN_RE = /(?:^|[^A-Za-z0-9._/-])(?:[a-z0-9._-]+\\/)?t[0-9]+(
     expectedErrorRe:
       /error: letter-bearing address from validated run must not be refused[\s\S]*HcBoundaryError: hc get refused target "t1a"[\s\S]*code: "prefix_violation"[\s\S]*error: letter-bearing address in stderr message must settle uncertain[\s\S]*Expected:\s*"uncertain"[\s\S]*Received:\s*"not_delivered"/,
   },
+  {
+    id: "ctrl-r16",
+    check: "r16a-unnamed-run-origin",
+    description: "fall back to requested name when authorizing address from unnamed run response",
+    testNameFilter: "r16a-unnamed-run-origin:",
+    mutate(p5Dir) {
+      replaceExact(
+        path.join(p5Dir, "hc-boundary.mjs"),
+        `    recordAuthorizedTerminal(parsedStdout);`,
+        `    recordAuthorizedTerminal({ address: parsedStdout.address, name: parsedStdout.name ?? name });`,
+      );
+    },
+    expectedErrorRe:
+      /error: unnamed run response must not authorise its address before name lookup[\s\S]*Expected constructor:\s*\[class HcBoundaryError[\s\S]*Received value:\s*null/,
+  },
 ];
 
 let passed = 0;
