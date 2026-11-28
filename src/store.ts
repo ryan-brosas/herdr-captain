@@ -280,8 +280,9 @@ function isValidIntentRefShape(v: unknown): v is IntentRef {
 }
 
 function isValidEvidenceRefShape(v: unknown): v is EvidenceRef {
-  return isPlainObject(v) && isNonEmptyString(v.kind) &&
-    typeof v.sha256 === "string" && SHA256_HEX_RE.test(v.sha256) &&
+  if (!isPlainObject(v)) return false;
+  const sha256 = v.sha256;
+  return isNonEmptyString(v.kind) && typeof sha256 === "string" && SHA256_HEX_RE.test(sha256) &&
     isNaturalSafeInt(v.bytes) && typeof v.truncated === "boolean";
 }
 
@@ -358,6 +359,18 @@ function checkDirState(io: StoreFsOps, dirPath: string): "present" | "absent" | 
   }
 }
 
+function checkDirChainState(
+  io: StoreFsOps,
+  dirs: readonly string[],
+): { readonly status: "present" } | { readonly status: "absent" } | { readonly status: "unreadable"; readonly dirPath: string } {
+  for (const dirPath of dirs) {
+    const state = checkDirState(io, dirPath);
+    if (state === "absent") return { status: "absent" };
+    if (state === "unreadable") return { status: "unreadable", dirPath };
+  }
+  return { status: "present" };
+}
+
 function ensureDirChain(io: StoreFsOps, lease: OwnerLease, baseDir: string, segments: readonly string[]): string {
   let current = path.resolve(baseDir);
   for (const segment of segments) {
@@ -426,7 +439,10 @@ type ReadRegularResult =
   | { readonly status: "unreadable"; readonly message: string };
 
 function readRegularFileNoFollow(io: StoreFsOps, filePath: string, maxBytesExclusive?: number): ReadRegularResult {
-  const flags = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW : fs.constants.O_RDONLY;
+  const flags =
+    fs.constants.O_RDONLY |
+    (typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0) |
+    (typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0);
   let fd: number;
   try {
     fd = io.openSync(filePath, flags);
@@ -462,15 +478,15 @@ type ArtifactCheckResult =
 
 function inspectArtifactFile(
   io: StoreFsOps,
-  artifactsDir: string,
+  paths: TicketPaths,
   expectedSha256: string,
   expectedBytes?: number,
 ): ArtifactCheckResult {
-  const artifactPath = path.join(artifactsDir, `${expectedSha256}.md`);
-  const dirState = checkDirState(io, artifactsDir);
-  if (dirState === "absent") return { status: "missing", path: artifactPath };
-  if (dirState === "unreadable") {
-    return { status: "unreadable", path: artifactPath, message: `Unreadable artifacts directory: ${artifactsDir}` };
+  const artifactPath = path.join(paths.artifactsDir, `${expectedSha256}.md`);
+  const dirChain = checkDirChainState(io, [path.dirname(paths.ticketDir), paths.ticketDir, paths.artifactsDir]);
+  if (dirChain.status === "absent") return { status: "missing", path: artifactPath };
+  if (dirChain.status === "unreadable") {
+    return { status: "unreadable", path: artifactPath, message: `Expected readable directory at ${dirChain.dirPath}` };
   }
   const readRes = readRegularFileNoFollow(io, artifactPath);
   if (readRes.status === "missing") return { status: "missing", path: artifactPath };
@@ -546,7 +562,7 @@ function publishExclusiveFile(params: {
       // Leftover dot-temp stays ignored and never blocks publication or hides an earlier error.
     }
 
-    if (!linkedExisting) fsyncDir(io, dirPath);
+    fsyncDir(io, dirPath);
   } catch (err) {
     hasPrimaryError = true;
     throw err;
@@ -655,10 +671,10 @@ export function openTicketLog(input: OpenTicketLogInput, options?: StoreOptions)
     ticketDir: paths.ticketDir, reason, message, seq, path: targetPath, verifiedPrefix: [...verifiedPrefix],
   });
 
-  for (const dirPath of [path.dirname(paths.ticketDir), paths.ticketDir, paths.logDir]) {
-    const dirState = checkDirState(io, dirPath);
-    if (dirState === "absent") return cleanEmpty();
-    if (dirState === "unreadable") return quarantine("log_unreadable", `Expected readable directory at ${dirPath}`, null, dirPath, []);
+  const dirChain = checkDirChainState(io, [path.dirname(paths.ticketDir), paths.ticketDir, paths.logDir]);
+  if (dirChain.status === "absent") return cleanEmpty();
+  if (dirChain.status === "unreadable") {
+    return quarantine("log_unreadable", `Expected readable directory at ${dirChain.dirPath}`, null, dirChain.dirPath, []);
   }
 
   let rawNames: string[];
@@ -670,23 +686,39 @@ export function openTicketLog(input: OpenTicketLogInput, options?: StoreOptions)
   }
   rawNames.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
+  let firstForeign: { readonly message: string; readonly fullPath: string } | null = null;
   const recordFiles: Array<{ readonly seq: number; readonly name: string; readonly filePath: string }> = [];
   for (const name of rawNames) {
     if (name.startsWith(".")) continue;
     const match = RECORD_FILE_RE.exec(name);
     const fullPath = path.join(paths.logDir, name);
-    if (match === null) return quarantine("foreign_log_entry", `Unexpected entry in log/: ${name}`, null, fullPath, []);
+    if (match === null) {
+      firstForeign ??= { message: `Unexpected entry in log/: ${name}`, fullPath };
+      continue;
+    }
     const seq = Number(match[1]);
     if (seq < 1 || seq > MAX_COMMIT_SEQ) {
-      return quarantine("foreign_log_entry", `Out-of-range log entry name: ${name}`, null, fullPath, []);
+      firstForeign ??= { message: `Out-of-range log entry name: ${name}`, fullPath };
+      continue;
     }
     recordFiles.push({ seq, name, filePath: fullPath });
   }
 
-  if (recordFiles.length === 0) return cleanEmpty();
+  const reportFault = (
+    reason: QuarantineReason, message: string, seq: number | null,
+    targetPath: string | null, verifiedPrefix: readonly VerifiedCommitEntry[],
+  ): QuarantinedTicketLog => firstForeign !== null
+    ? quarantine("foreign_log_entry", firstForeign.message, null, firstForeign.fullPath, verifiedPrefix)
+    : quarantine(reason, message, seq, targetPath, verifiedPrefix);
+
+  if (recordFiles.length === 0) {
+    return firstForeign !== null
+      ? quarantine("foreign_log_entry", firstForeign.message, null, firstForeign.fullPath, [])
+      : cleanEmpty();
+  }
   recordFiles.sort((a, b) => a.seq - b.seq);
   if (recordFiles[0]!.seq !== 1) {
-    return quarantine("missing_first_record", `Expected 000001.json, found ${recordFiles[0]!.name}`, 1, path.join(paths.logDir, "000001.json"), []);
+    return reportFault("missing_first_record", `Expected 000001.json, found ${recordFiles[0]!.name}`, 1, path.join(paths.logDir, "000001.json"), []);
   }
 
   const verified: VerifiedCommitEntry[] = [];
@@ -696,16 +728,16 @@ export function openTicketLog(input: OpenTicketLogInput, options?: StoreOptions)
   for (const item of recordFiles) {
     if (item.seq !== expectedSeq) {
       const missingName = `${formatSeq6(expectedSeq)}.json`;
-      return quarantine("sequence_gap", `Expected ${missingName}, found ${item.name}`, expectedSeq, path.join(paths.logDir, missingName), verified);
+      return reportFault("sequence_gap", `Expected ${missingName}, found ${item.name}`, expectedSeq, path.join(paths.logDir, missingName), verified);
     }
 
     const readRes = readRegularFileNoFollow(io, item.filePath, MAX_COMMIT_RECORD_BYTES);
     if (readRes.status === "missing" || readRes.status === "unreadable") {
       const msg = readRes.status === "unreadable" ? readRes.message : `Missing record ${item.filePath}`;
-      return quarantine("record_unreadable", msg, expectedSeq, item.filePath, verified);
+      return reportFault("record_unreadable", msg, expectedSeq, item.filePath, verified);
     }
     if (readRes.status === "too_large") {
-      return quarantine("record_too_large", `${item.name} is ${readRes.byteLength} bytes; limit is < ${MAX_COMMIT_RECORD_BYTES}`, expectedSeq, item.filePath, verified);
+      return reportFault("record_too_large", `${item.name} is ${readRes.byteLength} bytes; limit is < ${MAX_COMMIT_RECORD_BYTES}`, expectedSeq, item.filePath, verified);
     }
 
     const rawBytes = readRes.bytes;
@@ -714,27 +746,31 @@ export function openTicketLog(input: OpenTicketLogInput, options?: StoreOptions)
     try {
       parsed = JSON.parse(UTF8_FATAL_DECODER.decode(rawBytes));
     } catch {
-      return quarantine("parse_error", `Invalid UTF-8 JSON in ${item.filePath}`, expectedSeq, item.filePath, verified);
+      return reportFault("parse_error", `Invalid UTF-8 JSON in ${item.filePath}`, expectedSeq, item.filePath, verified);
     }
 
     const validated = validateRecordEnvelope(parsed, {
       name: item.name, expectedSeq, prevSha256, projectKey, issueRef: parsedRef.issueRef,
     });
-    if (!validated.ok) return quarantine(validated.reason, validated.message, expectedSeq, item.filePath, verified);
+    if (!validated.ok) return reportFault(validated.reason, validated.message, expectedSeq, item.filePath, verified);
 
     for (const ref of validated.record.evidenceRefs) {
-      const check = inspectArtifactFile(io, paths.artifactsDir, ref.sha256, ref.bytes);
-      if (check.status === "missing") return quarantine("artifact_missing", `Missing artifact ${ref.sha256}.md`, expectedSeq, check.path, verified);
-      if (check.status === "unreadable") return quarantine("artifact_unreadable", check.message, expectedSeq, check.path, verified);
+      const check = inspectArtifactFile(io, paths, ref.sha256, ref.bytes);
+      if (check.status === "missing") return reportFault("artifact_missing", `Missing artifact ${ref.sha256}.md`, expectedSeq, check.path, verified);
+      if (check.status === "unreadable") return reportFault("artifact_unreadable", check.message, expectedSeq, check.path, verified);
       if (check.status === "length_mismatch") {
-        return quarantine("artifact_length_mismatch", `Artifact ${ref.sha256}.md length ${check.actualBytes} !== ${check.expectedBytes}`, expectedSeq, check.path, verified);
+        return reportFault("artifact_length_mismatch", `Artifact ${ref.sha256}.md length ${check.actualBytes} !== ${check.expectedBytes}`, expectedSeq, check.path, verified);
       }
-      if (check.status === "hash_mismatch") return quarantine("artifact_hash_mismatch", `Artifact ${ref.sha256}.md hash mismatch`, expectedSeq, check.path, verified);
+      if (check.status === "hash_mismatch") return reportFault("artifact_hash_mismatch", `Artifact ${ref.sha256}.md hash mismatch`, expectedSeq, check.path, verified);
     }
 
     verified.push({ seq: expectedSeq, sha256: recordSha256, bytes: rawBytes.byteLength, path: item.filePath, record: validated.record });
     prevSha256 = recordSha256;
     expectedSeq += 1;
+  }
+
+  if (firstForeign !== null) {
+    return quarantine("foreign_log_entry", firstForeign.message, null, firstForeign.fullPath, verified);
   }
 
   return {
@@ -751,7 +787,7 @@ export function readArtifact(input: ReadArtifactInput, options?: StoreOptions): 
     throw new StoreError("invalid_argument", "sha256 must be a 64-character lowercase hex digest");
   }
   const paths = getTicketPaths(stateRoot, parsedRef.issueRef);
-  const check = inspectArtifactFile(resolveFsOps(options?.fs), paths.artifactsDir, input.sha256);
+  const check = inspectArtifactFile(resolveFsOps(options?.fs), paths, input.sha256);
   if (check.status !== "ok") throwForArtifactFailure(check, input.sha256);
   return { sha256: input.sha256, bytes: check.bytes, path: check.path, content: check.content };
 }
@@ -765,10 +801,14 @@ export function writeArtifact(
   validateLeaseArg(lease);
   const parsedRef = parseIssueRef(issueRef);
   let bytes: Buffer;
-  if (typeof content === "string") bytes = Buffer.from(content, "utf8");
-  else if (Buffer.isBuffer(content)) bytes = Buffer.from(content);
-  else if (content instanceof Uint8Array) bytes = Buffer.from(content.buffer, content.byteOffset, content.byteLength);
-  else throw new StoreError("invalid_argument", "artifact content must be a string, Buffer, or Uint8Array");
+  if (typeof content === "string") {
+    bytes = Buffer.from(content, "utf8");
+  } else if (content instanceof Uint8Array) {
+    bytes = Buffer.allocUnsafe(content.byteLength);
+    bytes.set(content);
+  } else {
+    throw new StoreError("invalid_argument", "artifact content must be a string, Buffer, or Uint8Array");
+  }
 
   const io = resolveFsOps(options?.fs);
   const paths = getTicketPaths(lease.stateRoot, parsedRef.issueRef);
@@ -776,15 +816,18 @@ export function writeArtifact(
 
   lease.assertValid();
 
-  const existing = inspectArtifactFile(io, paths.artifactsDir, digest);
-  if (existing.status === "ok") return { sha256: digest, bytes: bytes.byteLength, path: existing.path, created: false };
+  const existing = inspectArtifactFile(io, paths, digest);
+  if (existing.status === "ok") {
+    fsyncDir(io, paths.artifactsDir);
+    return { sha256: digest, bytes: bytes.byteLength, path: existing.path, created: false };
+  }
   if (existing.status !== "missing") throwForArtifactFailure(existing, digest);
 
   const published = publishExclusiveFile({
     io, lease, stateRoot: lease.stateRoot, dirSegments: ["tickets", parsedRef.issue, "artifacts"],
     finalName: `${digest}.md`, bytes,
     onLinkEexist: () => {
-      const raced = inspectArtifactFile(io, paths.artifactsDir, digest);
+      const raced = inspectArtifactFile(io, paths, digest);
       if (raced.status === "ok") return "already_valid";
       throwForArtifactFailure(raced, digest);
     },
@@ -871,11 +914,6 @@ export function appendCommitRecord(
     });
   }
 
-  for (const ref of evidenceRefs) {
-    const check = inspectArtifactFile(io, paths.artifactsDir, ref.sha256, ref.bytes);
-    if (check.status !== "ok") throwForArtifactFailure(check, ref.sha256);
-  }
-
   const nextSeq = opened.lastSeq + 1;
   const finalName = `${formatSeq6(nextSeq)}.json`;
   const recordBase: CommitRecordBase = {
@@ -903,6 +941,23 @@ export function appendCommitRecord(
     throw new StoreError("invalid_argument", "Commit record payload is not JSON-serializable", { cause: err });
   }
   const bytes = Buffer.from(serialized, "utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(UTF8_FATAL_DECODER.decode(bytes));
+  } catch (err) {
+    throw new StoreError("invalid_argument", "Serialized commit record is not valid UTF-8 JSON", { cause: err });
+  }
+  const validated = validateRecordEnvelope(parsed, {
+    name: finalName, expectedSeq: nextSeq, prevSha256: opened.lastRecordSha256,
+    projectKey: lease.projectKey, issueRef: parsedRef.issueRef,
+  });
+  if (!validated.ok) {
+    throw new StoreError("invalid_argument", validated.message, { details: { reason: validated.reason } });
+  }
+  for (const ref of validated.record.evidenceRefs) {
+    const check = inspectArtifactFile(io, paths, ref.sha256, ref.bytes);
+    if (check.status !== "ok") throwForArtifactFailure(check, ref.sha256);
+  }
   if (bytes.byteLength >= MAX_COMMIT_RECORD_BYTES) {
     throw new StoreError("record_too_large", `${finalName} is ${bytes.byteLength} UTF-8 bytes; limit is < ${MAX_COMMIT_RECORD_BYTES}`, {
       details: { fileName: finalName, byteLength: bytes.byteLength, maxBytes: MAX_COMMIT_RECORD_BYTES },
@@ -925,6 +980,6 @@ export function appendCommitRecord(
     sha256: digest,
     bytes: bytes.byteLength,
     path: published.finalPath,
-    record: JSON.parse(serialized) as CommitRecord,
+    record: validated.record,
   };
 }

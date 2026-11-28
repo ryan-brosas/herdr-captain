@@ -462,6 +462,7 @@ describe("commit-log store concurrency, fencing, and cross-module integration (p
 
       const tempFds = new Set<number>();
       const dirFds = new Set<number>();
+      let forcedShortWrite = false;
       const tracedFs: Partial<StoreFsOps> = {
         mkdirSync(targetPath, options) {
           trace.push(`mkdir:${path.basename(String(targetPath))}`);
@@ -485,10 +486,16 @@ describe("commit-log store concurrency, fencing, and cross-module integration (p
           length?: number | null,
           position?: fs.ReadPosition | null,
         ): number => {
+          const off = offset ?? 0;
+          let len = length ?? buffer.byteLength - off;
           if (tempFds.has(fd)) {
             trace.push("writeTemp");
+            if (!forcedShortWrite && len > 1) {
+              forcedShortWrite = true;
+              len = Math.max(1, Math.floor(len / 2));
+            }
           }
-          return fs.writeSync(fd, buffer, offset ?? 0, length ?? buffer.byteLength, position ?? null);
+          return fs.writeSync(fd, buffer, off, len, position ?? null);
         }) as typeof fs.writeSync,
         fsyncSync(fd) {
           trace.push(tempFds.has(fd) ? "fsyncTemp" : "fsyncDir");
@@ -518,6 +525,38 @@ describe("commit-log store concurrency, fencing, and cross-module integration (p
         appendCommitRecord(observedLease, makeIntentInput({ issueRef }), { fs: tracedFs }),
       );
       assert.equal(rec.seq, 1);
+
+      // Every expected operation must appear in the trace before judging order.
+      const expectedOps = [
+        "mkdir:tickets",
+        "mkdir:510",
+        "mkdir:log",
+        "openTemp",
+        "writeTemp",
+        "fsyncTemp",
+        "closeTemp",
+        "link",
+        "removeTemp",
+        "openDir",
+        "fsyncDir",
+        "closeDir",
+      ];
+      for (const expectedOp of expectedOps) {
+        assert.ok(
+          trace.includes(expectedOp),
+          `Expected operation ${expectedOp} in trace; trace=${trace.join(" -> ")}`,
+        );
+      }
+      const writeTempCount = trace.filter((op) => op === "writeTemp").length;
+      assert.ok(
+        writeTempCount >= 2,
+        `Expected >= 2 writeTemp calls with short write, got ${writeTempCount}; trace=${trace.join(" -> ")}`,
+      );
+      const fsyncDirCount = trace.filter((op) => op === "fsyncDir").length;
+      assert.ok(
+        fsyncDirCount >= 4,
+        `Expected >= 4 fsyncDir calls (3 parent dirs + post-link dir), got ${fsyncDirCount}; trace=${trace.join(" -> ")}`,
+      );
 
       // Every mutating step must be immediately preceded by assertValid.
       const mutatingSteps = new Set([

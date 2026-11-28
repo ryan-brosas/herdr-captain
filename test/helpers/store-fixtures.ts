@@ -33,11 +33,25 @@ export interface RawFileSnapshot {
   readonly size: number;
 }
 
+export interface TreeFileSnapshot {
+  readonly bytes: Buffer | null;
+  readonly ino: number;
+  readonly size: number;
+  readonly mode: number;
+}
+
+export interface TreeOtherSnapshot {
+  readonly ino: number;
+  readonly size: number;
+  readonly mode: number;
+}
+
 export interface TreeSnapshot {
   readonly exists: boolean;
   readonly dirs: readonly string[];
-  readonly files: ReadonlyMap<string, RawFileSnapshot>;
+  readonly files: ReadonlyMap<string, TreeFileSnapshot>;
   readonly symlinks: ReadonlyMap<string, string>;
+  readonly others: ReadonlyMap<string, TreeOtherSnapshot>;
 }
 
 export interface TrackedPid {
@@ -121,11 +135,13 @@ export function snapshotTree(rootDir: string): TreeSnapshot {
       dirs: [],
       files: new Map(),
       symlinks: new Map(),
+      others: new Map(),
     };
   }
   const dirs: string[] = [];
-  const files = new Map<string, RawFileSnapshot>();
+  const files = new Map<string, TreeFileSnapshot>();
   const symlinks = new Map<string, string>();
+  const others = new Map<string, TreeOtherSnapshot>();
 
   const walk = (currentDir: string, relPrefix: string): void => {
     const entries = fs.readdirSync(currentDir).sort();
@@ -139,14 +155,37 @@ export function snapshotTree(rootDir: string): TreeSnapshot {
         dirs.push(relPath);
         walk(fullPath, relPath);
       } else if (stat.isFile()) {
-        files.set(relPath, snapshotRawFile(fullPath));
+        let bytes: Buffer | null = null;
+        try {
+          bytes = Buffer.from(fs.readFileSync(fullPath));
+        } catch (err) {
+          const code =
+            typeof err === "object" && err !== null && "code" in err
+              ? (err as { code?: unknown }).code
+              : null;
+          if (code !== "EACCES" && code !== "EPERM") {
+            throw err;
+          }
+        }
+        files.set(relPath, {
+          bytes,
+          ino: stat.ino,
+          size: stat.size,
+          mode: stat.mode,
+        });
+      } else {
+        others.set(relPath, {
+          ino: stat.ino,
+          size: stat.size,
+          mode: stat.mode,
+        });
       }
     }
   };
 
   walk(rootDir, "");
   dirs.sort();
-  return { exists: true, dirs, files, symlinks };
+  return { exists: true, dirs, files, symlinks, others };
 }
 
 export function assertTreeUnchanged(
@@ -167,15 +206,36 @@ export function assertTreeUnchanged(
     Array.from(before.symlinks.entries()).sort(),
     `${label}: symlinks changed`,
   );
+  assert.deepEqual(
+    Array.from(after.others.keys()).sort(),
+    Array.from(before.others.keys()).sort(),
+    `${label}: special entry names changed`,
+  );
   for (const [relPath, snap] of before.files) {
     const afterSnap = after.files.get(relPath);
     assert.ok(afterSnap !== undefined, `${label}: file ${relPath} missing`);
-    assert.equal(
-      Buffer.compare(afterSnap.bytes, snap.bytes),
-      0,
-      `${label}: file ${relPath} bytes changed`,
-    );
     assert.equal(afterSnap.ino, snap.ino, `${label}: file ${relPath} inode changed`);
+    assert.equal(afterSnap.size, snap.size, `${label}: file ${relPath} size changed`);
+    assert.equal(afterSnap.mode, snap.mode, `${label}: file ${relPath} mode changed`);
+    assert.equal(
+      afterSnap.bytes === null,
+      snap.bytes === null,
+      `${label}: file ${relPath} readability changed`,
+    );
+    if (snap.bytes !== null && afterSnap.bytes !== null) {
+      assert.equal(
+        Buffer.compare(afterSnap.bytes, snap.bytes),
+        0,
+        `${label}: file ${relPath} bytes changed`,
+      );
+    }
+  }
+  for (const [relPath, snap] of before.others) {
+    const afterSnap = after.others.get(relPath);
+    assert.ok(afterSnap !== undefined, `${label}: special entry ${relPath} missing`);
+    assert.equal(afterSnap.ino, snap.ino, `${label}: special entry ${relPath} inode changed`);
+    assert.equal(afterSnap.size, snap.size, `${label}: special entry ${relPath} size changed`);
+    assert.equal(afterSnap.mode, snap.mode, `${label}: special entry ${relPath} mode changed`);
   }
 }
 
@@ -198,12 +258,15 @@ export function assertNoFileDeletedInTree(
     const afterSnap = after.files.get(relPath);
     assert.ok(afterSnap !== undefined, `${label}: file was deleted: ${relPath}`);
     if (!mutableRelPaths.has(relPath)) {
-      assert.equal(
-        Buffer.compare(afterSnap.bytes, snap.bytes),
-        0,
-        `${label}: pre-existing file ${relPath} bytes changed`,
-      );
       assert.equal(afterSnap.ino, snap.ino, `${label}: pre-existing file ${relPath} inode changed`);
+      assert.equal(afterSnap.size, snap.size, `${label}: pre-existing file ${relPath} size changed`);
+      if (snap.bytes !== null && afterSnap.bytes !== null) {
+        assert.equal(
+          Buffer.compare(afterSnap.bytes, snap.bytes),
+          0,
+          `${label}: pre-existing file ${relPath} bytes changed`,
+        );
+      }
     }
   }
 }

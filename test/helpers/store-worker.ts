@@ -7,6 +7,7 @@ import {
   appendCommitRecord,
   getTicketPaths,
   openTicketLog,
+  readArtifact,
   writeArtifact,
   type StoreFsOps,
 } from "../../src/store.ts";
@@ -588,6 +589,70 @@ async function main(): Promise<void> {
       throw new Error("integration-p2 requires --cwd, --state-base, and --issue-ref");
     }
     await runIntegrationP2(cwd, stateBase, issueRef, selfStartTime);
+    return;
+  }
+
+  if (mode === "fifo-op") {
+    const stateRoot = args["state-root"];
+    const projectKey = args["project-key"];
+    const issueRef = args["issue-ref"];
+    const op = args.op;
+    if (!stateRoot || !projectKey || !issueRef || !op) {
+      throw new Error("fifo-op requires --state-root, --project-key, --issue-ref, and --op");
+    }
+    if (op === "open") {
+      const result = openTicketLog({ stateRoot, projectKey, issueRef });
+      emitSync({ event: "op_result", ok: true, result });
+      return;
+    }
+    if (op === "read-artifact") {
+      const sha256 = args.sha256 ?? "";
+      try {
+        const res = readArtifact({ stateRoot, issueRef, sha256 });
+        emitSync({ event: "op_result", ok: true, result: { sha256: res.sha256, bytes: res.bytes, path: res.path } });
+      } catch (err) {
+        emitSync({ event: "op_result", ok: false, code: getErrorCode(err), message: formatError(err) });
+      }
+      return;
+    }
+    const fifoLease = await acquireLease({ projectKey, stateRoot });
+    emitSync({
+      event: "lease_acquired",
+      pid: process.pid,
+      startTime: selfStartTime,
+      holderPid: fifoLease.holderPid,
+      holderStartTime: fifoLease.holderStartTime,
+      epoch: fifoLease.epoch,
+    });
+    try {
+      if (op === "write-artifact") {
+        const payload = args.content ?? "";
+        const { writeResult } = await fifoLease.enqueue({
+          write: () => writeArtifact(fifoLease, issueRef, payload),
+        });
+        emitSync({ event: "op_result", ok: true, result: writeResult });
+      } else if (op === "append") {
+        const sha256 = args.sha256 ?? "";
+        const evidenceBytes = Number(args["evidence-bytes"] ?? "0");
+        const { writeResult } = await fifoLease.enqueue({
+          write: () =>
+            appendCommitRecord(
+              fifoLease,
+              makeIntentInput({
+                issueRef,
+                evidenceRefs: [{ kind: "brief", sha256, bytes: evidenceBytes, truncated: false }],
+              }),
+            ),
+        });
+        emitSync({ event: "op_result", ok: true, result: writeResult });
+      } else {
+        throw new Error(`Unknown fifo-op: ${op}`);
+      }
+    } catch (err) {
+      emitSync({ event: "op_result", ok: false, code: getErrorCode(err), message: formatError(err) });
+    } finally {
+      await fifoLease.release();
+    }
     return;
   }
 

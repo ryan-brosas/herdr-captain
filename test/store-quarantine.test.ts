@@ -594,7 +594,7 @@ describe("commit-log store quarantine and corruption detection (proof 8)", () =>
           name: "foreign name in log/ (notes.txt)",
           expectedReason: "foreign_log_entry",
           expectedSeq: null,
-          expectedPrefixLen: 0,
+          expectedPrefixLen: 2,
           setup: ({ logDir }) => {
             const foreign = path.join(logDir, "notes.txt");
             fs.writeFileSync(foreign, "stray file\n", "utf8");
@@ -610,7 +610,7 @@ describe("commit-log store quarantine and corruption detection (proof 8)", () =>
           name: "foreign name in log/ (000000.json)",
           expectedReason: "foreign_log_entry",
           expectedSeq: null,
-          expectedPrefixLen: 0,
+          expectedPrefixLen: 2,
           setup: ({ logDir }) => {
             const foreign = path.join(logDir, "000000.json");
             fs.writeFileSync(foreign, "{}\n", "utf8");
@@ -626,7 +626,7 @@ describe("commit-log store quarantine and corruption detection (proof 8)", () =>
           name: "foreign name in log/ (1000000.json)",
           expectedReason: "foreign_log_entry",
           expectedSeq: null,
-          expectedPrefixLen: 0,
+          expectedPrefixLen: 2,
           setup: ({ logDir }) => {
             const foreign = path.join(logDir, "1000000.json");
             fs.writeFileSync(foreign, "{}\n", "utf8");
@@ -709,9 +709,13 @@ describe("commit-log store quarantine and corruption detection (proof 8)", () =>
           tc.expectedPrefixLen,
           `${tc.name}: wrong verifiedPrefix length`,
         );
-        if (tc.expectedPrefixLen === 1) {
+        if (tc.expectedPrefixLen >= 1) {
           assert.equal(opened.verifiedPrefix[0]?.seq, 1);
           assert.equal(opened.verifiedPrefix[0]?.sha256, rec1.sha256);
+        }
+        if (tc.expectedPrefixLen >= 2) {
+          assert.equal(opened.verifiedPrefix[1]?.seq, 2);
+          assert.equal(opened.verifiedPrefix[1]?.sha256, rec2.sha256);
         }
         assertTreeUnchanged(stateRoot, treeBefore, `${tc.name}: open must write no quarantine file`);
 
@@ -890,6 +894,7 @@ describe("commit-log store quarantine and corruption detection (proof 8)", () =>
           fs.chmodSync(art.path, 0o000);
         }
         try {
+          const before = snapshotTree(stateRoot);
           const opened = openTicketLog({ stateRoot, projectKey: DEFAULT_PROJECT_KEY, issueRef });
           assert.equal(opened.status, "quarantined");
           assert.equal(opened.reason, "artifact_unreadable");
@@ -897,12 +902,14 @@ describe("commit-log store quarantine and corruption detection (proof 8)", () =>
           assert.equal(opened.path, art.path);
           assert.equal(opened.verifiedPrefix.length, 1);
           assert.equal(opened.verifiedPrefix[0]?.sha256, rec1.sha256);
+          assertTreeUnchanged(stateRoot, before, "unreadable artifact open must write nothing");
 
           await expectErrorCode(
             () => runWrite(lease, () => appendCommitRecord(lease, makeIntentInput({ issueRef }))),
             "log_quarantined",
             "append on unreadable artifact quarantine",
           );
+          assertTreeUnchanged(stateRoot, before, "unreadable artifact refused append must write nothing");
         } finally {
           if (isRoot) {
             fs.rmdirSync(art.path);

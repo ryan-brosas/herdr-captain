@@ -187,7 +187,18 @@ describe("commit-log store crash recovery and syscall failure handling (proofs 3
 
           if (params.kind === "artifact") {
             if (STEPS_AFTER_LINK.has(params.step)) {
+              assert.ok(
+                writtenBase64 !== null && writtenBase64.length > 0,
+                `${params.kind}/${params.step}: worker must report written byte evidence after link`,
+              );
               assert.equal(fs.existsSync(expectedArtPath), true);
+              const expectedBytes = Buffer.from(writtenBase64, "base64");
+              const actualBytes = fs.readFileSync(expectedArtPath);
+              assert.equal(
+                Buffer.compare(actualBytes, expectedBytes),
+                0,
+                `${params.kind}/${params.step}: published artifact bytes must match worker evidence`,
+              );
               const readBack = readArtifact({ stateRoot, issueRef, sha256: expectedArtSha });
               assert.equal(readBack.content.toString("utf8"), artifactContent);
             } else {
@@ -196,15 +207,17 @@ describe("commit-log store crash recovery and syscall failure handling (proofs 3
           } else if (publishedNewRecord) {
             const lastEntry = opened.records[opened.records.length - 1]!;
             assert.equal(lastEntry.seq, expectedCount);
-            if (writtenBase64 !== null) {
-              const expectedBytes = Buffer.from(writtenBase64, "base64");
-              const actualBytes = fs.readFileSync(lastEntry.path);
-              assert.equal(
-                Buffer.compare(actualBytes, expectedBytes),
-                0,
-                `${params.kind}/${params.step}: published record bytes must be complete`,
-              );
-            }
+            assert.ok(
+              writtenBase64 !== null && writtenBase64.length > 0,
+              `${params.kind}/${params.step}: worker must report written byte evidence after link`,
+            );
+            const expectedBytes = Buffer.from(writtenBase64, "base64");
+            const actualBytes = fs.readFileSync(lastEntry.path);
+            assert.equal(
+              Buffer.compare(actualBytes, expectedBytes),
+              0,
+              `${params.kind}/${params.step}: published record bytes must be complete`,
+            );
           }
 
           // Next append under a new lease gets the right sequence number and leaves leftover temp intact.
