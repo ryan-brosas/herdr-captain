@@ -28,4 +28,10 @@
 
 ## Build and tests
 
-No package build or test command exists yet. This repository holds design documents, probe records in `docs/probes/`, and probe code under `probes/` (`p1`, `p2`, and `p4`). It also holds the package stub (`package.json` and `src/index.ts`) from probe P1. Add the real commands here when Slice S1 lands ([P1](docs/probes/p1.md), [#8](https://github.com/ryan-brosas/herdr-captain/issues/8), [#28](https://github.com/ryan-brosas/herdr-captain/issues/28)).
+Run the test suite with:
+
+```bash
+bun run test
+```
+
+This runs `bun test ./test` on Linux with Bun 1.4.0 or newer, no install, and no external dependencies. Older Bun releases reap a killed child and run its exit callback during `spawnSync()`, so tests cannot hold an unreaped zombie holder before that callback runs. The owner lease tests also require `util-linux` `flock` with `--no-fork` and `--conflict-exit-code`, plus readable Linux `/proc`. No package build or type-check command exists yet; Slice S1 adds no development dependencies ([#8](https://github.com/ryan-brosas/herdr-captain/issues/8)).

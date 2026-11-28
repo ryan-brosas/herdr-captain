@@ -6,7 +6,9 @@ Terms used here follow [CONTEXT.md](../CONTEXT.md). Decisions live in [adr/](adr
 
 ## 1. Scope, governance, and non-goals
 
-Existing workflow documents, GitHub issues, and skills own product exploration, grounding, grilling, glossary ownership, ADRs, issue readiness, dependency ordering, and multi-ticket pacing. `herdr-captain` adds deterministic ticket execution reliability on top of `pi-fabric` and `herdr-core` (`hc`). It consumes one workflow-authorized brief per tracked ticket and enforces proved state transitions, attempt correlation, readback reconciliation, and exact-head gates.
+Existing workflow documents, GitHub issues, and skills own product exploration, grounding, grilling, glossary ownership, ADRs, issue readiness, dependency ordering, and multi-ticket pacing.
+
+`herdr-captain` adds deterministic ticket execution reliability on top of `pi-fabric` and `herdr-core` (`hc`). It consumes one workflow-authorized brief per tracked ticket and enforces proved state transitions, attempt correlation, readback reconciliation, and exact-head gates.
 
 ### Roles and harnesses
 
@@ -66,7 +68,7 @@ The provider exposes six closed-schema actions (`PROPOSED`):
 
 | Action | Role | External effect |
 |---|---|---|
-| `fleet.claim` | Acquire owner lease, verify `project.json`, run startup reconciliation | Starts `flock` holder |
+| `fleet.claim` | Read repo, acquire owner lease, re-read repo, publish or verify `project.json`, re-check lease, run startup reconciliation | Starts `flock` holder |
 | `fleet.brief_commit` | Persist immutable brief (or revision), validate `mid` tier and caps | Local store write only |
 | `fleet.dispatch` | Run one managed `hc` effect as `intent -> effect -> receipt` | `hc run` or `hc send` |
 | `fleet.record` | Persist artifact and commit evidence, `merge_intent`, `gh pr view` readback, closeout, invalidation, or user decision | Local store write only |
@@ -93,11 +95,62 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/herdr-captain/<projectKey>/
 
 1. Resolve `canonicalCommonDir = realpath(git rev-parse --git-common-dir)`. Fail closed outside a Git repository.
 2. Compute `projectKey = sha256(canonicalCommonDir).slice(0, 16)` (first 16 lowercase hex characters). The directory name is `<projectKey>` alone, with no folder-name prefix.
-3. Persist `project.json` (`schemaVersion: 1`, under 2 KB) containing readable `slug`, full `canonicalCommonDir`, full `commonDirSha256`, observed `originUrl`, and `rootCommitShas` (the repository's parentless commits, sorted).
+3. **Record, lease-first claim order, and publication:** Persist `project.json` (`schemaVersion: 1`, under 2 KB) with readable `slug`, full `canonicalCommonDir`, full `commonDirSha256`, observed `originUrl`, and sorted `rootCommitShas` (the parentless commits of every ref). `project.json` is written once and never rewritten. `rootCommitShas` is never empty; a stored record with an empty `rootCommitShas` is refused with `identity_mismatch` and is not accepted as old data.
+
+   Identity writes only after it has acquired the owner lease, and it checks the lease right before each write (section 5, rule (c)). The check and the write are two steps, so an owner whose lock holder dies between them can still complete one link. No other write follows, because every later check fails. A claim runs in this order:
+   1. Read the repo's common directory, the root commits of every ref, and its origin. Make no write.
+   2. If the repository has no commit on any ref, refuse with `identity_unborn` before any write, leaving the state root unchanged. An unborn `HEAD` beside a branch with commits is not refused here.
+   3. Acquire the owner lease for `projectKey` (section 5). The lease creates the project directory and writes its own files (`owner.lock`, `owner.json`).
+   4. Inside the lease queue, read the repository again. If the key is no longer the acquired key, refuse with `identity_mismatch`. If no root commit is found because commits vanished after step 1, refuse with `identity_unborn`; only the lease's files were written.
+   5. If the directory holds no `project.json`, run the relocation scan (item 6) and publish `project.json` as below. Otherwise verify the existing record (item 5).
+   6. Every refusal after step 3 releases the lease before returning the error, including `lease_revoked`. The claim calls lease release after its queued step ends, never from inside it, because release first drains the queue. The call is safe in each case. If the lock holder has died, the lock is already free. If a controlled revocation is under way, the call joins it (section 5, rule (d)). If the lease check failed while the holder is alive, the call closes the holder and frees the lock.
+   7. As the last step of every claim, run one more lease check (section 5, rule (c)) after the publication or verification. If the lease is no longer valid, the claim fails with `lease_revoked`, whatever it published or verified. No claim returns an open project before this check.
+
+   A directory holding only the lease's files is a first publication, at this claim or any later one. A second process claiming the same project gets `owner_conflict` and writes nothing. A second claim inside one process follows section 5 rule (e): it revokes and drains the first lease, acquires the second at the next epoch, and runs step 4.
+
+   To publish `project.json`, create a temporary file exclusively under a name unique to this call. Write and sync it. Hard-link it to `project.json` so an existing `project.json` is never replaced. Sync the directory. Remove the temporary only if this call created it. If the link found a `project.json` already there, verify that record (item 5) and write nothing. Then step 7 decides. A stale link cannot replace an existing record, and its claim fails with `lease_revoked` (step 7). Any record that link published is still a true record of the same repository, which the next owner verifies like any other. Identity never removes a file it did not create. A temporary left by a crashed call stays and is ignored.
 4. **Worktree sharing and clone isolation:** Linked worktrees of one clone resolve to the same `canonicalCommonDir` (git documents `--git-common-dir` as the directory shared by all linked worktrees), so they share one `projectKey`, one owner lease, and one execution ledger regardless of their folder names. Separate clones and distinct repositories with identical folder basenames hash to distinct keys and stay isolated. Symlinks resolve through `realpath`.
-5. **Mismatch refusal:** On every open of an existing project directory, compare stored `canonicalCommonDir` in `project.json` against live `canonicalCommonDir`. Any mismatch (a hash collision) refuses to bind (`identity_mismatch`) and escalates; old records are never silently rebound.
-6. **Relocation refusal (`PROPOSED`):** A moved clone hashes to a new `projectKey`, so the check above cannot see its old ledger. Before creating a new project directory, scan the other `project.json` files under the state root for the same `rootCommitShas` and `originUrl` whose stored `canonicalCommonDir` no longer exists on disk. A match refuses to start a fresh ledger (`identity_relocated`) and escalates. Only a recorded user decision rebinds the old ledger to the new path or confirms a new project. A second clone whose original path still exists is a separate project and opens normally. Origin URL drift logs a warning and blocks merge until the Captain confirms the target repository.
+5. **Verification and origin on open:** On every open of an existing `project.json`, all three checks must hold; if one fails, refuse with `identity_mismatch`:
+   1. Stored `canonicalCommonDir` equals the live one.
+   2. Stored `commonDirSha256` matches the directory name.
+   3. The live repository and stored `rootCommitShas` share at least one root commit.
+
+   After a refusal, `project.json` and the execution ledger stay unchanged. The lease's `owner.json` has a new epoch; that is the only write. The third check accepts a history that gained a root, and one that lost roots while at least one stored root remains. It shows lineage, not which clone this is (see item 6, limit 3).
+
+   `originUrl` is stored at first publication for the reader. A different live origin adds a warning to the claim result, and the claim goes on. Version 1 has no confirmation for an origin change and no merge gate on origin drift here. Before any merge effect, Slice S4 must compare the target repository with the ticket's `issueRef`.
+6. **Relocation refusal and limits (`PROPOSED`):** One clone at one path is one project. Version 1 has no rebind, no decision files, and no ancestry list. Refusing a moved clone is a best effort, not a guarantee (see the limits below).
+
+   At first publication, inside the owner lease, scan the other `project.json` files under the state root. A record matches when it shares a root commit with the live repository and its stored `canonicalCommonDir` no longer exists on disk. Origin is not compared. On a match, refuse with `identity_relocated` and name the state directory of every matching record. `project.json` is not written, and the lease is released. A fresh clone made after the old clone was deleted meets the same refusal; this is intended because the old ledger may hold open tickets. A second clone whose original path still exists is a separate project and opens normally.
+
+   **Manual remedy:** Version 1 has no command for this. Follow these steps in order:
+   1. Stop every Captain on the old and new clones, and wait until their leases are released.
+   2. Finish or stop every worker still running for a ticket of the old ledger; a worker outlives its Captain.
+   3. Move every directory the error named out of the state root.
+   4. Claim again. The clone then gets a new, empty execution ledger. The old ledger is not continued.
+
+   **Limits (what version 1 does not protect):**
+   1. A process that writes into the state folder without this package can damage or lose records.
+   2. A manual change to the state folder, or a move of the repository, while a Captain runs can leave two owners. Do both only with every Captain stopped.
+   3. A different repository at the same path that shares a root commit with the old one (a fork) opens the old ledger with its open tickets.
+   4. Some moves are not seen: the clone has lost every stored root; the move happens while another claim is at its first publication; or something else now exists at the old path. The moved clone then starts a new, empty ledger without a refusal, and the old ledger stays on disk.
 7. Every ticket and commit record carries both `projectKey` and `issueRef` (`<owner>/<repo>#<number>`).
+
+### What Slice S1b must prove
+
+Item 6 stays `PROPOSED` until these twelve proofs pass:
+
+1. Two processes claim a new project at once, both held at a barrier before publication: one publishes, and the other gets `owner_conflict`. One `project.json` exists, with the winner's bytes. A later claim by the loser reads that record.
+2. One process claims twice: the lease is handed over, the record is verified, and nothing is published a second time.
+3. A crash at each step (after the lease, after the temporary is written, after the link and before the temporary is removed): the next claim publishes or opens, and no file was deleted.
+4. The lock holder dies while the owner is paused before the link, and a second owner publishes. When the first owner resumes, its link fails, its claim fails with `lease_revoked`, and the second owner's record is unchanged. In the other order, the first owner's link lands first: its claim still fails with `lease_revoked`, and the second owner finds that record, verifies it, and opens. In a third case, the lock holder dies while the owner verifies an existing record, and a second owner opens: the first claim fails with `lease_revoked`, and the record is unchanged.
+5. A leftover temporary, a foreign file, and a temporary whose name collides survive every claim. A failed exclusive creation removes nothing.
+6. Each claim refused after the lease is acquired (`identity_mismatch`, `identity_relocated`, and `identity_unborn` at step 4) releases the lease: another process acquires it at once. The same holds when a claim fails with `lease_revoked` while the lock holder is alive because `owner.json` cannot be read: the claim releases the lease, the holder exits, and another process acquires the lease.
+7. A path mismatch, a directory name that does not match the stored hash, and no shared root each give `identity_mismatch` with the record's bytes unchanged. An added root opens, and a removed root opens while one stored root is left, both with the record's bytes unchanged. A stored record with empty roots is refused.
+8. No commit on any ref gives `identity_unborn` with the state root unchanged. An unborn `HEAD` beside a committed branch opens.
+9. A moved clone gives `identity_relocated` and names the old directory, also after a root was added and the origin changed. Two matching old records are both named. A fresh clone after a deleted clone is refused. A second clone whose first path still exists opens as its own project. A moved clone whose old path exists again opens with a new ledger (item 6, limit 4).
+10. After the named directories are moved out of the state root, the claim publishes. The directory that the refused claim left, with only the lease's files, does not block it.
+11. The origin is stored at publication. A different live origin gives a warning, and the claim opens.
+12. Linked worktrees share one key, a symlinked path resolves to the same key, and two clones of one repository get different keys.
 
 ## 4. The commit log
 
