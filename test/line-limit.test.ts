@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 import { assertSupportedBunVersion } from "./helpers/bun-version.ts";
 import {
@@ -14,6 +15,8 @@ import {
 } from "./helpers/line-limit.ts";
 
 assertSupportedBunVersion(Bun.version);
+
+const LINE_LIMIT_HELPER_PATH = fileURLToPath(new URL("./helpers/line-limit.ts", import.meta.url));
 
 const GIT_ENV_KEYS_TO_STRIP = [
   "GIT_DIR",
@@ -108,7 +111,7 @@ describe("Tracked file 1,000-line limit", () => {
         assertTrackedFileLineLimits(repoDir, MAX_TRACKED_FILE_LINES, (line) => {
           printedSingle.push(line);
         }),
-      ).toThrow(/^Fix: split test\/over-limit\.ts \(1001 lines, limit 1000\)$/);
+      ).toThrow(/^1 tracked file\(s\) over the 1000-line limit$/);
       expect(printedSingle).toEqual(["Fix: split test/over-limit.ts (1001 lines, limit 1000)"]);
 
       writeAndStageFile(repoDir, "src/over-no-nl.ts", makeLines(1001, false));
@@ -123,12 +126,78 @@ describe("Tracked file 1,000-line limit", () => {
         assertTrackedFileLineLimits(repoDir, MAX_TRACKED_FILE_LINES, (line) => {
           printedMulti.push(line);
         }),
-      ).toThrow(
-        "Fix: split src/over-no-nl.ts (1001 lines, limit 1000)\nFix: split test/over-limit.ts (1001 lines, limit 1000)",
-      );
+      ).toThrow(/^2 tracked file\(s\) over the 1000-line limit$/);
       expect(printedMulti).toEqual([
         "Fix: split src/over-no-nl.ts (1001 lines, limit 1000)",
         "Fix: split test/over-limit.ts (1001 lines, limit 1000)",
+      ]);
+    });
+  });
+
+  test("emits exactly one Fix line per oversized file in bun test output for one and two files", () => {
+    withTempDir((tmpDir) => {
+      const repoDir = path.join(tmpDir, "repo");
+      fs.mkdirSync(repoDir, { recursive: true });
+      runGit(repoDir, ["init", "-q"]);
+      writeAndStageFile(repoDir, "src/ok.ts", makeLines(10, true));
+
+      const runnerTestPath = path.join(tmpDir, "check-runner.test.ts");
+      fs.writeFileSync(
+        runnerTestPath,
+        [
+          'import { test } from "bun:test";',
+          `import { assertTrackedFileLineLimits, MAX_TRACKED_FILE_LINES } from ${JSON.stringify(LINE_LIMIT_HELPER_PATH)};`,
+          'test("enforces tracked file line limit", () => {',
+          "  assertTrackedFileLineLimits(process.env.TARGET_REPO_ROOT!, MAX_TRACKED_FILE_LINES, (line) => {",
+          '    process.stderr.write(`${line}\\n`);',
+          "  });",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const runCheck = (): {
+        status: number | null;
+        signal: NodeJS.Signals | null;
+        fixLines: string[];
+      } => {
+        const res = spawnSync(process.execPath, ["test", "./check-runner.test.ts"], {
+          cwd: tmpDir,
+          env: {
+            ...process.env,
+            NO_COLOR: "1",
+            TARGET_REPO_ROOT: repoDir,
+          },
+          encoding: "utf8",
+        });
+        if (res.error) {
+          throw res.error;
+        }
+        const allLines = [
+          ...(res.stdout ?? "").split(/\r?\n/),
+          ...(res.stderr ?? "").split(/\r?\n/),
+        ];
+        return {
+          status: res.status,
+          signal: res.signal,
+          fixLines: allLines.filter((line) => line.includes("Fix: split")),
+        };
+      };
+
+      writeAndStageFile(repoDir, "test/over-one.ts", makeLines(1001, true));
+      const oneFile = runCheck();
+      expect(oneFile.signal).toBeNull();
+      expect(oneFile.status).toBeGreaterThan(0);
+      expect(oneFile.fixLines).toEqual(["Fix: split test/over-one.ts (1001 lines, limit 1000)"]);
+
+      writeAndStageFile(repoDir, "src/over-two.ts", makeLines(1002, false));
+      const twoFiles = runCheck();
+      expect(twoFiles.signal).toBeNull();
+      expect(twoFiles.status).toBeGreaterThan(0);
+      expect(twoFiles.fixLines).toEqual([
+        "Fix: split src/over-two.ts (1002 lines, limit 1000)",
+        "Fix: split test/over-one.ts (1001 lines, limit 1000)",
       ]);
     });
   });

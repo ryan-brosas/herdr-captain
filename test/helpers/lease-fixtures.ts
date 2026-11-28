@@ -273,11 +273,7 @@ export function setupLeaseSuiteHooks(
       }
     }
     registry.clear();
-    try {
-      await suiteTracker.cleanupAll();
-    } finally {
-      onScratchRoot("");
-    }
+    await suiteTracker.cleanupAll();
     expect(suiteTracker.ownedChildren.size).toBe(0);
     expect(suiteTracker.trackedExternals.size).toBe(0);
     expect(suiteTracker.activeEnvTokens.size).toBe(0);

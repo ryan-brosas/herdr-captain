@@ -167,17 +167,17 @@ export function checkTrackedFileLineLimits(
 export function assertTrackedFileLineLimits(
   repoRoot: string = REPO_ROOT,
   limit: number = MAX_TRACKED_FILE_LINES,
-  onViolationLine?: (line: string) => void,
+  onViolationLine: (line: string) => void = (line) => {
+    process.stderr.write(`${line}\n`);
+  },
 ): LineLimitCheckResult {
   const result = checkTrackedFileLineLimits(repoRoot, limit);
   if (result.violations.length > 0) {
     const messages = formatLineLimitViolations(result.violations, limit);
-    if (onViolationLine) {
-      for (const message of messages) {
-        onViolationLine(message);
-      }
+    for (const message of messages) {
+      onViolationLine(message);
     }
-    throw new Error(messages.join("\n"));
+    throw new Error(`${result.violations.length} tracked file(s) over the ${limit}-line limit`);
   }
   return result;
 }
