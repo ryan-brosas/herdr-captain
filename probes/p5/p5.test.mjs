@@ -78,20 +78,35 @@ function createSandbox(label) {
   return sandbox;
 }
 
+const activeGateFifos = new Map();
+
 function makeGateFifo(dirPath, name = "gate.fifo") {
   const fifoPath = path.join(dirPath, name);
   execFileSync("mkfifo", [fifoPath], { stdio: "ignore" });
+  // Keep an O_RDWR | O_NONBLOCK descriptor open until afterEach so releaseGateFifo
+  // never blocks in kernel wait_for_partner when no reader is attached (for example
+  // after hc.kill) and buffered bytes remain readable if a reader opens slightly later.
+  const fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+  activeGateFifos.set(fifoPath, { fd, released: false });
   return fifoPath;
 }
 
 function releaseGateFifo(fifoPath) {
-  fs.writeFileSync(fifoPath, "go\n", "utf8");
+  const entry = activeGateFifos.get(fifoPath);
+  if (!entry) {
+    throw new Error(`releaseGateFifo called on unknown FIFO: ${fifoPath}`);
+  }
+  if (entry.released) {
+    return;
+  }
+  entry.released = true;
+  fs.writeSync(entry.fd, "go\n");
 }
 
 function readFakeHcState(fakeHcStateDir) {
   const p = path.join(fakeHcStateDir, "state.json");
   if (!fs.existsSync(p)) {
-    return { nextId: 1, runCount: 0, callSeq: 0, terminals: {} };
+    return { nextId: 46, runCount: 0, callSeq: 0, terminals: {} };
   }
   return JSON.parse(fs.readFileSync(p, "utf8"));
 }
@@ -199,11 +214,21 @@ beforeAll(() => {
 });
 
 afterEach(async () => {
-  while (activeSandboxes.length > 0) {
-    const sb = activeSandboxes.pop();
-    try {
+  const sandboxes = activeSandboxes.splice(0, activeSandboxes.length);
+  try {
+    for (const sb of sandboxes) {
       await stopProcessesByEnvToken("FAKE_HC_PROC_TOKEN", sb.token, 3000);
-    } finally {
+    }
+  } finally {
+    for (const [fifoPath, entry] of activeGateFifos.entries()) {
+      try {
+        fs.closeSync(entry.fd);
+      } catch {
+        // Ignore EBADF if already closed.
+      }
+      activeGateFifos.delete(fifoPath);
+    }
+    for (const sb of sandboxes) {
       fs.rmSync(sb.root, { recursive: true, force: true });
     }
   }
@@ -262,7 +287,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(summary.outcome).toBe("launched");
     expect(summary.prefix).toBe(sb.prefix);
     expect(summary.terminalName).toBe(expectedName);
-    expect(summary.address).toBe("t1");
+    expect(summary.address).toBe("t1a");
     expect(summary.epoch).toBe(1);
 
     // Controller has already exited: prove the worker genuinely outlived its parent.
@@ -321,7 +346,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(r2.prevRecordSha256).toBe(sha256Hex(raw1));
     expect(r3.prevRecordSha256).toBe(sha256Hex(raw2));
     expect(r2.intent.terminalName).toBe(expectedName);
-    expect(r3.receipt.address).toBe("t1");
+    expect(r3.receipt.address).toBe("t1a");
     expect(r2.time <= r3.time).toBe(true);
     expect(r2.time <= runCalls[0].ts).toBe(true);
 
@@ -555,17 +580,17 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
     expect(recovered.outcome).toBe("captured");
     expect(recovered.epoch).toBe(2);
     expect(recovered.terminalName).toBe(expectedName);
-    expect(recovered.address).toBe("t1");
+    expect(recovered.address).toBe("t1a");
     expect(recovered.linesVerified).toBe(expectedLines);
     expect(recovered.reportFileVerified).toBe(true);
     expect(recovered.recordSeq).toBe(4);
 
-    // First lookup used deterministic name; post-verification read used verified address "t1" (R4).
+    // First lookup used deterministic name; post-verification read used verified address "t1a" (R4).
     const recoverCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBeforeRecover);
     const getCall = recoverCalls.find((c) => c.argv[0] === "get");
     const readCall = recoverCalls.find((c) => c.argv[0] === "read");
     expect(getCall?.argv).toEqual(["get", expectedName, "--json"]);
-    expect(readCall?.argv).toEqual(["read", "t1", "--lines", "1000", "--json"]);
+    expect(readCall?.argv).toEqual(["read", "t1a", "--lines", "1000", "--json"]);
 
     expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
 
@@ -737,24 +762,24 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(payloadB.outcome).toBe("uncertain");
       expect(payloadB.escalated).toBe(true);
       expect(payloadB.found).toBe(true);
-      expect(payloadB.boundAddress).toBe("t1");
+      expect(payloadB.boundAddress).toBe("t1a");
       expect(payloadB.epoch).toBe(2);
       expect(payloadB.foldedFromSeq).toBe(2);
       expect(payloadB.foldedAttemptStateBefore).toBe("intent");
 
-      // First lookup by deterministic name, then screen-only read by verified address "t1" (R4).
+      // First lookup by deterministic name, then screen-only read by verified address "t1a" (R4).
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
       const recoverCallsB = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBeforeRecover);
       expect(recoverCallsB.map((c) => c.argv)).toEqual([
         ["get", expectedName, "--json"],
-        ["read", "t1", "--lines", "0", "--json"],
+        ["read", "t1a", "--lines", "0", "--json"],
       ]);
 
       const foldedAfterB = foldCommitLog(ticketDir);
       expect(foldedAfterB.status).toBe("ok");
       expect(foldedAfterB.phase).toBe("escalated");
       expect(foldedAfterB.openAttempt?.state).toBe("uncertain");
-      expect(foldedAfterB.openAttempt?.boundAddress).toBe("t1");
+      expect(foldedAfterB.openAttempt?.boundAddress).toBe("t1a");
       expect(foldedAfterB.records.map((r) => r.event)).toEqual([
         "brief_committed",
         "launch_intent",
@@ -1208,17 +1233,17 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(crashRes.signal).toBe("SIGKILL");
       waitForKernelLockRelease(sb.stateRoot);
 
-      // Wait for t1 to finish, remove t1, and start replacement t2 under the exact same name.
-      expect(runFakeHcDirect(["wait", "t1", "--timeout", "5", "--json"], sb.env).exitCode).toBe(0);
-      expect(runFakeHcDirect(["rm", "t1", "--json"], sb.env).exitCode).toBe(0);
+      // Wait for t1a to finish, remove t1a, and start replacement t1b under the exact same name.
+      expect(runFakeHcDirect(["wait", "t1a", "--timeout", "5", "--json"], sb.env).exitCode).toBe(0);
+      expect(runFakeHcDirect(["rm", "t1a", "--json"], sb.env).exitCode).toBe(0);
       const replArgv = buildStandInWorkerArgv({ attemptId: "a1", expectedLines });
       const replRun = runFakeHcDirect(
         ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", expectedName, "--cwd", sb.workDir, "--", ...replArgv],
         sb.env,
       );
       expect(replRun.exitCode).toBe(0);
-      expect(JSON.parse(replRun.stdout).address).toBe("t2");
-      expect(runFakeHcDirect(["wait", "t2", "--timeout", "5", "--json"], sb.env).exitCode).toBe(0);
+      expect(JSON.parse(replRun.stdout).address).toBe("t1b");
+      expect(runFakeHcDirect(["wait", "t1b", "--timeout", "5", "--json"], sb.env).exitCode).toBe(0);
 
       const ticketDir = getTicketDir(sb.stateRoot, issue);
       const artifactsBefore = listDirSorted(path.join(ticketDir, "artifacts"));
@@ -1324,12 +1349,12 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(payload.escalated).toBe(true);
       expect(payload.reason).toBe("terminal_missing_after_wait");
 
-      // Post-wait lookup targeted verified address t1; zero reads occurred; zero new artifacts saved.
+      // Post-wait lookup targeted verified address t1a; zero reads occurred; zero new artifacts saved.
       const recCalls = readFakeHcCalls(sb.fakeHcStateDir).slice(callsBefore);
       expect(recCalls.map((c) => c.argv)).toEqual([
         ["get", expectedName, "--json"],
-        ["wait", "t1", "--timeout", "10", "--json"],
-        ["get", "t1", "--json"],
+        ["wait", "t1a", "--timeout", "10", "--json"],
+        ["get", "t1a", "--json"],
       ]);
       expect(listDirSorted(path.join(ticketDir, "artifacts"))).toEqual(artifactsBefore);
 
@@ -1732,7 +1757,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
         sb.env,
       );
       expect(r1.exitCode).toBe(0);
-      expect(JSON.parse(r1.stdout).address).toBe("t1");
+      expect(JSON.parse(r1.stdout).address).toBe("t1a");
 
       // Duplicate live name fails with exit 1 name_taken on stderr and still increments runCount.
       const dup = runFakeHcDirect(
@@ -1744,18 +1769,18 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(JSON.parse(dup.stderr).error.kind).toBe("name_taken");
 
       // rm on a live terminal returns schema-listed kind "live" on stderr.
-      const rmLive = runFakeHcDirect(["rm", "t1", "--json"], sb.env);
+      const rmLive = runFakeHcDirect(["rm", "t1a", "--json"], sb.env);
       expect(rmLive.exitCode).toBe(1);
       expect(rmLive.stdout).toBe("");
       expect(JSON.parse(rmLive.stderr).error.kind).toBe("live");
 
-      // Distinct second launch allocates distinct address t2 and increments runCount to 3.
+      // Distinct second launch allocates distinct address t1b and increments runCount to 3.
       const r2 = runFakeHcDirect(
         ["run", "--bg", "--json", "--no-parent", "--no-notify", "--outlive-parent", "--name", name2, "--cwd", sb.workDir, "--", "true"],
         sb.env,
       );
       expect(r2.exitCode).toBe(0);
-      expect(JSON.parse(r2.stdout).address).toBe("t2");
+      expect(JSON.parse(r2.stdout).address).toBe("t1b");
       expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(3);
       releaseGateFifo(gateFifo);
     }
@@ -1816,7 +1841,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       );
       expect(runNamed.exitCode).toBe(0);
       const runJson = JSON.parse(runNamed.stdout);
-      expect(runJson.address).toBe("t1");
+      expect(runJson.address).toBe("t1a");
       expect(runJson.state).toBeTypeOf("string");
       for (const fullOnlyKey of ["labels", "argv", "created_ms", "screen", "cols", "rows"]) {
         expect(fullOnlyKey in runJson, `fake run must print short form without ${fullOnlyKey}`).toBe(false);
@@ -1834,14 +1859,14 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(Array.isArray(lsJson.terminals)).toBe(true);
       expect(typeof lsJson.hidden_finished).toBe("number");
       expect(Array.isArray(lsJson.machines)).toBe(true);
-      const unnamedEntry = lsJson.terminals.find((t) => t.address === "t2");
+      const unnamedEntry = lsJson.terminals.find((t) => t.address === "t1b");
       expect(unnamedEntry).toBeTruthy();
       expect("name" in unnamedEntry).toBe(false);
       for (const fullOnlyKey of ["labels", "argv", "created_ms", "screen", "cols", "rows"]) {
         expect(fullOnlyKey in unnamedEntry, `fake ls entry must print short form without ${fullOnlyKey}`).toBe(false);
       }
 
-      const getRes = runFakeHcDirect(["get", "t1", "--json"], sb.env);
+      const getRes = runFakeHcDirect(["get", "t1a", "--json"], sb.env);
       expect(getRes.exitCode).toBe(0);
       const getJson = JSON.parse(getRes.stdout);
       for (const reqKey of ["address", "labels", "argv", "cwd", "state", "created_ms", "screen", "cols", "rows"]) {
@@ -2137,7 +2162,7 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect(startRes.exitCode, "resumed hung run must succeed").toBe(0);
       const payload = JSON.parse(startRes.stdout);
       expect(payload.outcome).toBe("launched");
-      expect(payload.address).toBe("t1");
+      expect(payload.address).toBe("t1a");
       expect(
         readFakeHcState(sb.fakeHcStateDir).runCount,
         "R11: resumed hung run must count as 1, not 2",
@@ -2152,6 +2177,304 @@ describe("Probe P5: recovery tracer and hc boundary", () => {
       expect("hcBin" in hc).toBe(false);
       expect("prefix" in hc).toBe(false);
       expect("namespace" in hc).toBe(false);
+    }
+
+    assertTripwireNeverRan();
+  });
+
+  test("r13-r15-letter-address: letter-bearing and digits-only addresses work across get/wait/read/kill/rm while unrecorded and remote targets are refused", async () => {
+    function writeStubHc(dir, name, body) {
+      const stubPath = path.join(dir, name);
+      fs.writeFileSync(stubPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+      return stubPath;
+    }
+
+    // 1. Check 2 (R13 + R15): launch on fake-hc gets a letter-bearing address; get, read, kill, wait, rm all succeed.
+    {
+      const sb = createSandbox("r13-letter-lifecycle");
+      const gateFifo = makeGateFifo(sb.workDir);
+      const hc = createHcClient({ hcBin: FAKE_HC_PATH, prefix: sb.prefix, env: sb.env });
+      const runRes = await hc.run({
+        name: `${sb.prefix}-let`,
+        cwd: sb.workDir,
+        argv: ["sh", "-c", `IFS= read -r _ < '${gateFifo}' || true`],
+      });
+      expect(runRes.ok).toBe(true);
+      const addr = runRes.result.address;
+      expect(/^t[0-9][0-9a-z]*$/.test(addr), "minted address must match observed shape").toBe(true);
+      expect(/[a-z]/.test(addr.slice(1)), "minted address must hold a letter").toBe(true);
+
+      let refusedErr = null;
+      let getRes = null;
+      let readRes = null;
+      let killRes = null;
+      let waitRes = null;
+      let rmRes = null;
+      let afterRm = null;
+      try {
+        getRes = await hc.get(addr);
+        readRes = await hc.read(addr, { lines: 0 });
+        killRes = await hc.kill(addr);
+        waitRes = await hc.wait(addr, { timeoutSecs: 5 });
+        rmRes = await hc.rm(addr);
+        afterRm = await hc.get(addr);
+      } catch (err) {
+        refusedErr = err;
+      } finally {
+        releaseGateFifo(gateFifo);
+      }
+
+      expect(refusedErr, "letter-bearing address from validated run must not be refused").toBeNull();
+      expect(getRes?.ok).toBe(true);
+      expect(getRes?.terminal?.address).toBe(addr);
+      expect(readRes?.ok).toBe(true);
+      expect(killRes?.ok).toBe(true);
+      expect(waitRes?.ok).toBe(true);
+      expect(waitRes?.result?.ended).toBe(true);
+      expect(rmRes?.ok).toBe(true);
+      expect(afterRm?.ok).toBe(false);
+      expect(afterRm?.notFound).toBe(true);
+      expect(afterRm?.exitCode).toBe(3);
+    }
+
+    // 2. R15: digits-only address also works across get, read, kill, wait, rm.
+    {
+      const sb = createSandbox("r15-digits-only");
+      // Base-36 72 is "20" -> mints digits-only address "t20" through fake-hc.
+      fs.writeFileSync(
+        path.join(sb.fakeHcStateDir, "state.json"),
+        `${JSON.stringify({ nextId: 72, runCount: 0, callSeq: 0, terminals: {} })}\n`,
+        "utf8",
+      );
+      const gateFifo = makeGateFifo(sb.workDir);
+      const hc = createHcClient({ hcBin: FAKE_HC_PATH, prefix: sb.prefix, env: sb.env });
+      const runRes = await hc.run({
+        name: `${sb.prefix}-dig`,
+        cwd: sb.workDir,
+        argv: ["sh", "-c", `IFS= read -r _ < '${gateFifo}' || true`],
+      });
+      expect(runRes.ok).toBe(true);
+      const addr = runRes.result.address;
+      expect(/^t[0-9]+$/.test(addr), "digits-only test address must hold digits only").toBe(true);
+      expect(addr).toBe("t20");
+
+      try {
+        expect((await hc.get(addr)).ok).toBe(true);
+        expect((await hc.read(addr, { lines: 0 })).ok).toBe(true);
+        expect((await hc.kill(addr)).ok).toBe(true);
+        expect((await hc.wait(addr, { timeoutSecs: 5 })).ok).toBe(true);
+        expect((await hc.rm(addr)).ok).toBe(true);
+      } finally {
+        releaseGateFifo(gateFifo);
+      }
+    }
+
+    // 3. Check 5 (R13): unrecorded addresses of any shape and remote targets are refused,
+    //    and non-local or malformed addresses from a response are never recorded.
+    {
+      const sb = createSandbox("r13-unrecorded-and-remote");
+      const hc = createHcClient({ hcBin: FAKE_HC_PATH, prefix: sb.prefix, env: sb.env });
+
+      for (const unrecorded of ["t9k", "t99", "ta1", "t1a"]) {
+        let err = null;
+        try {
+          await hc.kill(unrecorded);
+        } catch (caught) {
+          err = caught;
+        }
+        expect(err, `unrecorded address ${unrecorded} must be refused`).toBeInstanceOf(HcBoundaryError);
+        expect(err.code).toBe("prefix_violation");
+      }
+
+      for (const remote of ["box/t1a", "box/t1", "node-1/t9k"]) {
+        let err = null;
+        try {
+          await hc.get(remote);
+        } catch (caught) {
+          err = caught;
+        }
+        expect(err, `remote target ${remote} must be refused`).toBeInstanceOf(HcBoundaryError);
+        expect(err.code).toBe("remote_target_forbidden");
+      }
+
+      const remoteRespStub = writeStubHc(
+        sb.workDir,
+        "remote-resp-hc",
+        `printf '{"address":"box/t1a","name":"${sb.prefix}-x","state":"live"}\\n'`,
+      );
+      const hcRemote = createHcClient({ hcBin: remoteRespStub, prefix: sb.prefix, env: sb.env });
+      const resRemote = await hcRemote.run({ name: `${sb.prefix}-x`, cwd: sb.workDir, argv: ["true"] });
+      expect(resRemote.ok).toBe(true);
+      let remoteFollowErr = null;
+      try {
+        await hcRemote.get("box/t1a");
+      } catch (caught) {
+        remoteFollowErr = caught;
+      }
+      expect(remoteFollowErr).toBeInstanceOf(HcBoundaryError);
+      expect(remoteFollowErr.code).toBe("remote_target_forbidden");
+
+      const badAddrStub = writeStubHc(
+        sb.workDir,
+        "bad-addr-hc",
+        `printf '{"address":"not-local","name":"${sb.prefix}-y","state":"live"}\\n'`,
+      );
+      const hcBadAddr = createHcClient({ hcBin: badAddrStub, prefix: sb.prefix, env: sb.env });
+      const resBad = await hcBadAddr.run({ name: `${sb.prefix}-y`, cwd: sb.workDir, argv: ["true"] });
+      expect(resBad.ok).toBe(true);
+      let badFollowErr = null;
+      try {
+        await hcBadAddr.get("not-local");
+      } catch (caught) {
+        badFollowErr = caught;
+      }
+      expect(badFollowErr).toBeInstanceOf(HcBoundaryError);
+      expect(badFollowErr.code).toBe("prefix_violation");
+    }
+
+    assertTripwireNeverRan();
+  });
+
+  test("r14-stderr-letter-address: letter-bearing address only in stderr message settles uncertain, key address/terminal matches any string, and ordinary t-words plus P3 name_taken still settle not_delivered", async () => {
+    function writeStubHc(dir, name, body) {
+      const stubPath = path.join(dir, name);
+      fs.writeFileSync(stubPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+      return stubPath;
+    }
+
+    // 1. Check 3 (R14): letter-bearing address only in stderr `message` ends uncertain, escalates, and keeps runCount unchanged.
+    {
+      const sb = createSandbox("r14-stderr-letter-msg");
+      const issue = "7";
+      const startRes = await runTracerProcess(
+        [
+          "start",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+          "--cwd",
+          sb.workDir,
+        ],
+        { ...sb.env, FAKE_HC_FAIL_RUN_MODE: "stderr_message_letter_address" },
+      );
+
+      expect(startRes.exitCode).toBe(1);
+      const payload = JSON.parse(startRes.stdout);
+      expect(payload.outcome, "letter-bearing address in stderr message must settle uncertain").toBe("uncertain");
+      expect(payload.escalated).toBe(true);
+      expect(payload.reason, "letter-bearing address in stderr message must report address_in_output").toBe(
+        "address_in_output",
+      );
+      expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
+
+      const recRes = await runTracerProcess(
+        [
+          "recover",
+          "--hc-bin",
+          FAKE_HC_PATH,
+          "--state-root",
+          sb.stateRoot,
+          "--project-key",
+          sb.projectKey,
+          "--issue",
+          issue,
+          "--prefix",
+          sb.prefix,
+        ],
+        sb.env,
+      );
+      expect(recRes.exitCode).toBe(0);
+      expect(JSON.parse(recRes.stdout).alreadyEscalated).toBe(true);
+      expect(readFakeHcState(sb.fakeHcStateDir).runCount).toBe(1);
+    }
+
+    // 2. Check 3 (R14): P3 a4-run-duplicate-name `name_taken` wording still settles `not_delivered`.
+    {
+      const sb = createSandbox("r14-p3-name-taken");
+      const gateFifo = makeGateFifo(sb.workDir);
+      const issue = "7";
+      const expectedName = buildDeterministicName({ prefix: sb.prefix, issue, attemptId: "a1" });
+      const seeded = runFakeHcDirect(
+        [
+          "run",
+          "--bg",
+          "--json",
+          "--no-parent",
+          "--no-notify",
+          "--outlive-parent",
+          "--name",
+          expectedName,
+          "--cwd",
+          sb.workDir,
+          "--",
+          "sh",
+          "-c",
+          `IFS= read -r _ < '${gateFifo}' || true`,
+        ],
+        sb.env,
+      );
+      expect(seeded.exitCode).toBe(0);
+
+      try {
+        const startRes = await runTracerProcess(
+          [
+            "start",
+            "--hc-bin",
+            FAKE_HC_PATH,
+            "--state-root",
+            sb.stateRoot,
+            "--project-key",
+            sb.projectKey,
+            "--issue",
+            issue,
+            "--prefix",
+            sb.prefix,
+            "--cwd",
+            sb.workDir,
+          ],
+          sb.env,
+        );
+        expect(startRes.exitCode).toBe(1);
+        const payload = JSON.parse(startRes.stdout);
+        expect(payload.outcome).toBe("not_delivered");
+        expect(payload.errorKind).toBe("name_taken");
+      } finally {
+        releaseGateFifo(gateFifo);
+      }
+    }
+
+    // 3. R14: any non-empty string under key `address` or `terminal` in parsed stderr counts as an address;
+    //    ordinary words starting with `t` do not false-trigger.
+    {
+      const sb = createSandbox("r14-key-and-words");
+      const keyStub = writeStubHc(
+        sb.workDir,
+        "stderr-key-hc",
+        'printf \'{"error":{"kind":"spawn_failed","message":"spawn failed","hint":"check","terminal":"ta9"}}\\n\' >&2; exit 1',
+      );
+      const hcKey = createHcClient({ hcBin: keyStub, prefix: sb.prefix, env: sb.env });
+      const keyRes = await hcKey.run({ name: `${sb.prefix}-k`, cwd: sb.workDir, argv: ["true"] });
+      expect(keyRes.ok).toBe(false);
+      expect(keyRes.disposition).toBe("ambiguous");
+      expect(keyRes.reason).toBe("address_in_output");
+
+      const tWordsStub = writeStubHc(
+        sb.workDir,
+        "stderr-twords-hc",
+        'printf \'{"error":{"kind":"spawn_failed","message":"terminal timeout taken to try tools","hint":"retry the task today"}}\\n\' >&2; exit 1',
+      );
+      const hcWords = createHcClient({ hcBin: tWordsStub, prefix: sb.prefix, env: sb.env });
+      const wordsRes = await hcWords.run({ name: `${sb.prefix}-w`, cwd: sb.workDir, argv: ["true"] });
+      expect(wordsRes.ok).toBe(false);
+      expect(wordsRes.disposition).toBe("not_delivered");
+      expect(wordsRes.reason).toBe("definite_run_error");
     }
 
     assertTripwireNeverRan();

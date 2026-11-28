@@ -82,12 +82,21 @@ function withStateLock(fn) {
   }
 }
 
+// Base-36 counter starting at 46 ("1a") mints made-up local addresses holding a digit then a letter (e.g. t1a, t1b).
+const INITIAL_NEXT_ID = 46;
+
+function mintAddress(state) {
+  const id = Number.isInteger(state.nextId) && state.nextId >= 1 ? state.nextId : INITIAL_NEXT_ID;
+  state.nextId = id + 1;
+  return `t${id.toString(36)}`;
+}
+
 function loadStateUnlocked() {
   try {
     return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
   } catch (err) {
     if (err && typeof err === "object" && err.code === "ENOENT") {
-      return { nextId: 1, runCount: 0, callSeq: 0, terminals: {} };
+      return { nextId: INITIAL_NEXT_ID, runCount: 0, callSeq: 0, terminals: {} };
     }
     throw err;
   }
@@ -344,8 +353,7 @@ function maybeReplaceTerminalAfterWaitUnlocked(state, rec) {
   // Remove the original terminal and replace it under the same name with a new address.
   delete state.terminals[rec.address];
 
-  const replAddr = `t${state.nextId}`;
-  state.nextId += 1;
+  const replAddr = mintAddress(state);
   const runRes = spawnSync(spec.argv[0], spec.argv.slice(1), {
     cwd: rec.cwd,
     encoding: "utf8",
@@ -423,13 +431,13 @@ function runCommand(argv) {
     if (cmd === "run") {
       jsonOut({ state: "live" });
     } else if (cmd === "get") {
-      jsonOut({ address: "t1", state: "finished", cwd: "/tmp" });
+      jsonOut({ address: "t1a", state: "finished", cwd: "/tmp" });
     } else if (cmd === "ls") {
       jsonOut({ terminals: "not-an-array", hidden_finished: 0, machines: [] });
     } else if (cmd === "wait") {
-      jsonOut({ terminal: "t1", reason: "exit", turn: 0, children: [] });
+      jsonOut({ terminal: "t1a", reason: "exit", turn: 0, children: [] });
     } else {
-      jsonOut({ address: "t1", state: 123 });
+      jsonOut({ address: "t1a", state: 123 });
     }
     return 0;
   }
@@ -548,6 +556,13 @@ function runCommand(argv) {
           exitCode: errorOut(1, "spawn_failed", "allocated t123 before failing", "inspect before retrying"),
         };
       }
+      if (failMode === "stderr_message_letter_address") {
+        recordCallUnlocked(state, argv, 1);
+        saveStateUnlocked(state);
+        return {
+          exitCode: errorOut(1, "spawn_failed", "allocated t2k before failing", "inspect before retrying"),
+        };
+      }
       if (failMode === "stderr_hint_address") {
         recordCallUnlocked(state, argv, 1);
         saveStateUnlocked(state);
@@ -598,8 +613,7 @@ function runCommand(argv) {
         };
       }
 
-      const address = `t${state.nextId}`;
-      state.nextId += 1;
+      const address = mintAddress(state);
 
       const effectiveParent = noParent ? null : (process.env.HC_TERMINAL_ID ?? null);
       const dieWithParent = effectiveParent !== null && !outliveParent;

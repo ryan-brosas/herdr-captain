@@ -30,8 +30,8 @@ const TERMINAL_RUN_DEFINITE_ERROR_KINDS = new Set([
 
 const MAX_TERMINAL_NAME_LENGTH = 32;
 const TERMINAL_NAME_RE = /^[a-z0-9._-]{1,32}$/;
-const LOCAL_ADDRESS_RE = /^t\d+$/;
-const ANY_ADDRESS_TOKEN_RE = /(?:^|[^a-z0-9._/-])(?:[a-z0-9._-]+\/)?t\d+(?=$|[^a-z0-9_/-])/;
+const LOCAL_ADDRESS_RE = /^t[0-9a-z]+$/;
+const ANY_ADDRESS_TOKEN_RE = /(?:^|[^A-Za-z0-9._/-])(?:[a-z0-9._-]+\/)?t[0-9][0-9a-z]*(?=$|[^A-Za-z0-9._/-])/;
 
 // Fixed prefix shape: tag "p5-" followed by 8 to 16 lowercase alphanumeric characters.
 const PREFIX_RE = /^p5-[a-z0-9]{8,16}$/;
@@ -217,7 +217,14 @@ function valueContainsAddress(value) {
     return value.some(valueContainsAddress);
   }
   if (isPlainObject(value)) {
-    return Object.values(value).some(valueContainsAddress);
+    for (const [key, entry] of Object.entries(value)) {
+      if ((key === "address" || key === "terminal") && typeof entry === "string" && entry.length > 0) {
+        return true;
+      }
+      if (valueContainsAddress(entry)) {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -395,7 +402,7 @@ export function createHcClient({
     );
   }
 
-  // Tracks local addresses (e.g. "t1") proven by run/ls/get responses to belong to this prefix.
+  // Tracks local addresses (e.g. "t1a", "t7") proven by run/ls/get responses to belong to this prefix.
   const authorizedAddresses = new Set();
 
   function hasPrefix(name) {
@@ -427,20 +434,13 @@ export function createHcClient({
       );
     }
     assertNotRemoteTarget(target, `hc ${command}`);
-    if (LOCAL_ADDRESS_RE.test(target)) {
-      if (!authorizedAddresses.has(target)) {
-        throw new HcBoundaryError(
-          "prefix_violation",
-          `hc ${command} refused address ${JSON.stringify(target)}: not verified to carry prefix ${JSON.stringify(namespace)}`,
-          { command, target, namespace },
-        );
-      }
+    if (authorizedAddresses.has(target)) {
       return;
     }
     if (!hasPrefix(target)) {
       throw new HcBoundaryError(
         "prefix_violation",
-        `hc ${command} refused terminal ${JSON.stringify(target)}: name lacks required prefix ${JSON.stringify(namespace)}`,
+        `hc ${command} refused target ${JSON.stringify(target)}: not a verified address and lacks required prefix ${JSON.stringify(namespace)}`,
         { command, target, namespace },
       );
     }

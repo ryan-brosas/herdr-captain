@@ -327,6 +327,23 @@ const CONTROLS = [
     },
     expectedErrorRe: /error: replaced terminal under same name during wait must stay uncertain[\s\S]*Expected:\s*"uncertain"[\s\S]*Received:\s*"captured"/,
   },
+  {
+    id: "ctrl-r13-r14",
+    check: "r13-r14-address-shapes",
+    description: "set both address patterns back to digits only",
+    testNameFilter: "r13-r15-letter-address:|r14-stderr-letter-address:",
+    mutate(p5Dir) {
+      replaceExact(
+        path.join(p5Dir, "hc-boundary.mjs"),
+        `const LOCAL_ADDRESS_RE = /^t[0-9a-z]+$/;
+const ANY_ADDRESS_TOKEN_RE = /(?:^|[^A-Za-z0-9._/-])(?:[a-z0-9._-]+\\/)?t[0-9][0-9a-z]*(?=$|[^A-Za-z0-9._/-])/;`,
+        `const LOCAL_ADDRESS_RE = /^t[0-9]+$/;
+const ANY_ADDRESS_TOKEN_RE = /(?:^|[^A-Za-z0-9._/-])(?:[a-z0-9._-]+\\/)?t[0-9]+(?=$|[^A-Za-z0-9._/-])/;`,
+      );
+    },
+    expectedErrorRe:
+      /error: letter-bearing address from validated run must not be refused[\s\S]*HcBoundaryError: hc get refused target "t1a"[\s\S]*code: "prefix_violation"[\s\S]*error: letter-bearing address in stderr message must settle uncertain[\s\S]*Expected:\s*"uncertain"[\s\S]*Received:\s*"not_delivered"/,
+  },
 ];
 
 let passed = 0;
