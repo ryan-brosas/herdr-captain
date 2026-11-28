@@ -43,6 +43,9 @@ import {
   waitForKernelLockRelease,
   type FdInfo,
 } from "./helpers/process.ts";
+import { assertSupportedBunVersion } from "./helpers/bun-version.ts";
+
+assertSupportedBunVersion(Bun.version);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LEASE_SOURCE_PATH = path.resolve(HERE, "..", "src", "lease.ts");
@@ -3333,6 +3336,28 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
     } finally {
       statSpy.mockRestore();
       fixture.restoreModes();
+    }
+  });
+});
+
+describe("Runtime version guard", () => {
+  test("assertSupportedBunVersion requires Bun 1.4.0 or newer and parses versions numerically", () => {
+    for (const older of ["1.2.14", "1.3.99"]) {
+      const escaped = older.replaceAll(".", "\\.");
+      expect(() => assertSupportedBunVersion(older)).toThrow(
+        new RegExp(`1\\.4\\.0.*${escaped}`),
+      );
+    }
+
+    for (const supported of ["1.4.0", "1.4.0-canary.1", "1.4.1", "1.10.0", "2.0.0"]) {
+      expect(() => assertSupportedBunVersion(supported)).not.toThrow();
+    }
+
+    for (const malformed of ["1.4", "", "canary", "v1.4.0"]) {
+      const escaped = JSON.stringify(malformed).replaceAll(".", "\\.");
+      expect(() => assertSupportedBunVersion(malformed)).toThrow(
+        new RegExp(`1\\.4\\.0.*${escaped}`),
+      );
     }
   });
 });

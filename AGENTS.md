@@ -34,4 +34,4 @@ Run the test suite with:
 bun run test
 ```
 
-This runs `bun test ./test` on Linux with no install and no external dependencies. The owner lease tests require `util-linux` `flock` with `--no-fork` and `--conflict-exit-code`, plus readable Linux `/proc`. No package build or type-check command exists yet; Slice S1 adds no development dependencies ([#8](https://github.com/ryan-brosas/herdr-captain/issues/8)).
+This runs `bun test ./test` on Linux with Bun 1.4.0 or newer, no install, and no external dependencies. Older Bun releases reap a killed child and run its exit callback during `spawnSync()`, so tests cannot hold an unreaped zombie holder before that callback runs. The owner lease tests also require `util-linux` `flock` with `--no-fork` and `--conflict-exit-code`, plus readable Linux `/proc`. No package build or type-check command exists yet; Slice S1 adds no development dependencies ([#8](https://github.com/ryan-brosas/herdr-captain/issues/8)).
