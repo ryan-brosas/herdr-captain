@@ -4,6 +4,8 @@ const MIN_BUN_PARTS: readonly [number, number, number] = [1, 4, 0];
 
 /**
  * Throws unless `version` starts with three dot-separated numbers at or above `1.4.0`.
+ * Each of the three numbers must be a safe integer (`2^53 - 1` at most).
+ * A larger number cannot be compared exactly.
  * Trailing text after the three numbers is ignored.
  */
 export function assertSupportedBunVersion(version: string): void {
