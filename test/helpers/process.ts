@@ -12,6 +12,7 @@ import {
 
 const DEAD_PROCESS_STATES = new Set(["Z", "X", "x"]);
 const INVALID_LINUX_UID = "4294967295";
+const MAX_PARENT_CHAIN_STEPS = 64;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const OWNER_WORKER_PATH = path.join(HERE, "owner-worker.ts");
 export const HARNESS_RUNNER_PATH = path.join(HERE, "harness-runner.ts");
@@ -49,8 +50,13 @@ export interface EnvTokenScanResult {
   uncertain: UncertainProcessEntry[];
 }
 
+export interface DetailedProcessStat extends ProcessStat {
+  pid: number;
+  ppid: number;
+}
+
 type ProcessStatReadResult =
-  | { status: "ok"; stat: ProcessStat }
+  | { status: "ok"; stat: DetailedProcessStat }
   | { status: "absent" }
   | { status: "malformed"; raw: string };
 
@@ -154,19 +160,38 @@ function readProcessStatStrict(
   if (!/^\d+$/.test(pidField)) {
     return { status: "malformed", raw: statRaw };
   }
+  const parsedPid = Number(pidField);
+  if (!Number.isSafeInteger(parsedPid) || parsedPid <= 0) {
+    return { status: "malformed", raw: statRaw };
+  }
+  if (pid !== "self" && parsedPid !== pid) {
+    return { status: "malformed", raw: statRaw };
+  }
   const fields = statRaw.slice(closeParen + 2).trim().split(/\s+/);
   if (fields.length < 20) {
     return { status: "malformed", raw: statRaw };
   }
   const state = fields[0];
+  const ppidField = fields[1];
   const startTime = fields[19];
-  if (!state || !/^[A-Za-z]$/.test(state) || !startTime || !/^\d+$/.test(startTime)) {
+  if (
+    !state ||
+    !/^[A-Za-z]$/.test(state) ||
+    !ppidField ||
+    !/^\d+$/.test(ppidField) ||
+    !startTime ||
+    !/^\d+$/.test(startTime)
+  ) {
     return { status: "malformed", raw: statRaw };
   }
-  return { status: "ok", stat: { state, startTime } };
+  const ppid = Number(ppidField);
+  if (!Number.isSafeInteger(ppid) || ppid < 0) {
+    return { status: "malformed", raw: statRaw };
+  }
+  return { status: "ok", stat: { pid: parsedPid, ppid, state, startTime } };
 }
 
-export function assertProcReadable(procRoot = "/proc"): ProcessStat {
+export function assertProcReadable(procRoot = "/proc"): DetailedProcessStat {
   fs.readdirSync(procRoot);
   const selfResult = readProcessStatStrict("self", procRoot);
   if (selfResult.status !== "ok") {
@@ -310,6 +335,115 @@ function getProcessOwnerProof(
   return "maybe_ours";
 }
 
+function collectSelfAncestors(
+  selfStat: DetailedProcessStat,
+  procRoot: string,
+): Map<number, string> | null {
+  const ancestors = new Map<number, string>();
+  ancestors.set(selfStat.pid, selfStat.startTime);
+
+  let curKey: number | "self" = "self";
+  let curStat = selfStat;
+
+  for (let step = 0; step < MAX_PARENT_CHAIN_STEPS; step += 1) {
+    if (curStat.pid === 1) {
+      return ancestors;
+    }
+    const parentPid = curStat.ppid;
+    if (parentPid <= 0 || ancestors.has(parentPid)) {
+      return null;
+    }
+    let parentResult: ProcessStatReadResult;
+    try {
+      parentResult = readProcessStatStrict(parentPid, procRoot);
+    } catch {
+      return null;
+    }
+    if (parentResult.status !== "ok") {
+      return null;
+    }
+    let curAfter: ProcessStatReadResult;
+    try {
+      curAfter = readProcessStatStrict(curKey, procRoot);
+    } catch {
+      return null;
+    }
+    if (
+      curAfter.status !== "ok" ||
+      curAfter.stat.pid !== curStat.pid ||
+      curAfter.stat.startTime !== curStat.startTime ||
+      curAfter.stat.ppid !== parentPid
+    ) {
+      return null;
+    }
+    ancestors.set(parentPid, parentResult.stat.startTime);
+    curKey = parentPid;
+    curStat = parentResult.stat;
+  }
+
+  return curStat.pid === 1 ? ancestors : null;
+}
+
+function isProvenNotOursByParentChain(
+  pid: number,
+  initialStat: DetailedProcessStat,
+  selfStartTicks: bigint,
+  selfAncestors: ReadonlyMap<number, string> | null,
+  procRoot: string,
+): boolean {
+  if (selfAncestors === null) {
+    return false;
+  }
+
+  let childPid = pid;
+  let childStat = initialStat;
+  const visited = new Set<number>([childPid]);
+
+  for (let step = 0; step < MAX_PARENT_CHAIN_STEPS; step += 1) {
+    const parentPid = childStat.ppid;
+    if (parentPid <= 0 || visited.has(parentPid)) {
+      return false;
+    }
+
+    let parentResult: ProcessStatReadResult;
+    try {
+      parentResult = readProcessStatStrict(parentPid, procRoot);
+    } catch {
+      return false;
+    }
+    if (parentResult.status !== "ok") {
+      return false;
+    }
+
+    let childAfter: ProcessStatReadResult;
+    try {
+      childAfter = readProcessStatStrict(childPid, procRoot);
+    } catch {
+      return false;
+    }
+    if (
+      childAfter.status !== "ok" ||
+      childAfter.stat.startTime !== childStat.startTime ||
+      childAfter.stat.ppid !== parentPid
+    ) {
+      return false;
+    }
+
+    if (selfAncestors.get(parentPid) === parentResult.stat.startTime) {
+      return false;
+    }
+    if (BigInt(parentResult.stat.startTime) < selfStartTicks) {
+      return true;
+    }
+
+    visited.add(parentPid);
+    childPid = parentPid;
+    childStat = parentResult.stat;
+  }
+
+  return false;
+}
+
 function formatUncertainProcesses(uncertain: UncertainProcessEntry[], procRoot: string): string {
   const details = uncertain
     .map((u) => `pid=${u.pid}${u.startTime ? ` startTime=${u.startTime}` : ""} (${u.reason})`)
@@ -343,6 +477,8 @@ export function scanProcessesByEnvToken(
     throw new Error(`Invalid minStartTime for env-token scan: ${String(minStartTimeRaw)}`);
   }
   const minStartTicks = BigInt(minStartTimeRaw);
+  const selfStartTicks = BigInt(selfStat.startTime);
+  const selfAncestors = collectSelfAncestors(selfStat, procRoot);
   const myUid = typeof process.getuid === "function" ? process.getuid() : null;
   const canCheckUidMap = readSelfUidMapUsable(procRoot);
 
@@ -355,7 +491,7 @@ export function scanProcessesByEnvToken(
       continue;
     }
     const pid = Number(name);
-    if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || pid === selfStat.pid) {
       continue;
     }
 
@@ -403,6 +539,17 @@ export function scanProcessesByEnvToken(
           continue;
         }
         if (BigInt(statBefore.stat.startTime) < minStartTicks) {
+          continue;
+        }
+        if (
+          isProvenNotOursByParentChain(
+            pid,
+            statBefore.stat,
+            selfStartTicks,
+            selfAncestors,
+            procRoot,
+          )
+        ) {
           continue;
         }
         uncertain.push({

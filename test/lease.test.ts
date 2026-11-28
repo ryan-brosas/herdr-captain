@@ -47,9 +47,15 @@ import {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LEASE_SOURCE_PATH = path.resolve(HERE, "..", "src", "lease.ts");
 
-function makeStatLine(pid: number, comm: string, state: string, startTime: string): string {
-  // Linux /proc/<pid>/stat: fields 3..22 after ") " -> state is field[0], starttime is field[19].
-  const middle = Array.from({ length: 18 }, () => "0").join(" ");
+function makeStatLine(
+  pid: number,
+  comm: string,
+  state: string,
+  startTime: string,
+  ppid = 0,
+): string {
+  // Linux /proc/<pid>/stat: fields 3..22 after ") " -> state is field[0], ppid is field[1], starttime is field[19].
+  const middle = [String(ppid), ...Array.from({ length: 17 }, () => "0")].join(" ");
   return `${pid} (${comm}) ${state} ${middle} ${startTime} 0 0\n`;
 }
 
@@ -70,17 +76,24 @@ function createFixtureProcRoot(
   selfStartTime: string,
   entries: FixtureProcEntry[],
   selfUidMap?: string,
+  selfPpid = 0,
 ): { procRoot: string; restoreModes: () => void } {
   const chmodPaths: string[] = [];
+  const selfStatLine = makeStatLine(process.pid, "bun", "R", selfStartTime, selfPpid);
   fs.mkdirSync(path.join(procRoot, "self"), { recursive: true });
-  fs.writeFileSync(
-    path.join(procRoot, "self", "stat"),
-    makeStatLine(process.pid, "bun", "R", selfStartTime),
-    "utf8",
-  );
+  fs.writeFileSync(path.join(procRoot, "self", "stat"), selfStatLine, "utf8");
   fs.writeFileSync(path.join(procRoot, "self", "environ"), "PATH=/usr/bin\0", "utf8");
   if (selfUidMap !== undefined) {
     fs.writeFileSync(path.join(procRoot, "self", "uid_map"), selfUidMap, "utf8");
+  }
+  if (selfPpid > 0) {
+    const selfPidDir = path.join(procRoot, String(process.pid));
+    fs.mkdirSync(selfPidDir, { recursive: true });
+    fs.writeFileSync(path.join(selfPidDir, "stat"), selfStatLine, "utf8");
+    fs.writeFileSync(path.join(selfPidDir, "environ"), "PATH=/usr/bin\0", "utf8");
+    if (selfUidMap !== undefined) {
+      fs.writeFileSync(path.join(selfPidDir, "uid_map"), selfUidMap, "utf8");
+    }
   }
 
   for (const entry of entries) {
@@ -2755,6 +2768,243 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
       ],
     );
 
+    const selfAncestorPid = 9000100;
+    const ancestorEntries: FixtureProcEntry[] = [
+      {
+        pid: 1,
+        uids: [otherUid, otherUid, otherUid, otherUid],
+        uidMap: sameNsUidMap,
+        stat: makeStatLine(1, "init", "S", "1", 0),
+        environ: "PATH=/usr/bin\0",
+      },
+      {
+        pid: selfAncestorPid,
+        uids: [myUid, myUid, myUid, myUid],
+        uidMap: sameNsUidMap,
+        stat: makeStatLine(selfAncestorPid, "shell", "S", "10000", 1),
+        environ: "PATH=/usr/bin\0",
+      },
+    ];
+
+    // Proof 4 (parent chain), cases (a) and (d): proven not ours and skipped cleanly.
+    const parentChainSkippedFixture = createFixtureProcRoot(
+      path.join(scratchRoot, "proc-parent-chain-skipped"),
+      "50000",
+      [
+        ...ancestorEntries,
+        {
+          // Older non-ancestor parent (e.g. browser running before the test started).
+          pid: 9000110,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000110, "browser", "S", "20000", 1),
+          environ: "PATH=/usr/bin\0",
+        },
+        {
+          // Newer intermediate parent whose own parent is the older non-ancestor 9000110.
+          pid: 9000111,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000111, "zygote", "S", "50010", 9000110),
+          environ: "PATH=/usr/bin\0",
+        },
+        {
+          // Case (a): newer unreadable entry whose parent is older than self and not an ancestor.
+          pid: 9000051,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000051, "sandbox-a", "S", "50020", 9000110),
+          environ: "SANDBOX=1\0",
+          environMode: 0o000,
+        },
+        {
+          // Case (d): newer unreadable entry whose parent is newer and grandparent is older non-ancestor.
+          pid: 9000054,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000054, "sandbox-d", "S", "50030", 9000111),
+          environ: "SANDBOX=1\0",
+          environMode: 0o000,
+        },
+      ],
+      sameNsUidMap,
+      selfAncestorPid,
+    );
+
+    // Proof 4 (parent chain), cases (b), (c), (e), and (f): must stay uncertain and fail cleanup.
+    const parentChainUncertainFixture = createFixtureProcRoot(
+      path.join(scratchRoot, "proc-parent-chain-uncertain"),
+      "50000",
+      [
+        ...ancestorEntries,
+        {
+          // Newer direct child of the test process (grandparent for case (e)).
+          pid: 9000120,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000120, "worker", "S", "50010", process.pid),
+          environ: "PATH=/usr/bin\0",
+        },
+        {
+          // Malformed-stat parent (otherUid so outer scan skips 9000132 itself while child 9000058 stays uncertain).
+          pid: 9000132,
+          uids: [otherUid, otherUid, otherUid, otherUid],
+          uidMap: sameNsUidMap,
+          stat: "9000132 (broken) S 1 2 3\n",
+          environ: "PATH=/usr/bin\0",
+        },
+        {
+          // Unreadable-stat parent (otherUid so outer scan skips 9000133 itself while child 9000059 stays uncertain).
+          pid: 9000133,
+          uids: [otherUid, otherUid, otherUid, otherUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000133, "locked", "S", "20000", 1),
+          statMode: 0o000,
+          environ: "PATH=/usr/bin\0",
+        },
+        {
+          // Case (b): parent is the test process.
+          pid: 9000052,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000052, "child-b", "S", "50020", process.pid),
+          environ: "HERDR_TEST_TOKEN=tok-parent-uncertain\0",
+          environMode: 0o000,
+        },
+        {
+          // Case (c): parent is an intermediate ancestor of the test process.
+          pid: 9000053,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000053, "child-c-anc", "S", "50021", selfAncestorPid),
+          environ: "HERDR_TEST_TOKEN=tok-parent-uncertain\0",
+          environMode: 0o000,
+        },
+        {
+          // Case (c): parent is pid 1 (ancestor of the test process).
+          pid: 9000055,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000055, "child-c-pid1", "S", "50022", 1),
+          environ: "HERDR_TEST_TOKEN=tok-parent-uncertain\0",
+          environMode: 0o000,
+        },
+        {
+          // Case (e): parent is newer than the test process and grandparent is the test process.
+          pid: 9000056,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000056, "grandchild-e", "S", "50023", 9000120),
+          environ: "HERDR_TEST_TOKEN=tok-parent-uncertain\0",
+          environMode: 0o000,
+        },
+        {
+          // Case (f): parent's stat is absent (pid 9000131 does not exist).
+          pid: 9000057,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000057, "orphan-f-absent", "S", "50024", 9000131),
+          environ: "HERDR_TEST_TOKEN=tok-parent-uncertain\0",
+          environMode: 0o000,
+        },
+        {
+          // Case (f): parent's stat is malformed.
+          pid: 9000058,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000058, "child-f-malformed", "S", "50025", 9000132),
+          environ: "HERDR_TEST_TOKEN=tok-parent-uncertain\0",
+          environMode: 0o000,
+        },
+        {
+          // Case (f): parent's stat is unreadable.
+          pid: 9000059,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000059, "child-f-unreadable", "S", "50026", 9000133),
+          environ: "HERDR_TEST_TOKEN=tok-parent-uncertain\0",
+          environMode: 0o000,
+        },
+      ],
+      sameNsUidMap,
+      selfAncestorPid,
+    );
+
+    // Proof 4 (parent chain), changed ppid on re-read after parent stat stays uncertain.
+    const parentChainChangedPpidFixture = createFixtureProcRoot(
+      path.join(scratchRoot, "proc-parent-chain-changed-ppid"),
+      "50000",
+      [
+        ...ancestorEntries,
+        {
+          pid: 9000110,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000110, "browser", "S", "20000", 1),
+          environ: "PATH=/usr/bin\0",
+        },
+        {
+          pid: 9000060,
+          uids: [myUid, myUid, myUid, myUid],
+          uidMap: sameNsUidMap,
+          stat: makeStatLine(9000060, "reparented", "S", "50040", 9000110),
+          environ: "HERDR_TEST_TOKEN=tok-parent-reparented\0",
+          environMode: 0o000,
+        },
+      ],
+      sameNsUidMap,
+      selfAncestorPid,
+    );
+
+    // Proof 4 (parent chain), 64-step walk cap: 64 steps skips, 65 steps stays uncertain.
+    const depthChainEntries: FixtureProcEntry[] = [
+      ...ancestorEntries,
+      {
+        pid: 9000200,
+        uids: [myUid, myUid, myUid, myUid],
+        uidMap: sameNsUidMap,
+        stat: makeStatLine(9000200, "older-root", "S", "20000", 1),
+        environ: "PATH=/usr/bin\0",
+      },
+    ];
+    for (let i = 1; i <= 64; i += 1) {
+      const nodePid = 9000200 + i;
+      depthChainEntries.push({
+        pid: nodePid,
+        uids: [myUid, myUid, myUid, myUid],
+        uidMap: sameNsUidMap,
+        stat: makeStatLine(nodePid, `hop-${i}`, "S", "50010", nodePid - 1),
+        environ: "PATH=/usr/bin\0",
+      });
+    }
+    depthChainEntries.push(
+      {
+        // 65 steps to older non-ancestor 9000200: exceeds 64-step limit -> uncertain.
+        pid: 9000061,
+        uids: [myUid, myUid, myUid, myUid],
+        uidMap: sameNsUidMap,
+        stat: makeStatLine(9000061, "too-deep", "S", "50050", 9000264),
+        environ: "HERDR_TEST_TOKEN=tok-parent-depth\0",
+        environMode: 0o000,
+      },
+      {
+        // Exact 64 steps to older non-ancestor 9000200: skipped cleanly.
+        pid: 9000062,
+        uids: [myUid, myUid, myUid, myUid],
+        uidMap: sameNsUidMap,
+        stat: makeStatLine(9000062, "at-limit", "S", "50051", 9000263),
+        environ: "HERDR_TEST_TOKEN=tok-parent-depth\0",
+        environMode: 0o000,
+      },
+    );
+    const parentChainDepthLimitFixture = createFixtureProcRoot(
+      path.join(scratchRoot, "proc-parent-chain-depth-limit"),
+      "50000",
+      depthChainEntries,
+      sameNsUidMap,
+      selfAncestorPid,
+    );
+
     try {
       expect(scanProcessesByEnvToken("HERDR_TEST_TOKEN", "tok-not-ours", fixture.procRoot)).toEqual({
         matches: [],
@@ -2776,9 +3026,128 @@ describe("Ported P2 negative controls (broken adapters and injected failures, ze
           minStartTime: "50010",
         }),
       ).toEqual([]);
+
+      // Proof 4 cases (a) and (d): older non-ancestor parent or grandparent skips cleanly.
+      const parentSkippedScan = scanProcessesByEnvToken(
+        "HERDR_TEST_TOKEN",
+        "tok-parent-skip",
+        parentChainSkippedFixture.procRoot,
+      );
+      expect(parentSkippedScan.matches).toEqual([]);
+      expect(
+        parentSkippedScan.uncertain
+          .map((u) => u.pid)
+          .sort((a, b) => a - b)
+          .join(","),
+      ).toBe("");
+      expect(parentSkippedScan.uncertain).toEqual([]);
+      expect(
+        findProcessesByEnvToken(
+          "HERDR_TEST_TOKEN",
+          "tok-parent-skip",
+          parentChainSkippedFixture.procRoot,
+        ),
+      ).toEqual([]);
+      expect(
+        await stopProcessesByEnvToken(
+          "HERDR_TEST_TOKEN",
+          "tok-parent-skip",
+          200,
+          parentChainSkippedFixture.procRoot,
+        ),
+      ).toEqual([]);
+
+      // Proof 4 cases (b), (c), (e), and (f): must stay uncertain and fail cleanup.
+      const parentUncertainScan = scanProcessesByEnvToken(
+        "HERDR_TEST_TOKEN",
+        "tok-parent-uncertain",
+        parentChainUncertainFixture.procRoot,
+      );
+      expect(parentUncertainScan.matches).toEqual([]);
+      const parentUncertainSorted = [...parentUncertainScan.uncertain].sort(
+        (a, b) => a.pid - b.pid,
+      );
+      expect(parentUncertainSorted).toEqual([
+        { pid: 9000052, startTime: "50020", reason: "unreadable_environ" },
+        { pid: 9000053, startTime: "50021", reason: "unreadable_environ" },
+        { pid: 9000055, startTime: "50022", reason: "unreadable_environ" },
+        { pid: 9000056, startTime: "50023", reason: "unreadable_environ" },
+        { pid: 9000057, startTime: "50024", reason: "unreadable_environ" },
+        { pid: 9000058, startTime: "50025", reason: "unreadable_environ" },
+        { pid: 9000059, startTime: "50026", reason: "unreadable_environ" },
+      ]);
+      expect(() =>
+        findProcessesByEnvToken(
+          "HERDR_TEST_TOKEN",
+          "tok-parent-uncertain",
+          parentChainUncertainFixture.procRoot,
+        ),
+      ).toThrow(/Uncertain process cleanup.*pid=9000052/);
+      await expect(
+        stopProcessesByEnvToken(
+          "HERDR_TEST_TOKEN",
+          "tok-parent-uncertain",
+          200,
+          parentChainUncertainFixture.procRoot,
+        ),
+      ).rejects.toThrow(/Uncertain process cleanup.*unreadable_environ/);
+
+      // Proof 4 changed-ppid re-read check: child's ppid changes after parent's stat is read.
+      const childStatPath = path.join(parentChainChangedPpidFixture.procRoot, "9000060", "stat");
+      const parentDirPrefix = `${path.join(parentChainChangedPpidFixture.procRoot, "9000110")}${path.sep}`;
+      const parentStatPath = path.join(parentChainChangedPpidFixture.procRoot, "9000110", "stat");
+      let childStatReads = 0;
+      let nonStatParentReadsDuringWalk = 0;
+      const origReadFileSync = fs.readFileSync.bind(fs);
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+        const target = String(args[0]);
+        if (target === childStatPath) {
+          childStatReads += 1;
+          if (childStatReads === 2) {
+            return makeStatLine(9000060, "reparented", "S", "50040", 1);
+          }
+        } else if (
+          childStatReads === 1 &&
+          target.startsWith(parentDirPrefix) &&
+          target !== parentStatPath
+        ) {
+          nonStatParentReadsDuringWalk += 1;
+        }
+        return origReadFileSync(...(args as Parameters<typeof fs.readFileSync>));
+      }) as typeof fs.readFileSync);
+      try {
+        const changedPpidScan = scanProcessesByEnvToken(
+          "HERDR_TEST_TOKEN",
+          "tok-parent-reparented",
+          parentChainChangedPpidFixture.procRoot,
+        );
+        expect(childStatReads).toBe(2);
+        expect(nonStatParentReadsDuringWalk).toBe(0);
+        expect(changedPpidScan).toEqual({
+          matches: [],
+          uncertain: [{ pid: 9000060, startTime: "50040", reason: "unreadable_environ" }],
+        });
+      } finally {
+        readSpy.mockRestore();
+      }
+
+      // Proof 4 64-step limit: 64 steps skips (9000062), 65 steps stays uncertain (9000061).
+      const depthLimitScan = scanProcessesByEnvToken(
+        "HERDR_TEST_TOKEN",
+        "tok-parent-depth",
+        parentChainDepthLimitFixture.procRoot,
+      );
+      expect(depthLimitScan).toEqual({
+        matches: [],
+        uncertain: [{ pid: 9000061, startTime: "50050", reason: "unreadable_environ" }],
+      });
     } finally {
       fixture.restoreModes();
       minStartFixture.restoreModes();
+      parentChainSkippedFixture.restoreModes();
+      parentChainUncertainFixture.restoreModes();
+      parentChainChangedPpidFixture.restoreModes();
+      parentChainDepthLimitFixture.restoreModes();
     }
   });
 
