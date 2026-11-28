@@ -184,12 +184,14 @@ function writeOwnerRecordAtomic(stateRoot: string, record: OwnerRecord): void {
   const payload = `${JSON.stringify(record, null, 2)}\n`;
 
   let fd: number | undefined;
+  let createdTmp = false;
   try {
     fd = fs.openSync(
       tmpPath,
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
       0o600,
     );
+    createdTmp = true;
     fs.writeFileSync(fd, payload, "utf8");
     fs.fsyncSync(fd);
     fs.closeSync(fd);
@@ -204,10 +206,12 @@ function writeOwnerRecordAtomic(stateRoot: string, record: OwnerRecord): void {
         // Ignore close error on cleanup path.
       }
     }
-    try {
-      fs.rmSync(tmpPath, { force: true });
-    } catch {
-      // Ignore temp removal error on cleanup path.
+    if (createdTmp) {
+      try {
+        fs.rmSync(tmpPath, { force: true });
+      } catch {
+        // Ignore temp removal error on cleanup path.
+      }
     }
     throw err;
   }
